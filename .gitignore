@@ -1,0 +1,209 @@
+# ============================================================
+# FUTUREEDGE — .gitignore
+# ============================================================
+
+
+# ============================================================
+# SECRETS — NEVER COMMIT THESE
+# ============================================================
+
+.env
+.env.local
+.env.production
+.env.staging
+*.secret
+secrets/
+
+
+# ============================================================
+# PYTHON
+# ============================================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / packaging
+.Python
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+.env/
+.venv/
+venv.bak/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# mypy / type checkers
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# Ruff / linting
+.ruff_cache/
+
+
+# ============================================================
+# JUPYTER NOTEBOOKS  (if you do any analysis)
+# ============================================================
+
+.ipynb_checkpoints
+*.ipynb
+
+
+# ============================================================
+# DOCKER
+# ============================================================
+
+# Don't ignore docker-compose files — commit those
+# But ignore local override files
+docker-compose.override.yml
+docker-compose.local.yml
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+# Local SQLite databases (if any used for testing)
+*.db
+*.sqlite
+*.sqlite3
+
+# PostgreSQL dumps
+*.sql.gz
+*.dump
+
+
+# ============================================================
+# LOGS
+# ============================================================
+
+*.log
+logs/
+log/
+
+
+# ============================================================
+# IDE / EDITORS
+# ============================================================
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# PyCharm / IntelliJ
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*#
+.#*
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+
+# ============================================================
+# DATA / MODELS
+# ============================================================
+
+# Large data files
+*.csv
+*.parquet
+*.feather
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+
+# ML model weights (Phase 2)
+*.pt
+*.pth
+*.onnx
+*.safetensors
+models/weights/
+models/checkpoints/
+
+# Market data cache
+data/cache/
+data/raw/
+data/processed/
+
+
+# ============================================================
+# TEMPORARY FILES
+# ============================================================
+
+tmp/
+temp/
+.tmp/
+*.tmp
+*.bak
+*.orig
+*.rej
