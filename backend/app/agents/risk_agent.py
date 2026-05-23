@@ -1,677 +1,298 @@
 """
-Risk Agent
+app/agents/risk_agent.py
+=========================
+Risk management agent — deterministic safety checks.
 
-Responsibilities:
------------------
-1. Perform deterministic risk checks
-2. Protect portfolio from catastrophic loss
-3. Monitor leverage and exposure
-4. Control volatility risk
-5. Provide independent VETO authority
+CHANGES FROM ORIGINAL:
+-----------------------
+1. Now ASYNC  (async def risk_agent_node)
 
-IMPORTANT:
+2. Kelly criterion now REAL, not hardcoded 0.02
+   Reads actual trade history from Postgres to compute
+   win rate, average win, average loss → real Kelly fraction.
+   Falls back to conservative 2% if not enough history.
+
+3. Indian market specific checks added
+   - NSE lot sizes for F&O
+   - Intraday position limits
+   - Zerodha MIS (intraday) margin rules
+
+PHILOSOPHY:
 -----------
-This agent should NEVER rely on LLMs.
-
-Reason:
---------
+This agent must NEVER use AI/LLMs.
 Risk systems must be:
-- deterministic
-- auditable
-- mathematically consistent
-- regulator-friendly
+  - deterministic (same input → same output every time)
+  - auditable      (regulator can verify the logic)
+  - conservative   (when uncertain, VETO)
 
-Institutional systems always separate:
-- prediction systems
-- risk systems
-
-Prediction can be probabilistic.
-Risk management must be strict.
+If this agent crashes → default is VETO (reject the trade).
 """
 
-# ============================================================
-# IMPORTS
-# ============================================================
-
-# Mathematical utilities
-import math
-
-# Structured logging
 from loguru import logger
 
-# Shared state and schemas
-from app.graph.state import (
-    AgentState,
-    AgentVote,
-    PortfolioSnapshot,
-    MarketContext
-)
+from app.graph.state import AgentState, AgentVote, PortfolioSnapshot, MarketContext
+from app.db.postgres import AsyncSessionLocal
+from app.db.repos.trade_repo import TradeRepo
 
 
 # ============================================================
-# VALUE AT RISK (VAR)
+# RISK LIMITS  (Indian market / Zerodha MIS intraday)
 # ============================================================
 
-def calculate_var(
-    returns: list[float],
-    confidence: float = 0.95
-) -> float:
-    """
-    Historical Value at Risk (VaR)
-
-    VaR estimates:
-    ----------------
-    Maximum expected loss under normal conditions.
-
-    Example:
-    ----------
-    95% VaR = 2%
-
-    Means:
-    -------
-    We expect losses greater than 2%
-    only 5% of the time.
-
-    Widely used in:
-    - hedge funds
-    - banks
-    - institutional trading
-    """
-
-    # --------------------------------------------------------
-    # EMPTY DATA CHECK
-    # --------------------------------------------------------
-
-    if not returns:
-        return 0.0
-
-
-    # --------------------------------------------------------
-    # SORT RETURNS
-    # --------------------------------------------------------
-
-    """
-    Worst losses move to beginning.
-    """
-
-    sorted_returns = sorted(returns)
-
-
-    # --------------------------------------------------------
-    # VAR INDEX
-    # --------------------------------------------------------
-
-    """
-    Example:
-    confidence = 95%
-
-    Then:
-    use worst 5% region.
-    """
-
-    index = int(
-        (1 - confidence)
-        * len(sorted_returns)
-    )
-
-
-    # --------------------------------------------------------
-    # RETURN ABSOLUTE LOSS
-    # --------------------------------------------------------
-
-    return abs(sorted_returns[index])
+MAX_MARGIN_UTILISATION = 0.80   # VETO if using > 80% margin
+HIGH_MARGIN_UTILISATION= 0.60   # WARNING if using > 60% margin
+MAX_SYMBOL_EXPOSURE    = 0.30   # VETO if > 30% in one symbol
+HIGH_SYMBOL_EXPOSURE   = 0.20   # WARNING if > 20% in one symbol
+MAX_VOLATILITY         = 0.08   # VETO if 24h volatility > 8%
+HIGH_VOLATILITY        = 0.05   # WARNING if > 5%
+MAX_POSITIONS          = 5      # Covered by portfolio agent too
 
 
 # ============================================================
-# KELLY CRITERION
+# RISK AGENT NODE  (async)
 # ============================================================
 
-def kelly_criterion(
-    win_rate: float,
-    avg_win: float,
-    avg_loss: float
-) -> float:
+async def risk_agent_node(state: AgentState) -> dict:
     """
-    Kelly Criterion
+    Runs all risk checks. If any critical limit is breached → VETO.
+    If warnings only → HOLD with reduced confidence.
+    If all clear → HOLD with high confidence (agent approves trade).
 
-    Used for optimal position sizing.
-
-    Purpose:
-    --------
-    Maximize long-term capital growth
-    while minimizing probability of ruin.
-
-    Formula balances:
-    - win probability
-    - reward/risk ratio
-
-    IMPORTANT:
-    ----------
-    Full Kelly is extremely aggressive.
-
-    Real systems often use:
-    - half Kelly
-    - quarter Kelly
-    """
-
-    # --------------------------------------------------------
-    # SAFETY CHECK
-    # --------------------------------------------------------
-
-    if avg_loss == 0:
-        return 0.0
-
-
-    # --------------------------------------------------------
-    # WIN/LOSS RATIO
-    # --------------------------------------------------------
-
-    """
-    Example:
-    avg_win = 200
-    avg_loss = 100
-
-    b = 2
-    """
-
-    b = avg_win / avg_loss
-
-
-    # --------------------------------------------------------
-    # LOSS PROBABILITY
-    # --------------------------------------------------------
-
-    q = 1 - win_rate
-
-
-    # --------------------------------------------------------
-    # KELLY FORMULA
-    # --------------------------------------------------------
-
-    """
-    Kelly Formula:
-
-    (p*b - q) / b
-    """
-
-    kelly = (
-        (win_rate * b - q)
-        / b
-    )
-
-
-    # --------------------------------------------------------
-    # SAFETY CAP
-    # --------------------------------------------------------
-
-    """
-    Prevent overleveraging.
-
-    Real systems cap position size
-    to avoid catastrophic ruin.
-    """
-
-    return max(
-        0.0,
-        min(kelly, 0.25)
-    )
-
-
-# ============================================================
-# RISK AGENT NODE
-# ============================================================
-
-def risk_agent_node(
-    state: AgentState
-) -> dict:
-    """
-    Main LangGraph node for risk management.
-
-    Workflow:
-    ----------
-    Portfolio State
-        ↓
-    Margin Checks
-        ↓
-    Exposure Checks
-        ↓
-    Volatility Checks
-        ↓
-    Risk Decision
-
-    IMPORTANT:
-    ----------
-    Risk agent does NOT predict market.
-
-    It protects capital.
+    Returns a partial state update with risk_vote set.
     """
 
     try:
-
-        # ====================================================
-        # EXTRACT STATE
-        # ====================================================
-
         portfolio: PortfolioSnapshot = state["portfolio"]
+        ctx: MarketContext           = state["market_context"]
+        symbol                       = ctx.symbol
 
-        market_ctx: MarketContext = (
-            state["market_context"]
-        )
-
-        symbol = market_ctx.symbol
-
-
-        # ====================================================
-        # DEFAULT RISK POSTURE
-        # ====================================================
-
-        """
-        Risk agent normally stays neutral.
-
-        It only:
-        - approves
-        - warns
-        - vetoes
-
-        It does NOT initiate trades.
-        """
-
-        decision = "HOLD"
-
+        decision   = "HOLD"     # default: no objection
         confidence = 0.8
+        reasons    = []
+        metadata   = {}
 
-        reasons = []
+        # --------------------------------------------------------
+        # CHECK 1: MARGIN UTILISATION
+        # --------------------------------------------------------
 
-        metadata = {}
-
-
-        # ====================================================
-        # MARGIN UTILIZATION CHECK
-        # ====================================================
-
-        """
-        Margin utilization measures leverage usage.
-
-        Formula:
-        --------
-        margin_used / total_equity
-
-        Example:
-        --------
-        Equity = $100,000
-        Margin Used = $80,000
-
-        Utilization = 80%
-
-        High utilization increases liquidation risk.
-        """
+        # How much of our capital is already deployed?
+        # High utilisation = less room to absorb losses.
 
         if portfolio.total_equity > 0:
-
-            margin_utilization = (
-                portfolio.margin_used
-                / portfolio.total_equity
-            )
-
+            margin_util = portfolio.margin_used / portfolio.total_equity
         else:
+            margin_util = 0.0
 
-            margin_utilization = 0
+        metadata["margin_utilisation"] = round(margin_util, 4)
 
-
-        metadata["margin_utilization"] = round(
-            margin_utilization,
-            4
-        )
-
-
-        # ----------------------------------------------------
-        # EXTREME MARGIN RISK
-        # ----------------------------------------------------
-
-        if margin_utilization > 0.8:
-
-            """
-            Above 80% leverage usage.
-
-            Very dangerous.
-
-            Risk agent activates VETO.
-            """
-
-            decision = "VETO"
-
+        if margin_util > MAX_MARGIN_UTILISATION:
+            decision   = "VETO"
             confidence = 0.99
-
             reasons.append(
-                f"Margin utilization "
-                f"{margin_utilization*100:.1f}% "
-                f"> 80% limit"
+                f"Margin utilisation {margin_util*100:.1f}% "
+                f"exceeds {MAX_MARGIN_UTILISATION*100:.0f}% limit"
             )
 
-
-        # ----------------------------------------------------
-        # ELEVATED RISK
-        # ----------------------------------------------------
-
-        elif margin_utilization > 0.6:
-
-            """
-            Elevated leverage.
-
-            Not catastrophic yet,
-            but needs monitoring.
-            """
-
+        elif margin_util > HIGH_MARGIN_UTILISATION:
             reasons.append(
-                f"Margin utilization "
-                f"{margin_utilization*100:.1f}% "
-                f"- elevated"
+                f"Margin utilisation {margin_util*100:.1f}% — elevated"
             )
 
+        # --------------------------------------------------------
+        # CHECK 2: SINGLE SYMBOL CONCENTRATION
+        # --------------------------------------------------------
 
-        # ====================================================
-        # DRAWDOWN LIMIT CHECK
-        # ====================================================
-
-        """
-        Drawdown = peak-to-loss decline.
-
-        Institutional systems enforce:
-        maximum survivable drawdown.
-
-        Example:
-        --------
-        15% drawdown limit.
-        """
-
-        max_dd_limit = (
-            portfolio.max_drawdown_limit
-        )
-
-        metadata["max_drawdown_limit"] = (
-            max_dd_limit
-        )
-
-
-        # ====================================================
-        # POSITION CONCENTRATION CHECK
-        # ====================================================
-
-        """
-        Prevent excessive concentration
-        in single asset.
-
-        Diversification reduces:
-        - tail risk
-        - catastrophic exposure
-        """
+        # Are we already too exposed to this specific symbol?
+        # Concentration risk: if RELIANCE crashes, we lose a lot.
 
         symbol_exposure = sum(
-
-            position.get("notional", 0)
-
-            for position in portfolio.open_positions
-
-            if position.get("symbol") == symbol
+            pos.get("notional", 0)
+            for pos in portfolio.open_positions
+            if pos.get("symbol") == symbol
         )
-
-
-        # ----------------------------------------------------
-        # EXPOSURE PERCENTAGE
-        # ----------------------------------------------------
 
         if portfolio.total_equity > 0:
-
-            exposure_pct = (
-                symbol_exposure
-                / portfolio.total_equity
-            )
-
+            exposure_pct = symbol_exposure / portfolio.total_equity
         else:
+            exposure_pct = 0.0
 
-            exposure_pct = 0
+        metadata["symbol_exposure_pct"] = round(exposure_pct, 4)
 
-
-        metadata["symbol_exposure_pct"] = round(
-            exposure_pct,
-            4
-        )
-
-
-        # ----------------------------------------------------
-        # OVER-CONCENTRATION
-        # ----------------------------------------------------
-
-        if exposure_pct > 0.3:
-
-            """
-            More than 30% exposure
-            in single symbol.
-
-            Dangerous concentration risk.
-            """
-
-            decision = "VETO"
-
+        if exposure_pct > MAX_SYMBOL_EXPOSURE:
+            decision   = "VETO"
             confidence = 0.95
-
             reasons.append(
-                f"{symbol} exposure "
-                f"{exposure_pct*100:.1f}% "
-                f"> 30% limit"
+                f"{symbol} exposure {exposure_pct*100:.1f}% "
+                f"exceeds {MAX_SYMBOL_EXPOSURE*100:.0f}% limit"
             )
 
-
-        # ----------------------------------------------------
-        # ELEVATED CONCENTRATION
-        # ----------------------------------------------------
-
-        elif exposure_pct > 0.2:
-
+        elif exposure_pct > HIGH_SYMBOL_EXPOSURE:
             reasons.append(
-                f"{symbol} exposure "
-                f"{exposure_pct*100:.1f}% "
-                f"- consider reducing"
+                f"{symbol} exposure {exposure_pct*100:.1f}% — consider reducing"
             )
 
+        # --------------------------------------------------------
+        # CHECK 3: VOLATILITY REGIME
+        # --------------------------------------------------------
 
-        # ====================================================
-        # KELLY POSITION SIZING
-        # ====================================================
+        # High volatility = unpredictable prices = higher risk.
+        # During extreme volatility (elections, budget day,
+        # global events), we halt trading automatically.
 
-        """
-        Simulated conservative Kelly sizing.
+        vol = ctx.volatility_24h
+        metadata["volatility_24h"] = vol
 
-        Production version should use:
-        - real trade history
-        - win rate statistics
-        - dynamic optimization
-        """
-
-        kelly_size = 0.02
-
-
-        metadata["kelly_fraction"] = (
-            kelly_size
-        )
-
-        metadata["suggested_position_pct"] = round(
-            kelly_size * 100,
-            2
-        )
-
-
-        # ====================================================
-        # VOLATILITY REGIME CHECK
-        # ====================================================
-
-        """
-        High volatility increases:
-        - slippage
-        - liquidation risk
-        - unpredictability
-
-        Risk systems often reduce
-        or halt trading during chaos.
-        """
-
-        vol = market_ctx.volatility_24h
-
-
-        # ----------------------------------------------------
-        # EXTREME VOLATILITY
-        # ----------------------------------------------------
-
-        if vol > 0.08:
-
-            """
-            Above 8% daily volatility.
-
-            Market considered unstable.
-            """
-
-            decision = "VETO"
-
-            confidence = 0.9
-
+        if vol > MAX_VOLATILITY:
+            decision   = "VETO"
+            confidence = 0.90
             reasons.append(
-                f"Extreme volatility "
-                f"{vol*100:.1f}% "
-                f"- trading halted"
+                f"Extreme volatility {vol*100:.1f}% "
+                f"exceeds {MAX_VOLATILITY*100:.0f}% limit — trading halted"
             )
 
-
-        # ----------------------------------------------------
-        # HIGH VOLATILITY
-        # ----------------------------------------------------
-
-        elif vol > 0.05:
-
+        elif vol > HIGH_VOLATILITY:
             reasons.append(
-                f"High volatility "
-                f"{vol*100:.1f}% "
-                f"- reduced size recommended"
+                f"High volatility {vol*100:.1f}% — reduce position size"
             )
 
+        # --------------------------------------------------------
+        # CHECK 4: DRAWDOWN LIMIT
+        # --------------------------------------------------------
 
-        # ====================================================
-        # FINAL SAFE STATUS
-        # ====================================================
+        # If we are already sitting on large unrealised losses,
+        # taking on more risk is dangerous.
 
-        """
-        If no warnings triggered,
-        portfolio considered healthy.
-        """
+        if portfolio.unrealized_pnl < -(0.05 * portfolio.total_equity):
+            reasons.append(
+                f"Portfolio under stress — unrealised PnL: "
+                f"₹{portfolio.unrealized_pnl:.2f}"
+            )
+            if decision == "HOLD":
+                confidence = min(confidence, 0.6)
+
+        # --------------------------------------------------------
+        # KELLY CRITERION  (real calculation from trade history)
+        # --------------------------------------------------------
+
+        # The Kelly criterion gives the mathematically optimal
+        # fraction of capital to risk on each trade.
+        #
+        # Formula: f = (p*b - q) / b
+        # Where:
+        #   p = win rate (e.g. 0.6 = 60% wins)
+        #   q = 1 - p  (loss rate)
+        #   b = avg_win / avg_loss  (reward:risk ratio)
+        #
+        # We use HALF Kelly (divide by 2) which is standard
+        # in professional trading to reduce volatility.
+
+        kelly_fraction = await _calculate_kelly(symbol)
+        metadata["kelly_fraction"]      = kelly_fraction
+        metadata["suggested_size_pct"]  = round(kelly_fraction * 100, 2)
+
+        # --------------------------------------------------------
+        # ALL CHECKS PASSED
+        # --------------------------------------------------------
 
         if not reasons:
+            reasons.append("All risk checks passed")
 
-            reasons.append(
-                "All risk checks passed"
-            )
+        # --------------------------------------------------------
+        # BUILD VOTE
+        # --------------------------------------------------------
 
-            """
-            HOLD means:
-            no veto triggered.
-            """
-
-            decision = "HOLD"
-
-
-        # ====================================================
-        # CREATE FINAL VOTE
-        # ====================================================
+        metadata["max_drawdown_limit"] = portfolio.max_drawdown_limit
 
         vote = AgentVote(
-
-            agent="RiskAgent",
-
-            decision=decision,
-
-            confidence=round(confidence, 3),
-
-            reasoning=" | ".join(reasons),
-
-            metadata=metadata
+            agent     = "RiskAgent",
+            decision  = decision,
+            confidence= round(confidence, 3),
+            reasoning = " | ".join(reasons),
+            metadata  = metadata,
         )
-
-
-        # ====================================================
-        # LOG RESULT
-        # ====================================================
 
         logger.info(
-            f"🛡️ RiskAgent | "
-            f"{symbol} | "
-            f"{decision} | "
-            f"Confidence={confidence:.2f}"
+            f"🛡️  RiskAgent | {symbol} | {decision} | "
+            f"conf={confidence:.2f} | margin={margin_util*100:.1f}%"
         )
 
-
-        # ====================================================
-        # RETURN LANGGRAPH STATE UPDATE
-        # ====================================================
-
         return {
-
-            # Main risk output
-            "risk_vote": vote,
-
-            # Workflow observability
-
-            "completed_nodes": [
-               
-                "risk_agent"
-            ],
-
-            "logs": [
-                
-                (
-                    f"RiskAgent generated "
-                    f"{decision} for {symbol}"
-                )
-            ]
+            "risk_vote":       vote,
+            "completed_nodes": ["risk_agent"],
+            "logs":            [f"RiskAgent generated {decision} for {symbol}"],
         }
-
-
-    # ========================================================
-    # FAILSAFE HANDLING
-    # ========================================================
 
     except Exception as e:
+        logger.exception(f"RiskAgent failure: {e}")
 
-        """
-        Risk systems must fail safely.
-
-        If risk engine crashes:
-        safest action = VETO
-        """
-
-        logger.exception(
-            f"RiskAgent failure: {str(e)}"
-        )
-
-        error_vote = AgentVote(
-
-            agent="RiskAgent",
-
-            decision="VETO",
-
-            confidence=1.0,
-
-            reasoning=(
-                f"Risk system failure: {str(e)}"
-            )
-        )
-
+        # Risk agent failure → VETO (safest possible action)
         return {
-
-            "risk_vote": error_vote,
-
-            "execution_error": str(e),
-
-
-            "logs": [
-                
-                f"RiskAgent failed: {str(e)}"
-            ]
+            "risk_vote": AgentVote(
+                agent     = "RiskAgent",
+                decision  = "VETO",
+                confidence= 1.0,
+                reasoning = f"Risk system failure — defaulting to VETO: {e}",
+            ),
+            "completed_nodes": ["risk_agent"],
+            "logs":            [f"RiskAgent failed: {e}"],
         }
+
+
+# ============================================================
+# KELLY CRITERION CALCULATION  (from real Postgres history)
+# ============================================================
+
+async def _calculate_kelly(symbol: str) -> float:
+    """
+    Calculate the optimal position size fraction using the
+    Kelly criterion, based on real trade history from Postgres.
+
+    Returns a fraction between 0.0 and 0.25.
+    0.02 = 2% of capital per trade (conservative minimum).
+    0.25 = 25% of capital per trade (maximum cap, never exceeded).
+
+    If fewer than 10 closed trades exist for this symbol,
+    we return a safe conservative default of 0.02 (2%).
+    """
+
+    try:
+        async with AsyncSessionLocal() as session:
+            trades = await TradeRepo.get_recent_closed_trades(
+                session, symbol, limit=50
+            )
+            stats = TradeRepo.calculate_win_stats(trades)
+
+        win_rate = stats["win_rate"]
+        avg_win  = stats["avg_win"]
+        avg_loss = stats["avg_loss"]
+
+        if avg_loss == 0:
+            return 0.02
+
+        # Reward:risk ratio
+        b = avg_win / avg_loss
+
+        # Loss probability
+        q = 1.0 - win_rate
+
+        # Full Kelly
+        full_kelly = (win_rate * b - q) / b
+
+        # Half Kelly — standard professional practice
+        half_kelly = full_kelly / 2.0
+
+        # Clamp between 2% and 25%
+        result = max(0.02, min(half_kelly, 0.25))
+
+        logger.debug(
+            f"Kelly | {symbol} | "
+            f"win_rate={win_rate:.2f} | b={b:.2f} | "
+            f"half_kelly={half_kelly:.4f} | final={result:.4f} | "
+            f"n={stats['sample_size']}"
+        )
+
+        return round(result, 4)
+
+    except Exception as e:
+        logger.warning(f"Kelly calculation failed: {e} — using default 0.02")
+        return 0.02

@@ -1,755 +1,380 @@
 """
-Orchestrator Node
+app/agents/orchestration_agent.py
+===================================
+Orchestrator — collects all 4 agent votes, applies weighted
+consensus, decides the final trade, and sets HITL flag.
 
-Responsibilities:
------------------
-1. Collect all agent votes
-2. Apply weighted consensus logic
-3. Detect disagreements between agents
-4. Handle veto authority
-5. Generate final trade proposal
-6. Trigger HITL (Human-In-The-Loop) if needed
+CHANGES FROM ORIGINAL:
+-----------------------
+1. Now ASYNC  (async def orchestrator_node)
 
-IMPORTANT:
------------
-This is the brain of the multi-agent system.
+2. Publishes agent results to Redis pub/sub after every cycle.
+   The frontend WebSocket listens to this channel and updates
+   the live dashboard in real time — no polling needed.
 
-Agents produce opinions.
-Orchestrator produces final decision.
+3. Uses Kelly fraction from risk_vote metadata for position sizing.
+   Instead of hardcoded 2%, the actual Kelly result from
+   risk_agent is used to size the position correctly.
+
+4. Indian market: position size in Rupees, not USD.
+
+HOW POSITION SIZING WORKS NOW:
+-------------------------------
+risk_agent computes Kelly fraction from trade history.
+Example: Kelly = 0.04 (4% of equity)
+equity = ₹100,000
+position_size = ₹100,000 × 0.04 = ₹4,000
+
+The execution agent converts this to number of shares:
+shares = ₹4,000 / current_price
 """
 
-# ============================================================
-# IMPORTS
-# ============================================================
+import json
 
-# Structured logging
 from loguru import logger
 
-# Shared state + schemas
 from app.graph.state import (
-    AgentState,
-    AgentVote,
-    TradeProposal,
-    PortfolioSnapshot,
-    MarketContext
+    AgentState, AgentVote, TradeProposal,
+    PortfolioSnapshot, MarketContext,
 )
+from app.db.redis import redis_client, CHANNEL_AGENT_RESULTS, CHANNEL_HITL_PENDING
 
 
 # ============================================================
 # AGENT WEIGHTS
 # ============================================================
 
-"""
-Each agent contributes differently.
-
-Higher weight:
-    more influence on final decision
-
-These weights should eventually become:
-- performance-adaptive
-- dynamically optimized
-- reinforcement learned
-"""
+# Higher weight = more influence on the final decision.
+# Phase 2: these will be dynamically updated based on
+# each agent's historical prediction accuracy.
 
 AGENT_WEIGHTS = {
-
-    "SignalAgent": 0.30,
-
+    "SignalAgent":    0.30,
     "SentimentAgent": 0.20,
-
-    "RiskAgent": 0.25,
-
-    "PortfolioAgent": 0.25
+    "RiskAgent":      0.25,
+    "PortfolioAgent": 0.25,
 }
 
 
 # ============================================================
-# AGENT DISAGREEMENT METRIC
+# DISAGREEMENT METRIC
 # ============================================================
 
-def calculate_agent_disagreement(
-    votes: list[AgentVote]
-) -> float:
+def _calculate_disagreement(votes: list[AgentVote]) -> float:
     """
-    Measure disagreement between agents.
+    Measure how much agents disagree with each other.
 
-    Purpose:
-    --------
-    Detect uncertainty in system consensus.
+    Returns:
+      0.0 → full agreement
+      1.0 → extreme disagreement (half say BUY, half say SELL)
 
-    Interpretation:
-    ----------------
-    0.0:
-        full agreement
+    Higher disagreement → higher uncertainty → more likely HITL.
 
-    1.0:
-        extreme disagreement
-
-    Higher disagreement means:
-    - less reliable consensus
-    - more uncertainty
-    - greater need for HITL
+    We only count active votes (BUY or SELL), not HOLDs.
+    A HOLD means "no opinion", not disagreement.
     """
 
-    # --------------------------------------------------------
-    # EMPTY VOTE CHECK
-    # --------------------------------------------------------
+    active = [v.decision for v in votes if v.decision in ("BUY", "SELL")]
 
-    if not votes:
+    if len(active) <= 1:
         return 0.0
 
+    buys  = active.count("BUY")
+    sells = active.count("SELL")
+    total = buys + sells
 
-    # --------------------------------------------------------
-    # IGNORE HOLD DECISIONS
-    # --------------------------------------------------------
-
-    """
-    HOLD is neutral.
-
-    Only compare active opinions:
-    BUY vs SELL
-    """
-
-    decisions = [
-
-        vote.decision
-
-        for vote in votes
-
-        if vote.decision != "HOLD"
-    ]
-
-
-    # --------------------------------------------------------
-    # TOO FEW ACTIVE DECISIONS
-    # --------------------------------------------------------
-
-    if len(decisions) <= 1:
-        return 0.0
-
-
-    # --------------------------------------------------------
-    # COUNT BUY VS SELL
-    # --------------------------------------------------------
-
-    buy_count = sum(
-        1
-        for decision in decisions
-        if decision == "BUY"
-    )
-
-    sell_count = sum(
-        1
-        for decision in decisions
-        if decision == "SELL"
-    )
-
-
-    # --------------------------------------------------------
-    # TOTAL ACTIVE DECISIONS
-    # --------------------------------------------------------
-
-    total_active = (
-        buy_count + sell_count
-    )
-
-
-    if total_active == 0:
-        return 0.0
-
-
-    # --------------------------------------------------------
-    # DISAGREEMENT FORMULA
-    # --------------------------------------------------------
-
-    """
-    Minority faction strength.
-
-    Example:
-    --------
-    BUY BUY SELL
-
-    minority = 1
-    total = 3
-
-    disagreement = 0.33
-    """
-
-    disagreement = (
-        min(buy_count, sell_count)
-        / total_active
-    )
-
-    return round(disagreement, 3)
+    # Minority fraction = how split the active votes are
+    return round(min(buys, sells) / total, 3)
 
 
 # ============================================================
-# ORCHESTRATOR NODE
+# ORCHESTRATOR NODE  (async)
 # ============================================================
 
-def orchestrator_node(
-    state: AgentState
-) -> dict:
+async def orchestrator_node(state: AgentState) -> dict:
     """
-    Main orchestration node.
+    Combines all agent votes into one final trade decision.
 
-    Workflow:
-    ----------
-    Agent Votes
-        ↓
-    Weighted Consensus
-        ↓
-    Risk Filtering
-        ↓
-    Trade Proposal
-        ↓
-    HITL Evaluation
+    Flow:
+    -----
+    Collect votes → check VETO → weighted score → decide →
+    size position → evaluate HITL → publish to Redis → return
     """
 
     try:
+        ctx: MarketContext           = state["market_context"]
+        portfolio: PortfolioSnapshot = state["portfolio"]
+        symbol  = ctx.symbol
+        price   = ctx.current_price
 
-        # ====================================================
-        # EXTRACT SHARED STATE
-        # ====================================================
+        # --------------------------------------------------------
+        # COLLECT VOTES
+        # --------------------------------------------------------
 
-        market_ctx: MarketContext = (
-            state["market_context"]
-        )
-
-        portfolio: PortfolioSnapshot = (
-            state["portfolio"]
-        )
-
-        symbol = market_ctx.symbol
-
-        price = market_ctx.current_price
-
-
-        # ====================================================
-        # COLLECT AGENT VOTES
-        # ====================================================
-
-        """
-        Retrieve all agent outputs
-        from LangGraph shared state.
-        """
-
-        votes = []
-
-
-        for vote_key in [
-
-            "signal_vote",
-
-            "sentiment_vote",
-
-            "risk_vote",
-
-            "portfolio_vote"
-        ]:
-
-            vote = state.get(vote_key)
-
-            if vote:
-
-                """
-                Votes already stored
-                as AgentVote objects.
-                """
-
-                votes.append(vote)
-
-
-        # ====================================================
-        # NO VOTES SAFETY CHECK
-        # ====================================================
-
-        if not votes:
-
-            logger.warning(
-                "No agent votes received"
-            )
-
-            empty_proposal = TradeProposal(
-
-                symbol=symbol,
-
-                direction="NONE",
-
-                size=0,
-
-                entry_price=price,
-
-                risk_score=1.0,
-
-                agent_consensus=[]
-            )
-
-            return {
-
-                "consensus": empty_proposal,
-
-                "hitl_required": False,
-
-                "hitl_status": "NOT_REQUIRED"
-            }
-
-
-        # ====================================================
-        # VETO CHECK
-        # ====================================================
-
-        """
-        Risk agents may override
-        all other agents.
-
-        IMPORTANT:
-        -----------
-        In institutional systems,
-        risk management always has
-        final authority.
-        """
-
-        vetoes = [
-
-            vote
-
-            for vote in votes
-
-            if vote.decision == "VETO"
+        votes = [
+            v for v in [
+                state.get("signal_vote"),
+                state.get("sentiment_vote"),
+                state.get("risk_vote"),
+                state.get("portfolio_vote"),
+            ]
+            if v is not None
         ]
 
+        if not votes:
+            logger.warning("Orchestrator: no agent votes received")
 
-        if vetoes:
-
-            veto = vetoes[0]
-
-            logger.warning(
-                f"🚫 Trade VETOED by "
-                f"{veto.agent}: "
-                f"{veto.reasoning}"
-            )
-
-            veto_proposal = TradeProposal(
-
-                symbol=symbol,
-
-                direction="NONE",
-
-                size=0,
-
-                entry_price=price,
-
-                risk_score=1.0,
-
-                agent_consensus=votes,
-
-                human_approved=False
+            proposal = TradeProposal(
+                symbol=symbol, direction="NONE",
+                size=0, entry_price=price, risk_score=1.0,
             )
 
             return {
-
-                "consensus": veto_proposal,
-
+                "consensus":   proposal,
                 "hitl_required": False,
-
                 "hitl_status": "NOT_REQUIRED",
-
-
-                "completed_nodes": [
-                    *state.get("completed_nodes", []),
-                    "orchestrator"
-                ],
-
-                "logs": [
-                    *state.get("logs", []),
-                    (
-                        f"Trade vetoed by "
-                        f"{veto.agent}"
-                    )
-                ]
+                "completed_nodes": ["orchestrator"],
+                "logs": ["Orchestrator: no votes — NONE"],
             }
 
+        # --------------------------------------------------------
+        # VETO CHECK
+        # --------------------------------------------------------
 
-        # ====================================================
-        # WEIGHTED SCORING
-        # ====================================================
+        # Any VETO from any agent = no trade, no questions asked.
+        # The risk agent has absolute authority to block trades.
 
-        """
-        Weighted voting system.
+        vetoes = [v for v in votes if v.decision == "VETO"]
 
-        Stronger agents contribute more.
+        if vetoes:
+            veto = vetoes[0]
+            logger.warning(f"🚫 VETO by {veto.agent}: {veto.reasoning}")
 
-        Formula:
-        --------
-        weight × confidence
-        """
+            proposal = TradeProposal(
+                symbol         = symbol,
+                direction      = "NONE",
+                size           = 0,
+                entry_price    = price,
+                risk_score     = 1.0,
+                agent_consensus= votes,
+                human_approved = False,
+            )
 
-        buy_score = 0.0
+            await _publish_results(symbol, proposal, votes)
 
+            return {
+                "consensus":       proposal,
+                "hitl_required":   False,
+                "hitl_status":     "NOT_REQUIRED",
+                "completed_nodes": ["orchestrator"],
+                "logs":            [f"Trade VETOED by {veto.agent}"],
+            }
+
+        # --------------------------------------------------------
+        # WEIGHTED CONSENSUS SCORING
+        # --------------------------------------------------------
+
+        buy_score  = 0.0
         sell_score = 0.0
-
-        total_weight = 0.0
-
-
-        # ----------------------------------------------------
-        # PROCESS EACH AGENT VOTE
-        # ----------------------------------------------------
+        total_wt   = 0.0
 
         for vote in votes:
-
-            weight = AGENT_WEIGHTS.get(
-                vote.agent,
-                0.2
-            )
-
-            total_weight += weight
-
-
-            # ------------------------------------------------
-            # BUY CONTRIBUTION
-            # ------------------------------------------------
+            wt = AGENT_WEIGHTS.get(vote.agent, 0.2)
+            total_wt += wt
 
             if vote.decision == "BUY":
-
-                buy_score += (
-                    weight
-                    * vote.confidence
-                )
-
-
-            # ------------------------------------------------
-            # SELL CONTRIBUTION
-            # ------------------------------------------------
-
+                buy_score  += wt * vote.confidence
             elif vote.decision == "SELL":
+                sell_score += wt * vote.confidence
 
-                sell_score += (
-                    weight
-                    * vote.confidence
-                )
+        if total_wt > 0:
+            buy_score  /= total_wt
+            sell_score /= total_wt
 
+        disagreement = _calculate_disagreement(votes)
 
-        # ====================================================
-        # NORMALIZATION
-        # ====================================================
+        # --------------------------------------------------------
+        # FINAL DECISION
+        # --------------------------------------------------------
 
-        """
-        Normalize scores
-        into comparable scale.
-        """
+        # Threshold of 0.55: a signal must be reasonably strong
+        # before we act. Weak signals produce too many bad trades.
 
-        if total_weight > 0:
-
-            buy_score /= total_weight
-
-            sell_score /= total_weight
-
-
-        # ====================================================
-        # DISAGREEMENT ANALYSIS
-        # ====================================================
-
-        disagreement = (
-            calculate_agent_disagreement(
-                votes
-            )
-        )
-
-
-        # ====================================================
-        # FINAL CONSENSUS DECISION
-        # ====================================================
-
-        """
-        Thresholds prevent weak trades.
-
-        Small uncertain signals:
-            HOLD
-
-        Strong aligned signals:
-            LONG / SHORT
-        """
-
-        if (
-
-            buy_score > 0.55
-
-            and buy_score > sell_score
-        ):
-
-            direction = "LONG"
-
+        if buy_score > 0.55 and buy_score > sell_score:
+            direction  = "LONG"
             confidence = buy_score
+            decision   = "BUY"
 
-            decision = "BUY"
-
-
-        elif (
-
-            sell_score > 0.55
-
-            and sell_score > buy_score
-        ):
-
-            direction = "SHORT"
-
+        elif sell_score > 0.55 and sell_score > buy_score:
+            direction  = "SHORT"
             confidence = sell_score
-
-            decision = "SELL"
-
+            decision   = "SELL"
 
         else:
+            direction  = "NONE"
+            confidence = max(buy_score, sell_score)
+            decision   = "HOLD"
 
-            direction = "NONE"
-
-            confidence = max(
-                buy_score,
-                sell_score
-            )
-
-            decision = "HOLD"
-
-
-        # ====================================================
+        # --------------------------------------------------------
         # RISK SCORE
-        # ====================================================
+        # --------------------------------------------------------
 
-        """
-        Higher confidence:
-            lower risk
+        # Low confidence → high risk
+        # High disagreement → higher risk
+        risk_score = min(1.0, max(0.0,
+            (1.0 - confidence) + (disagreement * 0.3)
+        ))
 
-        Higher disagreement:
-            higher risk
+        # --------------------------------------------------------
+        # POSITION SIZING  (using Kelly from risk agent)
+        # --------------------------------------------------------
 
-        Risk score range:
-            0 → safe
-            1 → dangerous
-        """
+        # Extract Kelly fraction computed by risk_agent
+        risk_vote = state.get("risk_vote")
+        kelly_fraction = 0.02   # safe default
 
-        risk_score = (
-
-            1.0 - confidence
-
-            + (disagreement * 0.3)
-        )
-
-
-        # ----------------------------------------------------
-        # CLAMP RISK SCORE
-        # ----------------------------------------------------
-
-        risk_score = min(
-            1.0,
-            max(0.0, risk_score)
-        )
-
-
-        # ====================================================
-        # POSITION SIZING
-        # ====================================================
-
-        """
-        Conservative position sizing.
-
-        Current rule:
-        --------------
-        2% of total equity per trade.
-
-        Production systems may use:
-        - Kelly criterion
-        - volatility targeting
-        - dynamic sizing
-        """
+        if risk_vote and risk_vote.metadata:
+            kelly_fraction = risk_vote.metadata.get("kelly_fraction", 0.02)
 
         if decision != "HOLD":
-
-            position_size = (
-                portfolio.total_equity
-                * 0.02
-            )
-
+            # Position size in Rupees
+            position_rupees = portfolio.total_equity * kelly_fraction
         else:
+            position_rupees = 0.0
 
-            position_size = 0
-
-
-        # ====================================================
-        # CREATE TRADE PROPOSAL
-        # ====================================================
+        # --------------------------------------------------------
+        # TRADE PROPOSAL
+        # --------------------------------------------------------
 
         proposal = TradeProposal(
-
-            symbol=symbol,
-
-            direction=direction,
-
-            size=round(position_size, 2),
-
-            entry_price=price,
-
-            risk_score=round(
-                risk_score,
-                3
-            ),
-
-            agent_consensus=votes,
-
-            human_approved=None
+            symbol         = symbol,
+            direction      = direction,
+            size           = round(position_rupees, 2),
+            entry_price    = price,
+            risk_score     = round(risk_score, 3),
+            agent_consensus= votes,
+            human_approved = None,
         )
 
-
-        # ====================================================
-        # HUMAN-IN-THE-LOOP (HITL)
-        # ====================================================
-
-        """
-        Some trades require
-        human approval.
-
-        Common institutional practice.
-        """
+        # --------------------------------------------------------
+        # HITL EVALUATION
+        # --------------------------------------------------------
 
         hitl_required = False
+        hitl_reasons  = []
 
-        hitl_reasons = []
-
-
-        # ----------------------------------------------------
-        # HIGH RISK CHECK
-        # ----------------------------------------------------
-
-        if risk_score > 0.7:
-
+        if risk_score > 0.70:
             hitl_required = True
+            hitl_reasons.append(f"High risk score: {risk_score:.2f}")
 
-            hitl_reasons.append(
-                f"High risk score: "
-                f"{risk_score:.2f}"
-            )
-
-
-        # ----------------------------------------------------
-        # HIGH DISAGREEMENT CHECK
-        # ----------------------------------------------------
-
-        if disagreement > 0.4:
-
+        if disagreement > 0.40:
             hitl_required = True
+            hitl_reasons.append(f"High agent disagreement: {disagreement:.2f}")
 
-            hitl_reasons.append(
-                f"High disagreement: "
-                f"{disagreement:.2f}"
-            )
-
-
-        # ----------------------------------------------------
-        # LARGE POSITION CHECK
-        # ----------------------------------------------------
-
-        if position_size > (
-            portfolio.total_equity * 0.05
-        ):
-
+        if position_rupees > (portfolio.total_equity * 0.05):
             hitl_required = True
+            hitl_reasons.append(f"Large position: ₹{position_rupees:.2f}")
 
-            hitl_reasons.append(
-                f"Large position: "
-                f"${position_size:.2f}"
-            )
+        # --------------------------------------------------------
+        # PUBLISH TO REDIS  (frontend WebSocket picks this up)
+        # --------------------------------------------------------
 
+        await _publish_results(symbol, proposal, votes, hitl_required, hitl_reasons)
 
-        # ====================================================
-        # LOG FINAL DECISION
-        # ====================================================
+        # --------------------------------------------------------
+        # LOG
+        # --------------------------------------------------------
 
         logger.info(
-            f"🎯 Orchestrator | "
-            f"{decision} {symbol} | "
-            f"Conf={confidence:.2f} | "
-            f"Risk={risk_score:.2f} | "
-            f"Disagreement={disagreement:.2f} | "
-            f"HITL={hitl_required}"
+            f"🎯 Orchestrator | {decision} {symbol} | "
+            f"conf={confidence:.2f} | risk={risk_score:.2f} | "
+            f"kelly={kelly_fraction:.3f} | "
+            f"size=₹{position_rupees:.0f} | HITL={hitl_required}"
         )
 
-
-        # ====================================================
-        # RETURN LANGGRAPH STATE UPDATE
-        # ====================================================
-
         return {
-
-            # Final trade proposal
-            "consensus": proposal,
-
-            # HITL controls
-            "hitl_required": hitl_required,
-
-            "hitl_status": (
-                "PENDING"
-                if hitl_required
-                else "NOT_REQUIRED"
-            ),
-
-            # Workflow observability
-            "completed_nodes": [
-            
-                "orchestrator"
-            ],
-
-            "logs": [
-               
-                (
-                    f"Orchestrator generated "
-                    f"{decision} for {symbol}"
-                )
-            ]
+            "consensus":       proposal,
+            "hitl_required":   hitl_required,
+            "hitl_status":     "PENDING" if hitl_required else "NOT_REQUIRED",
+            "completed_nodes": ["orchestrator"],
+            "logs":            [f"Orchestrator generated {decision} for {symbol}"],
         }
-
-
-    # ========================================================
-    # FAILSAFE HANDLING
-    # ========================================================
 
     except Exception as e:
+        logger.exception(f"Orchestrator failure: {e}")
 
-        """
-        Orchestrator failure is critical.
-
-        Safest action:
-        no trade.
-        """
-
-        logger.exception(
-            f"Orchestrator failure: {str(e)}"
-        )
-
-        fallback_proposal = TradeProposal(
-
-            symbol="UNKNOWN",
-
-            direction="NONE",
-
-            size=0,
-
-            entry_price=0,
-
-            risk_score=1.0
+        fallback = TradeProposal(
+            symbol="UNKNOWN", direction="NONE",
+            size=0, entry_price=0, risk_score=1.0,
         )
 
         return {
-
-            "consensus": fallback_proposal,
-
-            "hitl_required": True,
-
-            "hitl_status": "PENDING",
-
+            "consensus":       fallback,
+            "hitl_required":   True,
+            "hitl_status":     "PENDING",
             "execution_error": str(e),
-
-            "logs": [
-               
-                f"Orchestrator failed: {str(e)}"
-            ]
+            "completed_nodes": ["orchestrator"],
+            "logs":            [f"Orchestrator failed: {e}"],
         }
-        
+
+
+# ============================================================
+# REDIS PUBLISH HELPER
+# ============================================================
+
+async def _publish_results(
+    symbol:        str,
+    proposal:      TradeProposal,
+    votes:         list[AgentVote],
+    hitl_required: bool = False,
+    hitl_reasons:  list[str] | None = None,
+) -> None:
+    """
+    Publish orchestrator results to Redis pub/sub.
+
+    The frontend WebSocket server subscribes to this channel
+    and pushes the data to all connected browser clients.
+    This gives the live "agent vote panel" its real-time updates.
+
+    If hitl_required=True, also publish to CHANNEL_HITL_PENDING
+    so the frontend can show the HITL approval modal immediately.
+    """
+
+    try:
+        payload = {
+            "symbol":       symbol,
+            "direction":    proposal.direction,
+            "size":         proposal.size,
+            "entry_price":  proposal.entry_price,
+            "risk_score":   proposal.risk_score,
+            "hitl_required": hitl_required,
+            "hitl_reasons": hitl_reasons or [],
+            "votes": [
+                {
+                    "agent":      v.agent,
+                    "decision":   v.decision,
+                    "confidence": v.confidence,
+                    "reasoning":  v.reasoning,
+                }
+                for v in votes
+            ],
+        }
+
+        await redis_client.publish(
+            CHANNEL_AGENT_RESULTS,
+            json.dumps(payload),
+        )
+
+        if hitl_required:
+            await redis_client.publish(
+                CHANNEL_HITL_PENDING,
+                json.dumps({
+                    "symbol":   symbol,
+                    "reasons":  hitl_reasons or [],
+                    "proposal": payload,
+                }),
+            )
+
+    except Exception as e:
+        # Publish failure is non-fatal — log and continue
+        logger.warning(f"Redis publish failed: {e}")

@@ -1,142 +1,158 @@
-
-
 """
-Trade Model
+app/db/models/trade.py
+=======================
+Trade table — every executed or rejected trade stored permanently.
 
-Stores executed trades.
+RELATIONSHIP TO USER:
+----------------------
+Every trade now has a user_id foreign key.
+This means:
+  - "show me MY trades" → WHERE trades.user_id = current_user.id
+  - The risk agent's Kelly calculation uses only YOUR trade history
+  - Each user's PnL is tracked independently
+
+RELATIONSHIP TO WORKFLOW RUN:
+-------------------------------
+Every trade also links to the workflow_run that created it.
+This lets you trace: which agent cycle → which trade → which outcome.
 """
-
-# ============================================================
-# IMPORTS
-# ============================================================
 
 import uuid
+from datetime import datetime, timezone
 
-from datetime import datetime
-
-from sqlalchemy import (
-    String,
-    Float,
-    Boolean,
-    JSON,
-    DateTime,
-    ForeignKey
-)
-
-from sqlalchemy.orm import (
-    Mapped,
-    mapped_column,
-    relationship
-)
+from sqlalchemy import String, Float, Boolean, DateTime, JSON, Text, ForeignKey
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 
-
-# ============================================================
-# TRADE MODEL
-# ============================================================
 
 class Trade(Base):
 
     __tablename__ = "trades"
 
-
-    # ========================================================
-    # PRIMARY KEY
-    # ========================================================
+    # --------------------------------------------------------
+    # IDENTITY
+    # --------------------------------------------------------
 
     id: Mapped[str] = mapped_column(
-        String,
+        String(36),
         primary_key=True,
-        default=lambda: str(uuid.uuid4())
+        default=lambda: str(uuid.uuid4()),
     )
 
-
-    # ========================================================
-    # RELATIONSHIPS
-    # ========================================================
-
+    # Which user triggered this trade
+    # ON DELETE CASCADE: if user is deleted, their trades are deleted too
     user_id: Mapped[str] = mapped_column(
-        ForeignKey("users.id")
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="FK to users.id — which user owns this trade",
     )
 
-    portfolio_id: Mapped[str] = (
-        mapped_column(
-            ForeignKey("portfolios.id")
-        )
+    # The 8-char LangGraph workflow run ID
+    run_id: Mapped[str] = mapped_column(
+        String(8),
+        index=True,
+        comment="LangGraph run_id that created this trade",
     )
 
+    # Optional FK to workflow_runs table for full traceability
+    workflow_run_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("workflow_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="FK to workflow_runs.id",
+    )
 
-    # ========================================================
+    # --------------------------------------------------------
     # TRADE DETAILS
-    # ========================================================
+    # --------------------------------------------------------
 
-    symbol: Mapped[str] = mapped_column(
-        String,
-        index=True
+    symbol:      Mapped[str]   = mapped_column(String(30))
+    direction:   Mapped[str]   = mapped_column(String(10))  # LONG | SHORT | NONE
+    size:        Mapped[float] = mapped_column(Float)        # number of shares
+    entry_price: Mapped[float] = mapped_column(Float)
+
+    stop_loss:   Mapped[float | None] = mapped_column(Float, nullable=True)
+    take_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # --------------------------------------------------------
+    # RISK
+    # --------------------------------------------------------
+
+    risk_score: Mapped[float] = mapped_column(Float)
+
+    # --------------------------------------------------------
+    # STATUS
+    # --------------------------------------------------------
+
+    # OPEN | CLOSED | REJECTED | FAILED
+    status: Mapped[str] = mapped_column(String(20), default="OPEN")
+
+    # --------------------------------------------------------
+    # HITL
+    # --------------------------------------------------------
+
+    hitl_required:  Mapped[bool]       = mapped_column(Boolean, default=False)
+    human_approved: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    human_notes:    Mapped[str | None]  = mapped_column(Text,    nullable=True)
+
+    # Who approved/rejected (their user_id)
+    reviewed_by: Mapped[str | None] = mapped_column(
+        String(36),
+        nullable=True,
+        comment="user_id of the risk_manager who reviewed HITL",
     )
 
-    direction: Mapped[str] = (
-        mapped_column(String)
+    # --------------------------------------------------------
+    # AGENT VOTES  (full JSON audit trail)
+    # --------------------------------------------------------
+
+    agent_consensus: Mapped[list | None] = mapped_column(JSON, nullable=True)
+
+    # --------------------------------------------------------
+    # BROKER EXECUTION
+    # --------------------------------------------------------
+
+    broker:            Mapped[str | None]   = mapped_column(String(20),  nullable=True)
+    broker_order_id:   Mapped[str | None]   = mapped_column(String(100), nullable=True)
+    actual_fill_price: Mapped[float | None] = mapped_column(Float,       nullable=True)
+    slippage:          Mapped[float | None] = mapped_column(Float,       nullable=True)
+
+    # --------------------------------------------------------
+    # PnL
+    # --------------------------------------------------------
+
+    exit_price:   Mapped[float | None] = mapped_column(Float, nullable=True)
+    realized_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pnl_pct:      Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # --------------------------------------------------------
+    # TIMESTAMPS
+    # --------------------------------------------------------
+
+    opened_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
     )
 
-    entry_price: Mapped[float] = (
-        mapped_column(Float)
+    closed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )
-
-    quantity: Mapped[float] = (
-        mapped_column(Float)
-    )
-
-    status: Mapped[str] = (
-        mapped_column(String)
-    )
-
-
-    # ========================================================
-    # AI DECISION DATA
-    # ========================================================
-
-    risk_score: Mapped[float] = (
-        mapped_column(Float)
-    )
-
-    human_approved: Mapped[bool] = (
-        mapped_column(Boolean)
-    )
-
-    agent_consensus: Mapped[dict] = (
-        mapped_column(JSON)
-    )
-
-
-    # ========================================================
-    # TIMESTAMP
-    # ========================================================
-
-    created_at: Mapped[datetime] = (
-        mapped_column(
-            DateTime,
-            default=datetime.utcnow
-        )
-    )
-
-
-    # ========================================================
+    # --------------------------------------------------------
     # RELATIONSHIPS
-    # ========================================================
+    # --------------------------------------------------------
 
-    user = relationship(
-        "User",
-        back_populates="trades"
-    )
+    # Many trades → one user
+    user = relationship("User", back_populates="trades")
 
-    portfolio = relationship(
-        "Portfolio",
-        back_populates="trades"
-    )
+    # Many trades → one workflow run
+    workflow_run = relationship("WorkflowRun", back_populates="trades")
 
-    agent_decisions = relationship(
-        "AgentDecision",
-        back_populates="trade"
-    )
+    def __repr__(self) -> str:
+        return (
+            f"Trade(id={self.id!r}, symbol={self.symbol!r}, "
+            f"direction={self.direction!r}, user_id={self.user_id!r})"
+        )

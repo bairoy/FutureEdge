@@ -1,105 +1,117 @@
 """
-FutureEdge — FastAPI Application Entry Point
+main.py
+========
+FutureEdge FastAPI application entry point.
 
-Key wiring:
+HOW TO RUN:
 -----------
-1. lifespan=lifespan  →  opens the PostgreSQL checkpointer
-                          connection ONCE at startup and keeps
-                          it alive until shutdown.
+    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
-2. hitl_router        →  /api/v1/workflow/resume endpoint so
-                          the frontend can approve/reject trades.
+Or inside Docker (recommended):
+    docker compose up
 
-3. /workflow/run      →  triggers a new agent cycle and returns
-                          the thread_id so the caller can track
-                          or resume the workflow later.
+SETUP ORDER (first time only):
+--------------------------------
+1. Start services:
+       docker compose up -d db redis
+
+2. Create all database tables:
+       docker compose exec backend python -m app.scripts.create_tables
+
+3. Create the first admin user:
+       docker compose exec backend python -m app.scripts.create_admin
+
+4. Start the app:
+       docker compose up backend
+
+5. Visit the API docs:
+       http://localhost:8000/docs
+
+API ENDPOINTS:
+--------------
+POST /auth/login                    → get JWT tokens
+POST /auth/refresh                  → refresh access token
+POST /auth/logout                   → revoke refresh token
+GET  /auth/me                       → current user profile
+
+POST /users                         → create user (admin only)
+GET  /users                         → list all users (admin only)
+PUT  /users/{id}/role               → change role (admin only)
+POST /users/{id}/deactivate         → disable user (admin only)
+
+POST /api/v1/workflow/run           → start agent cycle (trader+)
+POST /api/v1/workflow/resume        → approve/reject HITL (risk_manager+)
+GET  /api/v1/workflow/{id}/status   → check workflow status (viewer+)
+
+POST /api/v1/kill-switch/halt       → halt trading (risk_manager+)
+POST /api/v1/kill-switch/resume     → resume trading (risk_manager+)
+GET  /api/v1/kill-switch/status     → check kill switch (viewer+)
+
+WS   /api/v1/market/stream?token=.. → live WebSocket stream (viewer+)
 """
 
-# ============================================================
-# IMPORTS
-# ============================================================
-
 from fastapi import FastAPI
-from loguru  import logger
+from loguru import logger
 
-# Lifespan: opens DB connection + compiles graph at startup
 from app.graph.runtime import lifespan
 
-# HITL API router
-from app.api.routes.hitl_router import router as hitl_router
+# Auth endpoints (login, refresh, logout, /me)
+from app.api.routes.auth_router import router as auth_router
 
-# Workflow entry point
-from app.graph.builder import run_agent_cycle
+# User management (admin only: create, list, change role)
+from app.api.routes.users_router import router as users_router
 
-# Schemas for the run endpoint
-from app.graph.state import MarketContext, PortfolioSnapshot
+# Workflow endpoints (run, resume HITL, status)
+from app.api.routes.workflow_router import router as workflow_router
+
+# Kill switch (halt/resume trading)
+from app.api.routes.kill_switch_router import router as kill_switch_router
+
+# WebSocket live stream
+from app.api.routes.market_router import router as market_router
 
 
 # ============================================================
-# APPLICATION
+# CREATE APP
 # ============================================================
 
 app = FastAPI(
-    title="FutureEdge Trading Agent",
-    version="1.0.0",
-    lifespan=lifespan,          # ← keeps checkpointer alive
+    title       = "FutureEdge — Indian Market AI Trading System",
+    description = (
+        "Multi-agent AI trading system for NSE/BSE via Zerodha Kite. "
+        "Supports multi-user with role-based access control."
+    ),
+    version     = "1.0.0",
+    lifespan    = lifespan,   # handles startup/shutdown
 )
 
 
 # ============================================================
-# ROUTERS
+# REGISTER ROUTERS
 # ============================================================
 
-app.include_router(hitl_router)
+# Auth — no prefix, routes are /auth/login etc.
+app.include_router(auth_router)
 
+# Users — prefix /users
+app.include_router(users_router)
 
-# ============================================================
-# WORKFLOW RUN ENDPOINT
-# ============================================================
-
-@app.post(
-    "/api/v1/workflow/run",
-    summary="Start a new agent workflow cycle",
-)
-async def run_workflow(
-    market_context: MarketContext,
-    portfolio:      PortfolioSnapshot,
-):
-    """
-    Trigger a full multi-agent trading cycle.
-
-    Returns:
-    --------
-    {
-        "thread_id": "a1b2c3d4",   ← save this!
-        "hitl_status": "PENDING",  ← PENDING means paused for review
-        "state": { ... }
-    }
-
-    If hitl_status == "PENDING", the workflow is paused.
-    Call POST /api/v1/workflow/resume with the thread_id to
-    approve or reject the trade.
-
-    If hitl_status == "NOT_REQUIRED" or "APPROVED", the trade
-    was or is being executed automatically.
-    """
-
-    result = await run_agent_cycle(
-        market_context=market_context,
-        portfolio=portfolio,
-    )
-
-    return {
-        "thread_id":   result["thread_id"],
-        "hitl_status": result["state"].get("hitl_status", "UNKNOWN"),
-        "state":       result["state"],
-    }
+# Workflow, kill switch, market — all under /api/v1/
+app.include_router(workflow_router)
+app.include_router(kill_switch_router)
+app.include_router(market_router)
 
 
 # ============================================================
 # HEALTH CHECK
 # ============================================================
 
-@app.get("/health", tags=["ops"])
+@app.get("/health", tags=["ops"], summary="Service health check")
 async def health():
-    return {"status": "ok"}
+    """
+    Simple health check endpoint.
+    Returns 200 OK if the service is running.
+    Used by Docker health checks and load balancers.
+    No authentication required.
+    """
+    return {"status": "ok", "service": "futureedge"}

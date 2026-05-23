@@ -1,36 +1,44 @@
 """
-FutureEdge Runtime
+app/graph/runtime.py
+=====================
+Application startup/shutdown lifecycle + compiled graph singleton.
 
-Responsibilities:
------------------
-1. Create a single AsyncPostgresSaver that lives for the
-   entire application lifetime (NOT per workflow cycle).
-2. Compile the LangGraph graph once against that checkpointer.
-3. Expose workflow_graph so every part of the app uses the
-   same compiled graph + same live DB connection.
+WHAT THIS FILE DOES:
+---------------------
+On startup (before the app serves any requests):
+  1. Open PostgreSQL connection for LangGraph checkpoints
+  2. Create checkpoint tables if they don't exist
+  3. Compile the LangGraph graph once (with checkpointer attached)
+  4. Load historical NSE candles via yfinance (free, no API key)
+  5. Start KiteTicker WebSocket for live tick streaming (if market open)
+  6. Connect to the broker (mock or Zerodha)
 
-WHY THIS MATTERS FOR HITL:
----------------------------
-interrupt() saves checkpoint to PostgreSQL, then ainvoke()
-returns early.  If the checkpointer connection is closed
-after that ainvoke() call (as happens when you use
-`async with` inside run_agent_cycle), the resume API has
-no live connection to load the checkpoint from.
+While running:
+  - workflow_graph is available to all API endpoints
+  - Live ticks flow: KiteTicker -> Redis Stream -> agents
 
-The lifespan context manager keeps the connection open from
-app startup → app shutdown, solving this completely.
+On shutdown:
+  - Stop KiteTicker WebSocket cleanly
+  - Close PostgreSQL connection
+  - Disconnect from broker
+
+WHY THE CHECKPOINTER MUST STAY ALIVE:
+---------------------------------------
+When interrupt() fires (HITL), LangGraph saves the workflow
+state to PostgreSQL and ainvoke() returns early.
+Later, when the resume API is called, LangGraph must reload
+that checkpoint from PostgreSQL to continue the workflow.
+
+If the PostgreSQL connection closes between the interrupt and
+the resume call, the workflow cannot be resumed.
+
+The lifespan() context manager solves this by keeping the
+connection open for the entire application lifetime.
 """
 
-# ============================================================
-# IMPORTS
-# ============================================================
-
 from contextlib import asynccontextmanager
-
 from loguru import logger
-
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-
 from app.core.config import settings
 
 
@@ -38,16 +46,15 @@ from app.core.config import settings
 # MODULE-LEVEL SINGLETONS
 # ============================================================
 
-# Populated by lifespan() before the app starts serving
 _checkpointer: AsyncPostgresSaver | None = None
 workflow_graph = None
 
 
-# ============================================================
-# DATABASE URI
-# ============================================================
-
 def _build_db_uri() -> str:
+    """
+    PostgreSQL URI for LangGraph checkpointer.
+    Note: LangGraph uses plain postgresql:// not postgresql+asyncpg://
+    """
     return (
         f"postgresql://"
         f"{settings.POSTGRES_USER}:"
@@ -59,59 +66,116 @@ def _build_db_uri() -> str:
 
 
 # ============================================================
-# LIFESPAN CONTEXT MANAGER
+# LIFESPAN
 # ============================================================
 
 @asynccontextmanager
 async def lifespan(app):
     """
-    FastAPI lifespan handler.
+    FastAPI lifespan context manager.
 
-    Usage in main.py:
-    -----------------
-    from app.graph.runtime import lifespan
-    app = FastAPI(lifespan=lifespan)
+    Wire into FastAPI like this in main.py:
+        app = FastAPI(lifespan=lifespan)
 
-    Lifecycle:
-    ----------
-    startup  → open DB connection, create tables, compile graph
-    running  → app serves requests (graph + checkpointer live)
-    shutdown → close DB connection cleanly
+    Everything before yield runs at STARTUP.
+    Everything after  yield runs at SHUTDOWN.
     """
 
     global _checkpointer, workflow_graph
 
-    db_uri = _build_db_uri()
+    # --------------------------------------------------------
+    # STEP 1: POSTGRESQL CHECKPOINTER
+    # --------------------------------------------------------
 
-    logger.info("🔌 Opening persistent PostgreSQL checkpointer...")
+    logger.info("Connecting to PostgreSQL checkpointer...")
 
-    async with AsyncPostgresSaver.from_conn_string(db_uri) as checkpointer:
-
-        # --------------------------------------------------------
-        # CREATE CHECKPOINT TABLES (idempotent)
-        # --------------------------------------------------------
+    async with AsyncPostgresSaver.from_conn_string(_build_db_uri()) as checkpointer:
 
         await checkpointer.setup()
-
-        logger.info("✅ Checkpoint tables ready")
+        logger.info("Checkpoint tables ready")
 
         # --------------------------------------------------------
-        # COMPILE GRAPH ONCE
+        # STEP 2: COMPILE GRAPH
         # --------------------------------------------------------
 
-        # Import here to avoid circular imports at module load
         from app.graph.builder import create_graph
 
         _checkpointer  = checkpointer
-        workflow_graph = create_graph().compile(
-            checkpointer=checkpointer
-        )
+        workflow_graph = create_graph().compile(checkpointer=checkpointer)
 
-        logger.info("🚀 FutureEdge graph compiled and ready")
+        logger.info("LangGraph workflow compiled")
+
+        # --------------------------------------------------------
+        # STEP 3: LOAD HISTORICAL CANDLES (yfinance - free)
+        # --------------------------------------------------------
+        # Gives agents enough history for RSI/MACD/Bollinger
+        # from the very first cycle without waiting for live ticks.
+
+        try:
+            from app.data.feed import load_historical_candles
+            from app.db.redis import redis_client, STREAM_TICKS
+
+            symbol  = settings.DEFAULT_SYMBOL
+            candles = load_historical_candles(symbol, period="5d", interval="1m")
+
+            if candles:
+                for c in candles[-100:]:
+                    await redis_client.xadd(
+                        STREAM_TICKS,
+                        {
+                            "token":     str(settings.DEFAULT_INSTRUMENT_TOKEN),
+                            "ltp":       str(c["close"]),
+                            "open":      str(c["open"]),
+                            "high":      str(c["high"]),
+                            "low":       str(c["low"]),
+                            "close":     str(c["close"]),
+                            "volume":    str(c["volume"]),
+                            "timestamp": c["timestamp"],
+                            "source":    "yfinance_historical",
+                        },
+                        maxlen=1000,
+                        approximate=True,
+                    )
+
+                logger.info(
+                    f"Seeded Redis Stream with {min(len(candles), 100)} "
+                    f"historical candles for {symbol}"
+                )
+
+        except Exception as e:
+            logger.warning(f"Historical candle load failed (non-fatal): {e}")
+
+        # --------------------------------------------------------
+        # STEP 4: START LIVE FEED
+        # --------------------------------------------------------
+
+        from app.data.feed import tick_publisher
+
+        if settings.ACTIVE_FEED == "zerodha":
+            tick_publisher.start()
+            logger.info("KiteTicker live feed started")
+        else:
+            logger.info("Mock feed mode - KiteTicker not started")
+
+        # --------------------------------------------------------
+        # STEP 5: CONNECT BROKER
+        # --------------------------------------------------------
+
+        from app.brokers.base import get_broker
+
+        broker = get_broker()
+        connected = await broker.connect()
+
+        if connected:
+            logger.info(f"Broker connected: {settings.ACTIVE_BROKER}")
+        else:
+            logger.warning(f"Broker connection failed: {settings.ACTIVE_BROKER}")
 
         # --------------------------------------------------------
         # APP RUNS HERE
         # --------------------------------------------------------
+
+        logger.info("FutureEdge is ready")
 
         yield
 
@@ -119,27 +183,30 @@ async def lifespan(app):
         # SHUTDOWN
         # --------------------------------------------------------
 
-        logger.info("🔌 Closing PostgreSQL checkpointer...")
+        logger.info("Shutting down FutureEdge...")
 
-    logger.info("👋 Checkpointer closed cleanly")
+        tick_publisher.stop()
+        await broker.disconnect()
+
+        logger.info("Shutdown complete")
+
+    logger.info("PostgreSQL checkpointer closed")
 
 
 # ============================================================
-# HELPER: GET GRAPH (safe accessor)
+# SAFE ACCESSOR
 # ============================================================
 
 def get_workflow_graph():
     """
-    Returns the compiled workflow graph.
-
-    Raises RuntimeError if called before lifespan() has run
-    (i.e. before the app has started).
+    Returns the compiled LangGraph workflow.
+    Raises RuntimeError if called before startup.
     """
 
     if workflow_graph is None:
         raise RuntimeError(
             "workflow_graph is not initialised. "
-            "Make sure lifespan() is wired into FastAPI."
+            "Make sure lifespan() is wired into FastAPI in main.py."
         )
 
     return workflow_graph

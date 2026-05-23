@@ -1,48 +1,43 @@
-# Import async database utilities from SQLAlchemy
+"""
+
+==================
+PostgreSQL connection using SQLAlchemy async.
+
+TWO THINGS ARE CREATED HERE:
+------------------------------
+1. engine            — the connection pool manager (one per app)
+2. AsyncSessionLocal — a factory that creates DB sessions
+
+HOW TO USE A SESSION IN ANY ASYNC FUNCTION:
+--------------------------------------------
+    from app.db.postgres import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(query)
+        await session.commit()
+
+WHY ASYNCPG?
+-------------
+asyncpg is a pure-Python async PostgreSQL driver.
+It never blocks the event loop — important for a trading
+system where every millisecond matters.
+"""
+
 from sqlalchemy.ext.asyncio import (
-    create_async_engine,   # Creates the async database engine
-    async_sessionmaker,    # Factory for creating async DB sessions
-    AsyncSession           # Type/class representing an async DB session
+    create_async_engine,
+    async_sessionmaker,
+    AsyncSession,
 )
 
-# Import application settings
-# Usually loaded from .env using Pydantic BaseSettings
 from app.core.config import settings
 
 
 # ============================================================
-# DATABASE CONNECTION URL
+# CONNECTION URL
 # ============================================================
 
-# We are constructing the PostgreSQL connection string dynamically
-# using values stored inside settings.
-
-# Final generated URL will look like:
-#
-# postgresql+asyncpg://username:password@host:port/database
-#
-# Example:
-# postgresql+asyncpg://postgres:mypassword@localhost:5432/legal_ai
-#
-# Breakdown:
-#
-# postgresql
-#   -> Database type
-#
-# +asyncpg
-#   -> Async driver used for PostgreSQL
-#      SQLAlchemy itself is not truly async.
-#      It uses an async driver underneath.
-#
-# username:password
-#   -> Database authentication credentials
-#
-# host:port
-#   -> Where PostgreSQL server is running
-#
-# /database_name
-#   -> Which database to connect to
-
+# Format: postgresql+asyncpg://user:password@host:port/database
+# "+asyncpg" tells SQLAlchemy to use the async driver.
 
 DATABASE_URL = (
     f"postgresql+asyncpg://"
@@ -55,43 +50,22 @@ DATABASE_URL = (
 
 
 # ============================================================
-# CREATE DATABASE ENGINE
+# ENGINE  (one per application lifetime)
 # ============================================================
 
-# Engine is the CORE interface between SQLAlchemy and the database.
+# pool_pre_ping=True : before reusing a pooled connection,
+#   ping it to confirm it is still alive.
+#   Prevents "server closed connection" errors after idle.
 #
-# Think of engine as:
-#
-# "The main connection manager that knows how to talk to PostgreSQL"
-#
-# It handles:
-# - opening DB connections
-# - connection pooling
-# - SQL communication
-# - async communication
-# - transaction coordination
-#
-# IMPORTANT:
-# Engine itself is NOT a single DB connection.
-#
-# It is a FACTORY + MANAGER for multiple connections.
-
+# pool_size=10  : keep 10 connections open at all times.
+# max_overflow=20 : allow 20 extra connections under heavy load.
 
 engine = create_async_engine(
-
-    # Connection URL we created above
     DATABASE_URL,
-
-    # echo=True prints every SQL query in terminal
-    #
-    # Useful during development/debugging.
-    #
-    # Example logs:
-    #
-    # SELECT users.id, users.name FROM users
-    #
-    # In production usually set to False
-    echo=True,
+    echo=False,           # set True to print every SQL query
+    pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=20,
 )
 
 
@@ -99,54 +73,16 @@ engine = create_async_engine(
 # SESSION FACTORY
 # ============================================================
 
-# Session = temporary conversation with database
+# Call AsyncSessionLocal() to create a new session each time.
+# A session = one unit of work with the DB.
 #
-# VERY IMPORTANT CONCEPT:
-#
-# Engine manages CONNECTIONS.
-# Session manages DATABASE OPERATIONS.
-#
-# Session is what you actually use inside API routes/services.
-#
-# Example:
-#
-# async with AsyncSessionLocal() as session:
-#     result = await session.execute(query)
-#
-#
-# async_sessionmaker creates a FACTORY that can generate
-# new AsyncSession objects whenever needed.
-
+# expire_on_commit=False :
+#   After commit(), ORM objects stay readable in Python memory.
+#   Without this, SQLAlchemy tries to reload them from DB
+#   immediately after commit — which fails in async code.
 
 AsyncSessionLocal = async_sessionmaker(
-
-    # Bind this session factory to our engine
-    #
-    # Meaning:
-    # "Whenever a session is created, use this engine"
     bind=engine,
-
-    # Specify that sessions should be asynchronous
-    #
-    # Without this:
-    # session would behave synchronously
     class_=AsyncSession,
-
-    # IMPORTANT SQLAlchemy behavior
-    #
-    # expire_on_commit=False means:
-    #
-    # "After commit, keep object data available in memory"
-    #
-    # Example:
-    #
-    # user.name still accessible after commit
-    #
-    # If True:
-    # SQLAlchemy expires object state after commit
-    # and tries to re-fetch from DB again.
-    #
-    # In FastAPI async apps,
-    # False is commonly preferred.
-    expire_on_commit=False
+    expire_on_commit=False,
 )
