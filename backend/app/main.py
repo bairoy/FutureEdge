@@ -70,6 +70,10 @@ from app.api.routes.kill_switch_router import router as kill_switch_router
 # WebSocket live stream
 from app.api.routes.market_router import router as market_router
 
+from app.api.routes.zerodha_router import router as zerodha_router
+
+from app.api.routes.trades_router       import router as trades_router
+
 
 # ============================================================
 # CREATE APP
@@ -100,6 +104,8 @@ app.include_router(users_router)
 app.include_router(workflow_router)
 app.include_router(kill_switch_router)
 app.include_router(market_router)
+app.include_router(zerodha_router)
+app.include_router(trades_router)       # /api/v1/trades
 
 
 # ============================================================

@@ -106,6 +106,7 @@ async def orchestrator_node(state: AgentState) -> dict:
         portfolio: PortfolioSnapshot = state["portfolio"]
         symbol  = ctx.symbol
         price   = ctx.current_price
+        run_id  = state["run_id"]
 
         # --------------------------------------------------------
         # COLLECT VOTES
@@ -160,7 +161,7 @@ async def orchestrator_node(state: AgentState) -> dict:
                 human_approved = False,
             )
 
-            await _publish_results(symbol, proposal, votes)
+            await _publish_results(symbol, proposal, votes, run_id)
 
             return {
                 "consensus":       proposal,
@@ -279,7 +280,7 @@ async def orchestrator_node(state: AgentState) -> dict:
         # PUBLISH TO REDIS  (frontend WebSocket picks this up)
         # --------------------------------------------------------
 
-        await _publish_results(symbol, proposal, votes, hitl_required, hitl_reasons)
+        await _publish_results(symbol, proposal, votes, run_id, hitl_required, hitl_reasons)
 
         # --------------------------------------------------------
         # LOG
@@ -326,6 +327,7 @@ async def _publish_results(
     symbol:        str,
     proposal:      TradeProposal,
     votes:         list[AgentVote],
+    run_id:        str,
     hitl_required: bool = False,
     hitl_reasons:  list[str] | None = None,
 ) -> None:
@@ -342,6 +344,7 @@ async def _publish_results(
 
     try:
         payload = {
+            "run_id":       run_id,
             "symbol":       symbol,
             "direction":    proposal.direction,
             "size":         proposal.size,

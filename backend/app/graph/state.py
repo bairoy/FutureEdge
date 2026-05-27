@@ -1,280 +1,140 @@
 """
-FutureEdge Agent State Definitions
+app/graph/state.py
+===================
+LangGraph shared state — updated for Phase 2.
 
-Central shared state passed between all LangGraph nodes.
-Each node reads/writes data from this state object.
+PHASE 2 ADDITIONS:
+-------------------
+1. llm_rationale : str
+   The LLM (Claude) explanation of WHY the orchestrator chose
+   its direction. Shown to the risk manager in the HITL review
+   modal so they can understand the reasoning before approving.
+
+2. regime : str
+   Market regime detected from OHLCV data.
+   Values: TRENDING_UP | TRENDING_DOWN | SIDEWAYS | HIGH_VOL | UNKNOWN
+   Used by signal_agent to weight indicators appropriately.
+   (RSI matters more in SIDEWAYS, MACD matters more in TRENDING)
+
+3. episodic_memory : list[dict]
+   Top-K similar past trade situations retrieved from Qdrant.
+   Injected into the orchestrator prompt so it can learn from history.
+   Example entry:
+   {
+     "symbol": "RELIANCE",
+     "regime": "TRENDING_UP",
+     "direction": "LONG",
+     "outcome": "WIN",
+     "pnl_pct": 1.2,
+     "similarity": 0.91
+   }
 """
 
-# ============================================================
-# IMPORTS
-# ============================================================
+from typing import Optional, Annotated
+import operator
 
-from typing import Optional
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
-from typing import Annotated
-import operator 
 
-# ============================================================
-# AGENT VOTE
-# ============================================================
 
 class AgentVote(BaseModel):
-    """
-    Represents a single agent's trading opinion.
-    
-    Example:
-    - Signal Agent → BUY
-    - Risk Agent → HOLD
-    - Sentiment Agent → SELL
-    """
+    agent:      str
+    decision:   str            # BUY | SELL | HOLD | VETO
+    confidence: float = Field(ge=0.0, le=1.0)
+    reasoning:  str
+    metadata:   dict = Field(default_factory=dict)
 
-    # Name of the agent
-    agent: str
-
-    # Trading decision made by agent
-    # BUY, SELL, HOLD, VETO
-    decision: str
-
-    # Confidence score between 0 and 1
-    # Example:
-    # 0.95 = very confident
-    confidence: float = Field(
-        ge=0.0,
-        le=1.0
-    )
-
-    # Why the agent made this decision
-    reasoning: str
-
-    # Extra optional data
-    # Example:
-    # indicators, model outputs, probabilities
-    metadata: dict = Field(default_factory=dict)
-
-
-# ============================================================
-# TRADE PROPOSAL
-# ============================================================
 
 class TradeProposal(BaseModel):
-    """
-    Final trade decision produced by orchestrator.
-    """
+    symbol:          str
+    direction:       str        # LONG | SHORT | NONE
+    size:            float      # position size in Rupees
+    entry_price:     float
+    stop_loss:       Optional[float] = None
+    take_profit:     Optional[float] = None
+    risk_score:      float = Field(ge=0.0, le=1.0)
+    agent_consensus: list[AgentVote] = Field(default_factory=list)
+    human_approved:  Optional[bool]  = None
+    human_notes:     Optional[str]   = None
+    llm_rationale:   Optional[str]   = None  # Phase 2: LLM explanation
 
-    # Trading symbol
-    # Example: BTCUSDT, AAPL, MES
-    symbol: str
-
-    # LONG or SHORT
-    direction: str
-
-    # Position size
-    # Example: 2 BTC or 5 contracts
-    size: float
-
-    # Expected trade entry price
-    entry_price: float
-
-    # Risk management levels
-    stop_loss: Optional[float] = None
-    take_profit: Optional[float] = None
-
-    # Overall risk score
-    # Lower = safer
-    risk_score: float = Field(
-        ge=0.0,
-        le=1.0
-    )
-
-    # Votes collected from all agents
-    agent_consensus: list[AgentVote] = Field(
-        default_factory=list
-    )
-
-    # Human approval system (HITL)
-    human_approved: Optional[bool] = None
-
-    # Optional human feedback
-    human_notes: Optional[str] = None
-
-
-# ============================================================
-# PORTFOLIO STATE
-# ============================================================
 
 class PortfolioSnapshot(BaseModel):
-    """
-    Current trading account condition.
-    """
-
-    # Total account value
-    total_equity: float
-
-    # Margin currently locked
-    margin_used: float
-
-    # Free capital available
-    margin_available: float
-
-    # Current unrealized profit/loss
-    unrealized_pnl: float
-
-    # Active open positions
-    open_positions: list[dict] = Field(
-        default_factory=list
-    )
-
-    # Daily realized PnL
+    total_equity:       float
+    margin_used:        float
+    margin_available:   float
+    unrealized_pnl:     float
+    open_positions:     list[dict] = Field(default_factory=list)
     realized_pnl_today: float = 0.0
-
-    # Current exposure level
-    # Example: 0.45 = 45% capital exposed
-    exposure_ratio: float = 0.0
-
-    # Max allowed drawdown
+    exposure_ratio:     float = 0.0
     max_drawdown_limit: float = 0.2
 
 
-# ============================================================
-# MARKET CONTEXT
-# ============================================================
-
 class MarketContext(BaseModel):
-    """
-    Current market environment data.
-    """
+    symbol:           str
+    current_price:    float
+    ohlcv_1m:         list[dict] = Field(default_factory=list)
+    ohlcv_5m:         list[dict] = Field(default_factory=list)
+    recent_news:      list[dict] = Field(default_factory=list)
+    macro_indicators: dict       = Field(default_factory=dict)
+    regime:           str   = "UNKNOWN"   # Phase 2: auto-detected
+    volatility_24h:   float = 0.0
+    sentiment_score:  float = 0.0
+    liquidity_score:  float = 0.0
 
-    # Trading asset
-    symbol: str
-
-    # Current live price
-    current_price: float
-
-    # OHLCV candles (1 minute)
-    ohlcv_1m: list[dict] = Field(default_factory=list)
-
-    # OHLCV candles (5 minute)
-    ohlcv_5m: list[dict] = Field(default_factory=list)
-
-    # Recent news articles/events
-    recent_news: list[dict] = Field(default_factory=list)
-
-    # Macro economic indicators
-    macro_indicators: dict = Field(default_factory=dict)
-
-    # Market regime
-    # Example:
-    # TRENDING_BULLISH
-    # SIDEWAYS
-    # HIGH_VOLATILITY
-    regime: str = "UNKNOWN"
-
-    # 24h volatility
-    volatility_24h: float = 0.0
-
-    # Market sentiment score
-    # Example:
-    # -1 = bearish
-    # +1 = bullish
-    sentiment_score: float = 0.0
-
-    # Liquidity condition
-    liquidity_score: float = 0.0
-
-
-# ============================================================
-# LANGGRAPH GLOBAL STATE
-# ============================================================
 
 class AgentState(TypedDict):
     """
     Shared state passed between all LangGraph nodes.
-    
-    Every node:
-    - reads from this state
-    - updates this state
+
+    PHASE 2 ADDITIONS:
+    - llm_rationale  : Claude's explanation of the consensus decision
+    - episodic_memory: similar past trades from Qdrant (populated before orchestrator)
     """
 
     # --------------------------------------------------------
-    # INPUTS
+    # USER CONTEXT
     # --------------------------------------------------------
+    user_id: str
 
-    # Trading symbol
-    symbol: str
-
-    # Current market information
+    # --------------------------------------------------------
+    # MARKET + PORTFOLIO INPUTS
+    # --------------------------------------------------------
+    symbol:         str
     market_context: MarketContext
-
-    # Portfolio/account state
-    portfolio: PortfolioSnapshot
-
+    portfolio:      PortfolioSnapshot
 
     # --------------------------------------------------------
     # AGENT OUTPUTS
     # --------------------------------------------------------
-
-    # Technical signal agent output
-    signal_vote: Optional[AgentVote]
-
-    # News/sentiment agent output
+    signal_vote:    Optional[AgentVote]
     sentiment_vote: Optional[AgentVote]
-
-    # Risk management agent output
-    risk_vote: Optional[AgentVote]
-
-    # Portfolio optimization agent output
+    risk_vote:      Optional[AgentVote]
     portfolio_vote: Optional[AgentVote]
 
+    # --------------------------------------------------------
+    # ORCHESTRATOR
+    # --------------------------------------------------------
+    consensus:     Optional[TradeProposal]
+    llm_rationale: Optional[str]   # Phase 2: Claude's reasoning
 
     # --------------------------------------------------------
-    # ORCHESTRATOR OUTPUT
+    # HITL
     # --------------------------------------------------------
-
-    # Final merged decision
-    consensus: Optional[TradeProposal]
-
-
-    # --------------------------------------------------------
-    # HUMAN-IN-THE-LOOP (HITL)
-    # --------------------------------------------------------
-
-    # Whether human approval required
     hitl_required: bool
-
-    # HITL state
-    # PENDING, APPROVED, REJECTED, TIMEOUT
-    hitl_status: str
-
+    hitl_status:   str
 
     # --------------------------------------------------------
     # EXECUTION
     # --------------------------------------------------------
-
-    # Executed trade details
-    executed_trade: Optional[dict]
-
-    # Execution failure reason
+    executed_trade:  Optional[dict]
     execution_error: Optional[str]
 
-
     # --------------------------------------------------------
-    # MEMORY + OBSERVABILITY
+    # OBSERVABILITY + MEMORY
     # --------------------------------------------------------
-
-    # Unique workflow run id
-    run_id: str
-
-    # Execution timestamp
-    timestamp: str
-
-    # Retrieved past similar situations
-    episodic_memory: list[dict]
-
-    # Logs generated during workflow
-    logs: Annotated[list[str],operator.add]
-
-    # Node execution history
-    completed_nodes: Annotated[list[str],operator.add]
-
-    
+    run_id:          str
+    timestamp:       str
+    episodic_memory: list[dict]   # Phase 2: filled from Qdrant
+    logs:            Annotated[list[str], operator.add]
+    completed_nodes: Annotated[list[str], operator.add]

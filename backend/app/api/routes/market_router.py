@@ -46,6 +46,7 @@ FRONTEND JAVASCRIPT EXAMPLE:
 
 import asyncio
 import json
+from datetime import datetime
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from loguru import logger
@@ -106,67 +107,55 @@ async def _authenticate_websocket(token: str | None) -> str | None:
 
 
 # ============================================================
+# HISTORY SEEDING ENDPOINT
+# ============================================================
+
+@router.get("/history/{symbol}")
+async def get_market_history(symbol: str):
+    """
+    Fetch the last 50 minutes of history for a symbol via yfinance.
+    Used to seed the chart immediately when a user searches for a stock.
+    """
+    from app.data.feed import load_historical_candles
+    candles = load_historical_candles(symbol, period="1d", interval="1m")
+    
+    # Format for lightweight-charts (Unix seconds)
+    formatted = []
+    for c in candles[-50:]:
+        try:
+            ts = int(datetime.fromisoformat(c["timestamp"]).timestamp())
+            formatted.append({
+                "time":   ts,
+                "open":   c["open"],
+                "high":   c["high"],
+                "low":    c["low"],
+                "close":  c["close"],
+                "volume": c["volume"],
+            })
+        except:
+            continue
+    return formatted
+
+
+# ============================================================
 # WEBSOCKET ENDPOINT
 # ============================================================
 
 @router.websocket("/stream")
 async def market_stream(
     websocket: WebSocket,
-    token: str | None = Query(default=None, description="JWT access token"),
+    token: str | None = Query(default=None),
 ):
-    """
-    WebSocket that streams everything the frontend needs.
-
-    Authentication: pass the access token as ?token=<your_token>
-
-    Messages format:
-        { "type": "tick",         "data": { "ltp": 22500, ... } }
-        { "type": "agent_result", "data": { "direction": "LONG", ... } }
-        { "type": "hitl_pending", "data": { "symbol": "RELIANCE", ... } }
-        { "type": "trade",        "data": { "shares": 2, ... } }
-        { "type": "kill_switch",  "data": { "halted": true, ... } }
-    """
-
-    # --------------------------------------------------------
-    # AUTHENTICATE BEFORE ACCEPTING
-    # --------------------------------------------------------
-    # We check the token BEFORE calling websocket.accept().
-    # If invalid, we close with code 4001 (our "unauthorized" code).
-
     user_id = await _authenticate_websocket(token)
-
     if user_id is None:
-        await websocket.close(code=4001, reason="Unauthorized — invalid or missing token")
-        logger.warning("WebSocket connection rejected — invalid token")
+        await websocket.close(code=4001, reason="Unauthorized")
         return
 
     await websocket.accept()
+    logger.info(f"WebSocket connected | user_id={user_id}")
 
-    logger.info(f"WebSocket connected | user_id={user_id} | client={websocket.client}")
-
-    # --------------------------------------------------------
-    # SUBSCRIBE TO REDIS PUB/SUB CHANNELS
-    # --------------------------------------------------------
-    # We use a SEPARATE Redis connection for pub/sub.
-    # Why? Once subscribed, a Redis connection is in a special mode
-    # where you can only call subscribe/unsubscribe/get_message.
-    # You cannot do regular commands (get, set, xread, etc.) on it.
-    # So we keep two connections:
-    #   redis_client        → for xread (stream) and regular commands
-    #   pubsub_client       → dedicated to pub/sub listening
-
-    import redis.asyncio as aioredis
-    from app.core.config import settings
-
-    pubsub_client = aioredis.Redis(
-        host=settings.REDIS_HOST,
-        port=settings.REDIS_PORT,
-        db=settings.REDIS_DB,
-        decode_responses=True,
-    )
-
-    pubsub = pubsub_client.pubsub()
-
+    current_symbol = "NIFTY 50"
+    pubsub = redis_client.pubsub()
     await pubsub.subscribe(
         CHANNEL_AGENT_RESULTS,
         CHANNEL_HITL_PENDING,
@@ -174,93 +163,70 @@ async def market_stream(
         CHANNEL_KILL_SWITCH,
     )
 
-    # "$" means: only new entries added AFTER we started listening.
-    # We do not want to replay old ticks to a freshly connected user.
-    last_tick_id = "$"
+    # Background task to listen for commands FROM the client (like subscribe)
+    async def listen_to_client():
+        nonlocal current_symbol
+        try:
+            while True:
+                data = await websocket.receive_json()
+                if data.get("type") == "subscribe":
+                    new_symbol = data.get("symbol", "NIFTY 50")
+                    # Clear current ticks for the new symbol
+                    await websocket.send_json({"type": "clear_ticks"})
+                    current_symbol = new_symbol
+                    logger.info(f"User {user_id} subscribed to {new_symbol}")
+                    # Notify feed manager to start tracking this symbol (Phase 2)
+        except:
+            pass
 
+    asyncio.create_task(listen_to_client())
+
+    last_tick_id = "$"
     try:
         while True:
-
-            # ------------------------------------------------
-            # READ LIVE TICKS  (from Redis Stream)
-            # ------------------------------------------------
-            # xread() reads new entries from the stream.
-            # block=0 means: return immediately even if empty
-            #   (we handle the empty case by just continuing the loop)
-
+            # 1. READ LIVE TICKS
             try:
-                entries = await redis_client.xread(
-                    {STREAM_TICKS: last_tick_id},
-                    count=10,
-                    block=0,
-                )
-
+                entries = await redis_client.xread({STREAM_TICKS: last_tick_id}, count=5, block=10)
                 if entries:
-                    # entries = [("stream_name", [(id, {fields}), ...])]
-                    for _stream_name, messages in entries:
+                    for _, messages in entries:
                         for msg_id, fields in messages:
-                            last_tick_id = msg_id   # advance our cursor
-
+                            last_tick_id = msg_id
+                            # Only send if it matches current symbol (or if it's NIFTY and we're on NIFTY)
+                            # For simplicity in Phase 1, we send everything and let frontend filter,
+                            # but better to filter here.
                             await websocket.send_json({
                                 "type": "tick",
                                 "data": {
-                                    "ltp":       float(fields.get("ltp",    0)),
-                                    "open":      float(fields.get("open",   0)),
-                                    "high":      float(fields.get("high",   0)),
-                                    "low":       float(fields.get("low",    0)),
-                                    "close":     float(fields.get("close",  0)),
-                                    "volume":    int(fields.get("volume",   0)),
+                                    "ltp":       float(fields.get("ltp", 0)),
+                                    "open":      float(fields.get("open", 0)),
+                                    "high":      float(fields.get("high", 0)),
+                                    "low":       float(fields.get("low", 0)),
+                                    "close":     float(fields.get("close", 0)),
+                                    "volume":    int(fields.get("volume", 0)),
                                     "timestamp": fields.get("timestamp", ""),
                                 },
                             })
+            except (TimeoutError, asyncio.TimeoutError):
+                pass
 
-            except Exception as e:
-                logger.warning(f"Tick stream read error: {e}")
+            # 2. READ PUB/SUB
+            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.01)
+            if message and message.get("data"):
+                channel = message.get("channel", "")
+                data = message["data"]
+                try:
+                    parsed = json.loads(data)
+                except:
+                    parsed = {"raw": data}
 
-            # ------------------------------------------------
-            # READ PUB/SUB MESSAGES  (agent results, etc.)
-            # ------------------------------------------------
-            # timeout=0.01 means: wait at most 10ms for a message.
-            # If nothing arrives in 10ms, return None and continue.
-            # This keeps the loop responsive.
+                msg_type = {
+                    CHANNEL_AGENT_RESULTS:  "agent_result",
+                    CHANNEL_HITL_PENDING:   "hitl_pending",
+                    CHANNEL_TRADE_EXECUTED: "trade",
+                    CHANNEL_KILL_SWITCH:    "kill_switch",
+                }.get(channel, "unknown")
 
-            try:
-                message = await pubsub.get_message(
-                    ignore_subscribe_messages=True,
-                    timeout=0.01,
-                )
-
-                if message and message.get("data"):
-                    channel = message.get("channel", "")
-                    data    = message["data"]
-
-                    try:
-                        parsed = json.loads(data)
-                    except Exception:
-                        parsed = {"raw": data}
-
-                    # Map Redis channel name → frontend message type
-                    msg_type = {
-                        CHANNEL_AGENT_RESULTS:  "agent_result",
-                        CHANNEL_HITL_PENDING:   "hitl_pending",
-                        CHANNEL_TRADE_EXECUTED: "trade",
-                        CHANNEL_KILL_SWITCH:    "kill_switch",
-                    }.get(channel, "unknown")
-
-                    await websocket.send_json({
-                        "type": msg_type,
-                        "data": parsed,
-                    })
-
-            except Exception as e:
-                logger.warning(f"PubSub read error: {e}")
-
-            # ------------------------------------------------
-            # SMALL SLEEP — prevent CPU busy loop
-            # ------------------------------------------------
-            # 100ms = we check for new data 10 times per second.
-            # Fast enough for a trading dashboard, slow enough
-            # to not waste CPU when the market is quiet.
+                await websocket.send_json({"type": msg_type, "data": parsed})
 
             await asyncio.sleep(0.1)
 
@@ -272,5 +238,8 @@ async def market_stream(
 
     finally:
         # Always clean up Redis connections when WebSocket closes
-        await pubsub.unsubscribe()
-        await pubsub_client.close()
+        try:
+            await pubsub.unsubscribe()
+            await pubsub.close()
+        except:
+            pass

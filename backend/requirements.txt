@@ -70,3 +70,18 @@ python-dotenv>=1.0.0               # .env loading
 email-validator>=2.0.0
 bcrypt>=4.0.0
 PyJWT>=2.8.0
+
+openai
+anthropic>=0.28.0
+
+# ============================================================
+# AI — FINBERT  (Phase 2 — optional, install separately)
+# Only needed if FINBERT_ENABLED=true in .env
+# Requires ~2GB disk and ~800MB RAM
+#
+# Install separately when ready:
+#   pip install transformers torch
+#
+# transformers>=4.40.0
+# torch>=2.0.0
+# ============================================================

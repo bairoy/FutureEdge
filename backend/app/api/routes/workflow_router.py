@@ -133,6 +133,23 @@ async def run_workflow(
         "hitl_status":     state.get("hitl_status", "UNKNOWN"),
         "direction":       consensus.direction if consensus else "NONE",
         "risk_score":      consensus.risk_score if consensus else 0.0,
+        "proposal":        consensus.model_dump() if consensus else None,
+        "votes": [
+            {
+                "agent":      v.agent,
+                "decision":   v.decision,
+                "confidence": v.confidence,
+                "reasoning":  v.reasoning,
+            }
+            for v in [
+                state.get("signal_vote"),
+                state.get("sentiment_vote"),
+                state.get("risk_vote"),
+                state.get("portfolio_vote"),
+            ]
+            if v is not None
+        ],
+        "reasons":         state.get("hitl_reasons", []),
         "execution_error": state.get("execution_error"),
         "completed_nodes": state.get("completed_nodes", []),
         "logs":            state.get("logs", []),

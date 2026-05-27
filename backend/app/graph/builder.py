@@ -1,56 +1,36 @@
 """
-FutureEdge LangGraph Builder
+app/graph/builder.py
+=====================
+LangGraph graph definition and run_agent_cycle function.
 
-Parallel Multi-Agent Architecture
-
+CHANGE: run_agent_cycle now accepts user_id.
+The user_id is stored in AgentState so execution_agent
+can write it to the trades table.
 """
-
-# ============================================================
-# IMPORTS
-# ============================================================
 
 import uuid
 from datetime import datetime
 
 from loguru import logger
-
 from langgraph.graph import StateGraph, START, END
 
-# Shared state
-from app.graph.state import (
-    AgentState,
-    MarketContext,
-    PortfolioSnapshot,
-)
-
-# Agents
-from app.agents.signal_agent      import signal_agent_node
-from app.agents.sentiment_agent   import sentiment_agent_node
-from app.agents.risk_agent        import risk_agent_node
-from app.agents.portfolio_agent   import portfolio_agent_node
+from app.graph.state import AgentState, MarketContext, PortfolioSnapshot
+from app.agents.signal_agent        import signal_agent_node
+from app.agents.sentiment_agent     import sentiment_agent_node
+from app.agents.risk_agent          import risk_agent_node
+from app.agents.portfolio_agent     import portfolio_agent_node
 from app.agents.orchestration_agent import orchestrator_node
-from app.agents.human_agent       import human_review_node, should_human_review
-from app.agents.execution_agent   import execution_node
+from app.agents.human_agent         import human_review_node, should_human_review
+from app.agents.execution_agent     import execution_node
 
-
-# ============================================================
-# CREATE GRAPH  (stateless — no checkpointer attached here)
-# ============================================================
 
 def create_graph() -> StateGraph:
     """
-    Build and return the StateGraph builder.
-
-    The checkpointer is attached in runtime.lifespan() via
-    builder.compile(checkpointer=...), NOT here.
-    This keeps the graph definition stateless and testable.
+    Build the LangGraph workflow graph (stateless — no checkpointer here).
+    Checkpointer is attached in runtime.lifespan() via compile().
     """
 
     builder = StateGraph(AgentState)
-
-    # --------------------------------------------------------
-    # REGISTER NODES
-    # --------------------------------------------------------
 
     builder.add_node("signal_agent",    signal_agent_node)
     builder.add_node("sentiment_agent", sentiment_agent_node)
@@ -60,40 +40,24 @@ def create_graph() -> StateGraph:
     builder.add_node("human_review",    human_review_node)
     builder.add_node("execution",       execution_node)
 
-    # --------------------------------------------------------
-    # TRUE PARALLEL FAN-OUT
-    # --------------------------------------------------------
-
+    # Parallel fan-out: all 4 agents start simultaneously
     builder.add_edge(START, "signal_agent")
     builder.add_edge(START, "sentiment_agent")
     builder.add_edge(START, "risk_agent")
     builder.add_edge(START, "portfolio_agent")
 
-    # --------------------------------------------------------
-    # FAN-IN → ORCHESTRATOR
-    # --------------------------------------------------------
-
+    # Fan-in: all agents must finish before orchestrator runs
     builder.add_edge("signal_agent",    "orchestrator")
     builder.add_edge("sentiment_agent", "orchestrator")
     builder.add_edge("risk_agent",      "orchestrator")
     builder.add_edge("portfolio_agent", "orchestrator")
 
-    # --------------------------------------------------------
-    # CONDITIONAL ROUTING  (HITL or direct execution)
-    # --------------------------------------------------------
-
+    # Conditional: HITL or direct execution
     builder.add_conditional_edges(
         "orchestrator",
         should_human_review,
-        {
-            "human_review": "human_review",
-            "execute":      "execution",
-        },
+        {"human_review": "human_review", "execute": "execution"},
     )
-
-    # --------------------------------------------------------
-    # HITL → EXECUTION → END
-    # --------------------------------------------------------
 
     builder.add_edge("human_review", "execution")
     builder.add_edge("execution",    END)
@@ -101,58 +65,36 @@ def create_graph() -> StateGraph:
     return builder
 
 
-# ============================================================
-# RUN AGENT CYCLE
-# ============================================================
-
 async def run_agent_cycle(
     market_context: MarketContext,
     portfolio:      PortfolioSnapshot,
+    user_id:        str | None = None,   # NEW: which user triggered this
     config:         dict | None = None,
 ) -> dict:
     """
-    Execute one complete workflow cycle.
+    Execute one complete workflow cycle for a specific user.
 
-    Returns a dict with:
-    --------------------
-    - thread_id : str   → use this to resume if HITL pauses
-    - state     : dict  → final (or interrupted) graph state
+    The user_id is included in the initial state so the
+    execution_agent can write it to the trades table.
 
-    IMPORTANT:
-    ----------
-    This function uses the singleton workflow_graph from
-    app.graph.runtime.  That graph already has a live
-    AsyncPostgresSaver attached.  Do NOT create a new
-    checkpointer here — doing so would close the connection
-    after ainvoke() returns on interrupt, making resume
-    impossible.
+    Returns:
+    --------
+    {
+        "thread_id": "a1b2c3d4",
+        "state":     { ... full AgentState ... }
+    }
     """
 
-    # --------------------------------------------------------
-    # IMPORT SINGLETON  (late import avoids circular deps)
-    # --------------------------------------------------------
-
     from app.graph.runtime import get_workflow_graph
-
-    graph = get_workflow_graph()
-
-    # --------------------------------------------------------
-    # WORKFLOW IDENTITY
-    # --------------------------------------------------------
-
+    graph  = get_workflow_graph()
     run_id = str(uuid.uuid4())[:8]
 
-    # --------------------------------------------------------
-    # INITIAL STATE
-    # --------------------------------------------------------
-
     initial_state: AgentState = {
-
         # Inputs
         "market_context": market_context,
         "portfolio":      portfolio,
 
-        # Agent outputs (empty until nodes run)
+        # Agent outputs (populated by each agent node)
         "signal_vote":    None,
         "sentiment_vote": None,
         "risk_vote":      None,
@@ -169,44 +111,25 @@ async def run_agent_cycle(
         "executed_trade":  None,
         "execution_error": None,
 
-        # Observability
+        # Observability + user tracking
         "run_id":          run_id,
+        "user_id":         user_id or "anonymous",
         "timestamp":       datetime.utcnow().isoformat(),
         "episodic_memory": [],
         "logs":            [],
         "completed_nodes": [],
     }
 
-    # --------------------------------------------------------
-    # THREAD CONFIG
-    # --------------------------------------------------------
-
     if config is None:
-        config = {
-            "configurable": {
-                "thread_id": run_id
-            }
-        }
+        config = {"configurable": {"thread_id": run_id}}
 
-    # --------------------------------------------------------
-    # EXECUTE
-    # --------------------------------------------------------
-
-    logger.info(f"🎬 Starting workflow | run_id={run_id}")
+    logger.info(f"Starting workflow | run_id={run_id} | user_id={user_id}")
 
     result = await graph.ainvoke(initial_state, config=config)
 
-    # ainvoke() returns early when interrupt() fires.
-    # The caller can check result["hitl_status"] == "PENDING"
-    # to know the workflow is paused and needs a resume call.
-
     logger.info(
-        f"🏁 Workflow cycle finished | "
-        f"run_id={run_id} | "
+        f"Workflow finished | run_id={run_id} | "
         f"hitl_status={result.get('hitl_status', 'N/A')}"
     )
 
-    return {
-        "thread_id": run_id,
-        "state":     result,
-    }
+    return {"thread_id": run_id, "state": result}

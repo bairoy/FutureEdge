@@ -1,0 +1,136 @@
+/**
+ * frontend/src/app/globals.css
+ *
+ * Global styles: Tailwind directives, CSS variables, scrollbar,
+ * reusable component classes, and animation keyframes.
+ */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─── DESIGN TOKENS ─────────────────────────────────────────── */
+:root {
+  --color-surface: #111827;
+  /* gray-900 — cards, panels      */
+  --color-surface-2: #1f2937;
+  /* gray-800 — inputs, hover      */
+  --color-border: #374151;
+  /* gray-700                       */
+  --color-bull: #22c55e;
+  /* green-500 — profit, BUY, up   */
+  --color-bear: #ef4444;
+  /* red-500   — loss,  SELL, down */
+  --color-neutral: #f59e0b;
+  /* amber-500 — HOLD, warning     */
+}
+
+/* ─── SCROLLBAR ──────────────────────────────────────────────── */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #374151 transparent;
+}
+
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #374151;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #4b5563;
+}
+
+/* ─── REUSABLE COMPONENT CLASSES ────────────────────────────── */
+@layer components {
+
+  /* Card container */
+  .card {
+    @apply bg-gray-900 border border-gray-800 rounded-xl;
+  }
+
+  /* Decision badges */
+  .badge-bull {
+    @apply px-2 py-0.5 rounded text-xs font-semibold bg-green-500/10 text-green-400;
+  }
+
+  .badge-bear {
+    @apply px-2 py-0.5 rounded text-xs font-semibold bg-red-500/10 text-red-400;
+  }
+
+  .badge-hold {
+    @apply px-2 py-0.5 rounded text-xs font-semibold bg-amber-500/10 text-amber-400;
+  }
+
+  .badge-veto {
+    @apply px-2 py-0.5 rounded text-xs font-semibold bg-gray-500/10 text-gray-400;
+  }
+
+  /* Buttons */
+  .btn-primary {
+    @apply px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-danger {
+    @apply px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-success {
+    @apply px-4 py-2 rounded-lg bg-green-600 hover:bg-green-700 text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-ghost {
+    @apply px-3 py-1.5 rounded-lg text-gray-400 hover:text-gray-100 hover:bg-gray-800 text-sm font-medium transition-colors;
+  }
+
+  /* Form input */
+  .input {
+    @apply w-full px-3 py-2 rounded-lg bg-gray-800 border border-gray-700 text-gray-100 placeholder-gray-500 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-colors;
+  }
+
+  /* Small uppercase label */
+  .section-label {
+    @apply text-xs font-semibold uppercase tracking-wider text-gray-500;
+  }
+}
+
+/* ─── ANIMATIONS ────────────────────────────────────────────── */
+@keyframes pulse-slow {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.5;
+  }
+}
+
+@keyframes slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-pulse-slow {
+  animation: pulse-slow 2s ease-in-out infinite;
+}
+
+.animate-slide-up {
+  animation: slide-up 0.2s ease-out;
+}

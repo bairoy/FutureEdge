@@ -1,0 +1,31 @@
+# Next.js build output
+.next/
+out/
+
+# Dependencies — always regenerated from package.json
+node_modules/
+
+# Environment files — contain API URLs and secrets
+.env
+.env.local
+.env.production
+.env.staging
+
+# Vercel deployment
+.vercel
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor
+.vscode/
+.idea/
