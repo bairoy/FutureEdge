@@ -61,8 +61,23 @@ class MockBroker(BrokerBase):
         }
 
     async def get_positions(self) -> list[dict]:
-        # No real positions in mock mode
-        return []
+        # Return simulated mock positions for local paper trading and UI testing
+        return [
+            {
+                "symbol":    "RELIANCE",
+                "quantity":  50,
+                "avg_price": 2450.0,
+                "pnl":       3500.0,
+                "notional":  122500.0,
+            },
+            {
+                "symbol":    "INFY",
+                "quantity":  -20,
+                "avg_price": 1420.0,
+                "pnl":       -480.0,
+                "notional":  28400.0,
+            }
+        ]
 
     # --------------------------------------------------------
     # ORDER PLACEMENT

@@ -70,6 +70,9 @@ KEY_TRADING_HALT = "TRADING_HALT"
 # Indicator cache keys  (TTL = 60 seconds)
 KEY_INDICATORS = "futureedge:indicators:{symbol}"   # format with symbol
 
+# Zerodha dynamic access token (expires daily at 6:00 AM IST)
+KEY_ZERODHA_ACCESS_TOKEN = "futureedge:zerodha:access_token"
+
 
 # ============================================================
 # REDIS STREAM NAMES

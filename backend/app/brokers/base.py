@@ -202,9 +202,7 @@ class BrokerBase(ABC):
         pass
 
 
-# ============================================================
-# BROKER FACTORY
-# ============================================================
+_broker_instance = None
 
 def get_broker() -> BrokerBase:
     """
@@ -215,6 +213,9 @@ def get_broker() -> BrokerBase:
         ACTIVE_BROKER=mock
         ACTIVE_BROKER=zerodha
     """
+    global _broker_instance
+    if _broker_instance is not None:
+        return _broker_instance
 
     broker_name = settings.ACTIVE_BROKER.lower()
 
@@ -224,7 +225,7 @@ def get_broker() -> BrokerBase:
 
     if broker_name == "mock":
         from app.brokers.mock import MockBroker
-        return MockBroker()
+        _broker_instance = MockBroker()
 
     # --------------------------------------------------------
     # ZERODHA BROKER
@@ -232,12 +233,15 @@ def get_broker() -> BrokerBase:
 
     elif broker_name == "zerodha":
         from app.brokers.zerodha import ZerodhaBroker
-        return ZerodhaBroker()
+        _broker_instance = ZerodhaBroker()
 
     # --------------------------------------------------------
     # UNKNOWN BROKER
     # --------------------------------------------------------
 
-    raise ValueError(
-        f"Unsupported broker: {broker_name}"
-    )
+    else:
+        raise ValueError(
+            f"Unsupported broker: {broker_name}"
+        )
+
+    return _broker_instance

@@ -117,7 +117,7 @@ async def get_market_history(symbol: str):
     Used to seed the chart immediately when a user searches for a stock.
     """
     from app.data.feed import load_historical_candles
-    candles = load_historical_candles(symbol, period="1d", interval="1m")
+    candles = load_historical_candles(symbol, period="5d", interval="1m")
     
     # Format for lightweight-charts (Unix seconds)
     formatted = []
@@ -140,6 +140,18 @@ async def get_market_history(symbol: str):
 # ============================================================
 # WEBSOCKET ENDPOINT
 # ============================================================
+
+from app.core.config import settings
+
+SYMBOL_TO_TOKEN = {
+    "NIFTY 50": 256265,
+    "NIFTY50": 256265,
+    "NIFTY BANK": 260105,
+    "BANKNIFTY": 260105,
+    "RELIANCE": 738561,
+    "INFY": 408065,
+    "TCS": 2953217,
+}
 
 @router.websocket("/stream")
 async def market_stream(
@@ -192,8 +204,15 @@ async def market_stream(
                         for msg_id, fields in messages:
                             last_tick_id = msg_id
                             # Only send if it matches current symbol (or if it's NIFTY and we're on NIFTY)
-                            # For simplicity in Phase 1, we send everything and let frontend filter,
-                            # but better to filter here.
+                            tick_token = fields.get("token")
+                            expected_token = SYMBOL_TO_TOKEN.get(current_symbol.upper())
+                            if expected_token is None:
+                                if current_symbol.upper() == settings.DEFAULT_SYMBOL.upper():
+                                    expected_token = settings.DEFAULT_INSTRUMENT_TOKEN
+
+                            if tick_token and expected_token and str(tick_token) != str(expected_token):
+                                continue
+
                             await websocket.send_json({
                                 "type": "tick",
                                 "data": {

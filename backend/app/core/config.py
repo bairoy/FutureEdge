@@ -59,6 +59,10 @@ class Settings(BaseSettings):
   OPENAI_API_KEY:str=""
   FINBERT_ENABLED:bool = False
   LLM_REASONING_ENABLED:bool = True
+  LOCAL_MODEL_API_KEY:str = ""
+  LOCAL_MODEL_BASE_URL:str = ""
+  LOCAL_MODEL_NAME:str = "gpt-4o-mini"
+
 # --------------------------------------------------------
     # PHASE 2 — ADAPTIVE AGENT WEIGHTS
     #

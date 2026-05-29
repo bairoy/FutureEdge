@@ -244,20 +244,6 @@ async def orchestrator_node(state: AgentState) -> dict:
             position_rupees = 0.0
 
         # --------------------------------------------------------
-        # TRADE PROPOSAL
-        # --------------------------------------------------------
-
-        proposal = TradeProposal(
-            symbol         = symbol,
-            direction      = direction,
-            size           = round(position_rupees, 2),
-            entry_price    = price,
-            risk_score     = round(risk_score, 3),
-            agent_consensus= votes,
-            human_approved = None,
-        )
-
-        # --------------------------------------------------------
         # HITL EVALUATION
         # --------------------------------------------------------
 
@@ -275,6 +261,48 @@ async def orchestrator_node(state: AgentState) -> dict:
         if position_rupees > (portfolio.total_equity * 0.05):
             hitl_required = True
             hitl_reasons.append(f"Large position: ₹{position_rupees:.2f}")
+
+        # --------------------------------------------------------
+        # GENERATE LLM RATIONALE  (only if not holding)
+        # --------------------------------------------------------
+        llm_rationale = None
+        from app.core.config import settings
+        if decision != "HOLD" and settings.LLM_REASONING_ENABLED:
+            try:
+                from app.models.llm_reasoner import generate_trade_rationale
+                memories = state.get("episodic_memory", [])
+                regime = ctx.regime if hasattr(ctx, "regime") else "UNKNOWN"
+                
+                llm_rationale = await generate_trade_rationale(
+                    symbol=symbol,
+                    direction=direction,
+                    votes=votes,
+                    buy_score=buy_score,
+                    sell_score=sell_score,
+                    risk_score=risk_score,
+                    disagreement=disagreement,
+                    episodic_memories=memories,
+                    regime=regime,
+                )
+            except Exception as le:
+                logger.warning(f"Failed to generate LLM rationale: {le}")
+                from app.models.llm_reasoner import _template_rationale
+                llm_rationale = _template_rationale(direction, votes, risk_score, disagreement)
+
+        # --------------------------------------------------------
+        # TRADE PROPOSAL
+        # --------------------------------------------------------
+
+        proposal = TradeProposal(
+            symbol         = symbol,
+            direction      = direction,
+            size           = round(position_rupees, 2),
+            entry_price    = price,
+            risk_score     = round(risk_score, 3),
+            agent_consensus= votes,
+            human_approved = None,
+            llm_rationale  = llm_rationale,
+        )
 
         # --------------------------------------------------------
         # PUBLISH TO REDIS  (frontend WebSocket picks this up)
@@ -295,6 +323,7 @@ async def orchestrator_node(state: AgentState) -> dict:
 
         return {
             "consensus":       proposal,
+            "llm_rationale":   llm_rationale,
             "hitl_required":   hitl_required,
             "hitl_status":     "PENDING" if hitl_required else "NOT_REQUIRED",
             "completed_nodes": ["orchestrator"],
@@ -350,6 +379,7 @@ async def _publish_results(
             "size":         proposal.size,
             "entry_price":  proposal.entry_price,
             "risk_score":   proposal.risk_score,
+            "llm_rationale": proposal.llm_rationale,
             "hitl_required": hitl_required,
             "hitl_reasons": hitl_reasons or [],
             "votes": [

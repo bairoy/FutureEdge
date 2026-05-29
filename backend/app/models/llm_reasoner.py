@@ -113,8 +113,10 @@ async def generate_trade_rationale(
     if not settings.LLM_REASONING_ENABLED:
         return _template_rationale(direction, votes, risk_score, disagreement)
 
-    if not settings.OPENAI_API_KEY:
-        logger.debug("OPENAI_API_KEY not set — using template rationale")
+    has_openai = bool(settings.OPENAI_API_KEY)
+    has_local = bool(settings.LOCAL_MODEL_BASE_URL)
+    if not (has_openai or has_local):
+        logger.debug("Neither OPENAI_API_KEY nor LOCAL_MODEL_BASE_URL is set — using template rationale")
         return _template_rationale(direction, votes, risk_score, disagreement)
 
     # --------------------------------------------------------
@@ -171,13 +173,17 @@ Do not recommend approving or rejecting — just explain the reasoning.
         We use run_in_executor so the FastAPI / async event loop
         does not get blocked during the network request.
         """
+        api_key = settings.LOCAL_MODEL_API_KEY or settings.OPENAI_API_KEY or "dummy"
+        base_url = settings.LOCAL_MODEL_BASE_URL or None
+        model_name = settings.LOCAL_MODEL_NAME or "gpt-4o-mini"
 
         client = OpenAI(
-            api_key=settings.OPENAI_API_KEY
+            api_key=api_key,
+            base_url=base_url
         )
 
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=model_name,
 
             messages=[
                 {

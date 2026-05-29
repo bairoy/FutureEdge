@@ -36,12 +36,19 @@ from pprint import pprint
 from loguru import logger
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
+# Import all models to register them on Base and prevent mapper compilation issues during tests
+from app.db.models.user import User
+from app.db.models.refresh_token import RefreshToken
+from app.db.models.workflow_run import WorkflowRun
+from app.db.models.trade import Trade
+
 from app.graph.builder import create_graph, run_agent_cycle
 from app.graph.state import MarketContext, PortfolioSnapshot
 from app.core.config import settings
 from app.data.feed import load_historical_candles, get_current_price_yfinance
 
 import app.graph.runtime as runtime
+
 
 
 # ============================================================
@@ -178,6 +185,7 @@ async def main():
         print(f"  Size       : ₹{consensus.size:.2f}")
         print(f"  Entry Price: ₹{consensus.entry_price:.2f}")
         print(f"  Risk Score : {consensus.risk_score:.2f}")
+        print(f"  AI Rationale: {consensus.llm_rationale}")
 
     print("\n" + "="*60)
     print("EXECUTED TRADE")

@@ -159,8 +159,6 @@ async def execution_node(state: AgentState) -> dict:
             price      = price,
         )
 
-        await broker.disconnect()
-
         # ====================================================
         # BUILD TRADE RECORD
         # ====================================================

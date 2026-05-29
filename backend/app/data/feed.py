@@ -249,23 +249,48 @@ class NSETickPublisher:
         Call this from your lifespan startup after market opens.
         """
 
-        if not settings.ZERODHA_API_KEY or not settings.ZERODHA_ACCESS_TOKEN:
+        import redis as sync_redis
+        from app.db.redis import KEY_ZERODHA_ACCESS_TOKEN
+
+        # Get token from Redis dynamically
+        try:
+            r = sync_redis.Redis(
+                host=settings.REDIS_HOST,
+                port=settings.REDIS_PORT,
+                db=settings.REDIS_DB,
+                decode_responses=True,
+            )
+            token = r.get(KEY_ZERODHA_ACCESS_TOKEN)
+            r.close()
+        except Exception as re:
+            logger.warning(f"Could not check Redis for Zerodha access token: {re}")
+            token = None
+
+        if token:
+            token = token.decode() if isinstance(token, bytes) else token
+        else:
+            token = settings.ZERODHA_ACCESS_TOKEN
+
+        if not settings.ZERODHA_API_KEY or not token:
             logger.warning(
                 "⚠️  KiteTicker not started — "
-                "ZERODHA_API_KEY or ZERODHA_ACCESS_TOKEN missing in .env"
+                "ZERODHA_API_KEY or ZERODHA_ACCESS_TOKEN missing"
             )
             return
 
         if not is_market_open():
-            logger.info("📴 Market is closed — KiteTicker not started")
-            return
+            if settings.APP_ENV == "production":
+                logger.info("📴 Market is closed — KiteTicker not started in production")
+                return
+            else:
+                logger.warning("📴 Market is closed, but starting KiteTicker anyway for testing in development")
 
         try:
             from kiteconnect import KiteTicker
 
             self._ticker = KiteTicker(
                 settings.ZERODHA_API_KEY,
-                settings.ZERODHA_ACCESS_TOKEN,
+                token,
             )
 
             # Register callbacks
@@ -394,7 +419,7 @@ class NSETickPublisher:
                 "low":       str(ohlc.get("low",   ltp)),
                 "close":     str(ohlc.get("close", ltp)),
                 "volume":    str(tick.get("volume_traded", 0)),
-                "timestamp": str(ts),
+                "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
             },
             maxlen=1000,
             approximate=True,
@@ -458,5 +483,11 @@ async def get_latest_tick(symbol: str = "NIFTY 50") -> dict | None:
 # Add more tokens to the list to subscribe to more instruments.
 
 tick_publisher = NSETickPublisher(
-    instrument_tokens=[settings.DEFAULT_INSTRUMENT_TOKEN]
+    instrument_tokens=[
+        settings.DEFAULT_INSTRUMENT_TOKEN,  # NIFTY 50
+        260105,                             # NIFTY BANK
+        738561,                             # RELIANCE
+        408065,                             # INFY
+        2953217,                            # TCS
+    ]
 )

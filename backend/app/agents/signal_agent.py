@@ -84,56 +84,80 @@ async def signal_agent_node(state: AgentState) -> dict:
         from_cache      = ind["from_cache"]
 
         # --------------------------------------------------------
-        # SCORING SYSTEM
+        # REGIME-AWARE SCORING SYSTEM
         # --------------------------------------------------------
-
-        # score > 0  → bullish evidence
-        # score < 0  → bearish evidence
-        # score near 0 → mixed / unclear
-
+        regime = ctx.regime if hasattr(ctx, "regime") else "RANGEBOUND"
         score   = 0.0
         reasons = []
 
-        # --- RSI ---
-        # RSI < 30 → oversold (prices fell hard) → possible bounce up
-        # RSI > 70 → overbought (prices rose hard) → possible pullback
-
+        # --- 1. RSI (Relative Strength Index) ---
+        rsi_score = 0.0
         if rsi < 30:
-            score += 0.3
-            reasons.append(f"RSI oversold ({rsi:.1f})")
+            rsi_score = 0.3
         elif rsi > 70:
-            score -= 0.3
-            reasons.append(f"RSI overbought ({rsi:.1f})")
+            rsi_score = -0.3
 
-        # --- MACD ---
-        # Positive histogram and MACD above signal → bullish momentum
-        # Negative histogram and MACD below signal → bearish momentum
-
+        # --- 2. MACD (Moving Average Convergence Divergence) ---
+        macd_score = 0.0
         if hist > 0 and macd_val > signal_val:
-            score += 0.25
-            reasons.append("MACD bullish crossover")
+            macd_score = 0.25
         elif hist < 0 and macd_val < signal_val:
-            score -= 0.25
-            reasons.append("MACD bearish crossover")
+            macd_score = -0.25
 
-        # --- Bollinger Bands ---
-        # Price below lower band → stretched too far down → possible bounce
-        # Price above upper band → stretched too far up   → possible pullback
-
+        # --- 3. Bollinger Bands ---
+        bb_score = 0.0
         if price < bollinger_lower:
-            score += 0.2
-            reasons.append("Price below lower Bollinger band")
+            bb_score = 0.2
         elif price > bollinger_upper:
-            score -= 0.2
-            reasons.append("Price above upper Bollinger band")
+            bb_score = -0.2
+
+        # --- DYNAMIC REGIME WEIGHTING ---
+        if regime == "RANGEBOUND":
+            # Amplify mean-reversion (RSI + Bollinger) and suppress trend-following (MACD)
+            score = (rsi_score * 1.5) + (bb_score * 1.5) + (macd_score * 0.2)
+            reasons.append("Regime: Rangebound (Mean Reversion amplified)")
+            if rsi < 30 or rsi > 70:
+                reasons.append(f"RSI trigger ({rsi:.1f})")
+            if price < bollinger_lower or price > bollinger_upper:
+                reasons.append("Bollinger Band boundary trigger")
+                
+        elif regime in ("TRENDING_UP", "TRENDING_DOWN"):
+            # Amplify trend-following (MACD) and ignore counter-trend mean reversion (RSI / Bollinger)
+            score = macd_score * 1.8
+            
+            # Damp counter-trend signals
+            if regime == "TRENDING_UP":
+                if rsi_score < 0: # ignore overbought RSI sell signals
+                    logger.debug("SignalAgent | Dampened overbought RSI sell signal during TRENDING_UP")
+                if rsi_score > 0: # allow oversold pullbacks
+                    score += rsi_score * 0.5
+            elif regime == "TRENDING_DOWN":
+                if rsi_score > 0: # ignore oversold RSI buy signals
+                    logger.debug("SignalAgent | Dampened oversold RSI buy signal during TRENDING_DOWN")
+                if rsi_score < 0: # allow overbought pullbacks
+                    score += rsi_score * 0.5
+                    
+            reasons.append(f"Regime: Trend Following ({regime.replace('_', ' ')})")
+            if hist > 0 and macd_val > signal_val:
+                reasons.append("MACD Bullish crossover")
+            elif hist < 0 and macd_val < signal_val:
+                reasons.append("MACD Bearish crossover")
+                
+        elif regime == "HIGH_VOLATILITY":
+            # Damp all signals across the board to remain conservative
+            score = ((rsi_score * 0.5) + (macd_score * 0.5) + (bb_score * 0.5)) * 0.5
+            reasons.append("Regime: High Volatility (Signals dampened by 50%)")
+            
+        else:
+            # Fallback to standard baseline scoring
+            score = rsi_score + macd_score + bb_score
+            reasons.append("Regime: Unknown (Baseline indicator scoring applied)")
 
         # --- Volatility filter ---
         # High volatility makes all signals less reliable.
-        # We reduce the score magnitude but keep the direction.
-
         if ctx.volatility_24h > 0.05:
             score *= 0.7
-            reasons.append(f"High volatility ({ctx.volatility_24h*100:.1f}%) — signal dampened")
+            reasons.append(f"Elevated volatility ({ctx.volatility_24h*100:.1f}%) — signal dampened")
 
         # --------------------------------------------------------
         # CONVERT SCORE TO DECISION

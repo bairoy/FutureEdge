@@ -87,13 +87,55 @@ async def run_workflow(
         volatility_24h= 0.02,
     )
 
-    portfolio = PortfolioSnapshot(
-        total_equity     = 100000.0,
-        margin_used      = 10000.0,
-        margin_available = 90000.0,
-        unrealized_pnl   = 0.0,
-        open_positions   = [],
-    )
+    # Fetch portfolio from broker dynamically
+    portfolio = None
+    if request.use_live_data:
+        try:
+            from app.brokers.base import get_broker
+            broker = get_broker()
+            
+            # Ensure connected
+            is_connected = await broker.is_connected()
+            if not is_connected:
+                await broker.connect()
+                
+            broker_acc = await broker.get_account()
+            broker_pos = await broker.get_positions()
+            
+            portfolio = PortfolioSnapshot(
+                total_equity     = float(broker_acc.get("total_equity", 100000.0)),
+                margin_used      = float(broker_acc.get("margin_used", 0.0)),
+                margin_available = float(broker_acc.get("margin_available", 100000.0)),
+                unrealized_pnl   = float(broker_acc.get("unrealized_pnl", 0.0)),
+                open_positions   = broker_pos,
+            )
+            logger.info(f"Loaded live broker portfolio: equity={portfolio.total_equity}, available={portfolio.margin_available}")
+        except Exception as pe:
+            logger.warning(f"Failed to fetch live broker portfolio details: {pe} - using fallback")
+    if not portfolio:
+        # Fallback mock portfolio for testing when broker is not connected or fails
+        portfolio = PortfolioSnapshot(
+            total_equity     = 100000.0,
+            margin_used      = 10000.0,
+            margin_available = 90000.0,
+            unrealized_pnl   = 3020.0,  # 3500 - 480
+            open_positions   = [
+                {
+                    "symbol":    "RELIANCE",
+                    "quantity":  50,
+                    "avg_price": 2450.0,
+                    "pnl":       3500.0,
+                    "notional":  122500.0,
+                },
+                {
+                    "symbol":    "INFY",
+                    "quantity":  -20,
+                    "avg_price": 1420.0,
+                    "pnl":       -480.0,
+                    "notional":  28400.0,
+                }
+            ],
+        )
 
     # Pass user_id into the cycle so agents/execution can record it
     result = await run_agent_cycle(

@@ -22,12 +22,12 @@
 
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import Link from "next/link";
 import {
   LayoutDashboard, TrendingUp, Users, Activity,
-  LogOut, BarChart2, ExternalLink,
+  LogOut, BarChart2, ExternalLink, RefreshCw, LineChart
 } from "lucide-react";
 
 import api, { tokenStore } from "@/lib/api";
@@ -36,12 +36,14 @@ import { useWebSocket } from "@/hooks/useWebSocket";
 import { useKillSwitch } from "@/hooks/useKillSwitch";
 import { KillSwitchButton } from "@/components/trading/KillSwitchButton";
 import { HITLModal } from "@/components/trading/HITLModal";
+import { showToast } from "@/components/ui/Toast";
 import type { UserProfile } from "@/types";
 
 // ─── NAV CONFIG ──────────────────────────────────────────────
 const NAV = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard, minRole: "viewer" },
   { href: "/dashboard/trades", label: "Trades", icon: TrendingUp, minRole: "viewer" },
+  { href: "/dashboard/backtest", label: "Backtest", icon: LineChart, minRole: "trader" },
   { href: "/dashboard/users", label: "Users", icon: Users, minRole: "admin" },
 ];
 
@@ -64,6 +66,50 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
   const { user, setUser, setLoading, isLoading } = useAuthStore();
   const hitlPending = useTradingStore((s) => s.hitlPending);
+
+  const [zerodhaStatus, setZerodhaStatus] = useState<{ is_zerodha: boolean; connected: boolean } | null>(null);
+  const [checkingZerodha, setCheckingZerodha] = useState(false);
+
+  async function checkZerodhaStatus() {
+    try {
+      const { data } = await api.get("/auth/zerodha/status");
+      setZerodhaStatus(data);
+    } catch (err) {
+      console.error("[Zerodha] Status check failed:", err);
+    }
+  }
+
+  async function handleConnectZerodha() {
+    setCheckingZerodha(true);
+    try {
+      const { data } = await api.get("/auth/zerodha/login-url");
+      if (data.login_url) {
+        window.location.href = data.login_url;
+      } else {
+        showToast("Zerodha login URL not configured on backend", "error");
+      }
+    } catch (err) {
+      showToast("Failed to fetch Zerodha login URL", "error");
+    } finally {
+      setCheckingZerodha(false);
+    }
+  }
+
+  // Effect to parse success callback and poll status
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get("zerodha") === "success") {
+        showToast("Zerodha connected successfully!", "success");
+        // Clear query parameters from URL bar
+        const newUrl = window.location.pathname;
+        window.history.replaceState({}, "", newUrl);
+      }
+    }
+    checkZerodhaStatus();
+    const interval = setInterval(checkZerodhaStatus, 30_000);
+    return () => clearInterval(interval);
+  }, []);
 
   // Start WebSocket + sync kill switch state
   useWebSocket();
@@ -220,6 +266,33 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
             {pathname.split("/").filter(Boolean).pop()?.replace("-", " ") ?? "Dashboard"}
           </span>
           <div className="flex items-center gap-3">
+            {zerodhaStatus?.is_zerodha && (
+              zerodhaStatus.connected ? (
+                <button
+                  onClick={handleConnectZerodha}
+                  disabled={checkingZerodha}
+                  title="Zerodha session is active. Click to re-authenticate."
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-green-500/30 bg-green-500/10 text-green-400 text-xs font-semibold hover:bg-green-500/20 transition-all shadow-[0_0_10px_rgba(34,197,94,0.1)] cursor-pointer"
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse shrink-0" />
+                  Zerodha Connected
+                </button>
+              ) : (
+                <button
+                  onClick={handleConnectZerodha}
+                  disabled={checkingZerodha}
+                  title="Authentication Required. Click to connect to Zerodha."
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 text-amber-400 text-xs font-semibold hover:bg-amber-500/20 transition-all shadow-[0_0_10px_rgba(245,158,11,0.15)] animate-pulse cursor-pointer"
+                >
+                  {checkingZerodha ? (
+                    <RefreshCw className="w-3 h-3 animate-spin shrink-0" />
+                  ) : (
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0" />
+                  )}
+                  Connect Zerodha
+                </button>
+              )
+            )}
             {hasRole(user.role, "risk_manager") && <KillSwitchButton />}
           </div>
         </header>

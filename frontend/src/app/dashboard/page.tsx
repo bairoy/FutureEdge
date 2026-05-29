@@ -22,7 +22,7 @@
 
 import { useState, useEffect } from "react";
 import useSWR from "swr";
-import { TrendingUp, TrendingDown, Minus, AlertTriangle, Play, RefreshCw, Brain } from "lucide-react";
+import { TrendingUp, TrendingDown, Minus, AlertTriangle, Play, RefreshCw, Brain, Briefcase, Wallet } from "lucide-react";
 
 import { useTradingStore, useAuthStore, type TickPoint } from "@/store";
 import { PriceChart } from "@/components/charts/PriceChart";
@@ -47,6 +47,7 @@ export default function DashboardPage() {
 
   const [running, setRunning] = useState(false);
   const [runResult, setRunResult] = useState<WorkflowRunResponse | null>(null);
+  const [useMockPortfolio, setUseMockPortfolio] = useState(false);
 
   // Fetch history when symbol changes
   const { setTicks } = useTradingStore();
@@ -71,6 +72,31 @@ export default function DashboardPage() {
     { refreshInterval: 30_000 }
   );
 
+  interface BrokerPortfolio {
+    connected: boolean;
+    mock_data?: boolean;
+    account: {
+      total_equity: number;
+      margin_used: number;
+      margin_available: number;
+      unrealized_pnl: number;
+    };
+    positions: Array<{
+      symbol: string;
+      quantity: number;
+      avg_price: number;
+      pnl: number;
+      notional: number;
+    }>;
+  }
+
+  // Fetch broker portfolio details — refreshes every 10 seconds
+  const { data: portfolio } = useSWR<BrokerPortfolio>(
+    `/api/v1/broker/portfolio${useMockPortfolio ? "?mock=true" : ""}`,
+    fetcher,
+    { refreshInterval: 10_000 }
+  );
+
   // ── Run a new agent cycle ──────────────────────────────────
   async function handleRun() {
     setRunning(true);
@@ -79,14 +105,14 @@ export default function DashboardPage() {
     try {
       const { data } = await api.post<WorkflowRunResponse>("/api/v1/workflow/run", {
         symbol: currentSymbol,
-        use_live_data: true,
+        use_live_data: !useMockPortfolio,
       });
 
       setRunResult(data);
 
       // Immediately sync with store so charts and agent cards update
       if (data.votes) {
-        setAgentResult(data.votes, data.direction, data.risk_score, null);
+        setAgentResult(data.votes, data.direction, data.risk_score, data.proposal?.llm_rationale || null);
       }
 
       if (data.hitl_status === "PENDING") {
@@ -100,7 +126,7 @@ export default function DashboardPage() {
             size: data.proposal.size,
             entryPrice: data.proposal.entry_price,
             riskScore: data.proposal.risk_score,
-            llmRationale: null,
+            llmRationale: data.proposal.llm_rationale || null,
             reasons: data.reasons || [],
             memories: [],
             votes: data.votes,
@@ -188,7 +214,7 @@ export default function DashboardPage() {
                     size: runResult.proposal.size,
                     entryPrice: runResult.proposal.entry_price,
                     riskScore: runResult.proposal.risk_score,
-                    llmRationale: null,
+                    llmRationale: runResult.proposal.llm_rationale || null,
                     reasons: runResult.reasons || [],
                     memories: [],
                     votes: runResult.votes,
@@ -253,6 +279,117 @@ export default function DashboardPage() {
             </span>
           </div>
           <PnLChart trades={trades ?? []} height={280} />
+        </div>
+      </div>
+
+      {/* ── Portfolio & Positions ────────────────────────────── */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
+        {/* Margins/Funds Info Card */}
+        <div className="card p-4 flex flex-col justify-between">
+          <div>
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2">
+                <Briefcase className="w-4 h-4 text-blue-400" />
+                <h2 className="font-semibold text-gray-100 text-sm">Account Funds</h2>
+                {portfolio?.mock_data && (
+                  <span className="px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 text-[10px] font-semibold border border-amber-500/20">
+                    Mock
+                  </span>
+                )}
+              </div>
+              <button
+                onClick={() => setUseMockPortfolio(!useMockPortfolio)}
+                className={`text-[10px] px-2 py-0.5 rounded font-medium transition-all border ${
+                  useMockPortfolio 
+                    ? "bg-blue-600/15 border-blue-500/30 text-blue-400 hover:bg-blue-600/25" 
+                    : "bg-gray-800/40 border-gray-700/60 text-gray-400 hover:bg-gray-800"
+                }`}
+                title="Toggle between real broker data and simulated mock data"
+              >
+                {useMockPortfolio ? "Real Broker" : "Test Mock"}
+              </button>
+            </div>
+            {portfolio ? (
+              <div className="space-y-3.5">
+                <div className="flex justify-between items-center text-sm">
+                  <span className="text-gray-400">Total Equity</span>
+                  <span className="font-bold text-gray-100">₹{portfolio.account.total_equity.toLocaleString("en-IN", { maximumFractionDigits: 2 })}</span>
+                </div>
+                <div className="flex justify-between items-center text-sm">
+                  <span className="text-gray-400">Margin Used</span>
+                  <span className="font-bold text-gray-100">₹{portfolio.account.margin_used.toLocaleString("en-IN", { maximumFractionDigits: 2 })}</span>
+                </div>
+                <div className="flex justify-between items-center text-sm">
+                  <span className="text-gray-400">Margin Available</span>
+                  <span className="font-bold text-green-400">₹{portfolio.account.margin_available.toLocaleString("en-IN", { maximumFractionDigits: 2 })}</span>
+                </div>
+                <div className="flex justify-between items-center text-sm border-t border-gray-800/60 pt-2.5">
+                  <span className="text-gray-400">Unrealized P&L</span>
+                  <span className={`font-bold ${portfolio.account.unrealized_pnl >= 0 ? "text-green-400" : "text-red-400"}`}>
+                    {portfolio.account.unrealized_pnl >= 0 ? "+" : ""}₹{portfolio.account.unrealized_pnl.toLocaleString("en-IN", { maximumFractionDigits: 2 })}
+                  </span>
+                </div>
+              </div>
+            ) : (
+              <div className="text-center py-6 text-gray-500 text-xs">Loading funds information...</div>
+            )}
+          </div>
+        </div>
+
+        {/* Positions Table (takes 2 columns) */}
+        <div className="lg:col-span-2 card p-4">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <Wallet className="w-4 h-4 text-purple-400" />
+              <h2 className="font-semibold text-gray-100 text-sm">Open Positions</h2>
+              {portfolio?.mock_data && (
+                <span className="px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 text-[10px] font-semibold border border-amber-500/20 animate-pulse">
+                  Mock
+                </span>
+              )}
+            </div>
+            <span className="text-xs text-gray-500">
+              {portfolio?.positions.length ?? 0} active positions
+            </span>
+          </div>
+
+          <div className="overflow-x-auto">
+            {portfolio && portfolio.positions.length > 0 ? (
+              <table className="w-full text-xs text-left">
+                <thead>
+                  <tr className="border-b border-gray-800 text-gray-500">
+                    <th className="py-2 font-medium">Symbol</th>
+                    <th className="py-2 font-medium">Quantity</th>
+                    <th className="py-2 font-medium">Avg Price</th>
+                    <th className="py-2 font-medium text-right">P&L</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-800/40">
+                  {portfolio.positions.map((pos) => {
+                    const isLong = pos.quantity > 0;
+                    return (
+                      <tr key={pos.symbol} className="hover:bg-gray-800/10">
+                        <td className="py-2.5 font-semibold text-gray-200">{pos.symbol}</td>
+                        <td className="py-2.5">
+                          <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${isLong ? "bg-green-500/10 text-green-400" : "bg-red-500/10 text-red-400"}`}>
+                            {isLong ? "BUY" : "SELL"} {Math.abs(pos.quantity)}
+                          </span>
+                        </td>
+                        <td className="py-2.5 text-gray-300">₹{pos.avg_price.toLocaleString("en-IN", { maximumFractionDigits: 2 })}</td>
+                        <td className={`py-2.5 text-right font-bold ${pos.pnl >= 0 ? "text-green-400" : "text-red-400"}`}>
+                          {pos.pnl >= 0 ? "+" : ""}₹{pos.pnl.toLocaleString("en-IN", { maximumFractionDigits: 2 })}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            ) : (
+              <div className="text-center py-8 text-gray-500 text-xs">
+                No active positions currently open.
+              </div>
+            )}
+          </div>
         </div>
       </div>
 

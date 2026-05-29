@@ -186,7 +186,8 @@ async def risk_agent_node(state: AgentState) -> dict:
         # We use HALF Kelly (divide by 2) which is standard
         # in professional trading to reduce volatility.
 
-        kelly_fraction = await _calculate_kelly(symbol)
+        user_id = state.get("user_id", "anonymous")
+        kelly_fraction = await _calculate_kelly(symbol, user_id)
         metadata["kelly_fraction"]      = kelly_fraction
         metadata["suggested_size_pct"]  = round(kelly_fraction * 100, 2)
 
@@ -242,7 +243,7 @@ async def risk_agent_node(state: AgentState) -> dict:
 # KELLY CRITERION CALCULATION  (from real Postgres history)
 # ============================================================
 
-async def _calculate_kelly(symbol: str) -> float:
+async def _calculate_kelly(symbol: str, user_id: str) -> float:
     """
     Calculate the optimal position size fraction using the
     Kelly criterion, based on real trade history from Postgres.
@@ -258,7 +259,7 @@ async def _calculate_kelly(symbol: str) -> float:
     try:
         async with AsyncSessionLocal() as session:
             trades = await TradeRepo.get_recent_closed_trades(
-                session, symbol, limit=50
+                session, symbol, user_id=user_id, limit=50
             )
             stats = TradeRepo.calculate_win_stats(trades)
 

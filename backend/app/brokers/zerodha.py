@@ -67,15 +67,43 @@ class ZerodhaBroker(BrokerBase):
         is not async. It is fast (just setting up an HTTP client)
         so it is acceptable to call it at startup.
         """
+        if self._connected and self._kite is not None:
+            return True
 
         try:
             # kiteconnect is not an async library — we import and
             # call it directly. The actual HTTP calls are fast enough
             # that they do not block the event loop noticeably.
             from kiteconnect import KiteConnect
+            from app.db.redis import redis_client, KEY_ZERODHA_ACCESS_TOKEN
+
+            # Try to load token from Redis first
+            try:
+                token = await redis_client.get(KEY_ZERODHA_ACCESS_TOKEN)
+            except Exception as re:
+                logger.warning(f"Could not fetch Zerodha token from Redis: {re}")
+                token = None
+
+            if not token:
+                import os
+                import json
+                if os.path.exists("broker_token.json"):
+                    try:
+                        with open("broker_token.json", "r") as f:
+                            token_data = json.load(f)
+                            token = token_data.get("ZERODHA_ACCESS_TOKEN")
+                        logger.info("Loaded Zerodha access token from broker_token.json")
+                    except Exception as fe:
+                        logger.warning(f"Could not load token from broker_token.json: {fe}")
+
+            if not token:
+                token = settings.ZERODHA_ACCESS_TOKEN
+
+            if not token:
+                raise ValueError("No Zerodha access token available in Redis, JSON config, or env settings")
 
             self._kite = KiteConnect(api_key=settings.ZERODHA_API_KEY)
-            self._kite.set_access_token(settings.ZERODHA_ACCESS_TOKEN)
+            self._kite.set_access_token(token)
 
             # Quick connectivity check — fetch profile
             profile = self._kite.profile()
