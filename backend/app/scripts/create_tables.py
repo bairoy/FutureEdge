@@ -55,6 +55,7 @@ from app.db.models.user          import User          # users table
 from app.db.models.refresh_token import RefreshToken  # refresh_tokens table
 from app.db.models.workflow_run  import WorkflowRun   # workflow_runs table
 from app.db.models.trade         import Trade         # trades table
+from app.db.models.kill_switch_event import KillSwitchEvent # kill_switch_events table
 
 
 async def create_tables() -> None:
@@ -71,6 +72,7 @@ async def create_tables() -> None:
     logger.info("  ✓ refresh_tokens")
     logger.info("  ✓ workflow_runs")
     logger.info("  ✓ trades")
+    logger.info("  ✓ kill_switch_events")
     logger.info("")
     logger.info("Next step: create your first admin user:")
     logger.info("  docker compose exec backend python -m app.scripts.create_admin")

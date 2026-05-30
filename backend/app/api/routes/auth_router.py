@@ -31,7 +31,7 @@ WHAT THE FRONTEND SHOULD DO:
 4. On logout → call /auth/logout then clear both tokens
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from pydantic import BaseModel, EmailStr
@@ -45,6 +45,7 @@ from app.auth.dependencies import get_db, get_current_user, require_viewer
 from app.db.models.user import User
 from app.db.models.refresh_token import RefreshToken
 from app.db.repos.user_repo import UserRepo
+from app.api.dependencies.rate_limiter import rate_limit
 
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -91,6 +92,7 @@ class UserProfile(BaseModel):
 
 @router.post(
     "/login",
+    dependencies=[Depends(rate_limit(limit=5, window_seconds=60))],
     response_model=TokenResponse,
     summary="Login with email and password",
 )
@@ -168,7 +170,7 @@ async def login(
     db.add(db_token)
 
     # Update last_login_at
-    user.last_login_at = datetime.utcnow()
+    user.last_login_at = datetime.now(timezone.utc)
 
     await db.commit()
 
@@ -265,7 +267,7 @@ async def refresh_token(
     # ROTATE: REVOKE OLD TOKEN, CREATE NEW TOKENS
     # --------------------------------------------------------
     db_token.is_revoked  = True
-    db_token.last_used_at = datetime.utcnow()
+    db_token.last_used_at = datetime.now(timezone.utc)
 
     new_access_token             = create_access_token(user.id, user.role)
     new_refresh_token_str, expire = create_refresh_token(user.id)

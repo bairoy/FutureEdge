@@ -71,9 +71,10 @@ class ZerodhaBroker(BrokerBase):
             return True
 
         try:
+            import asyncio
             # kiteconnect is not an async library — we import and
-            # call it directly. The actual HTTP calls are fast enough
-            # that they do not block the event loop noticeably.
+            # call it directly. We wrap synchronous network calls
+            # in an executor to avoid blocking the event loop.
             from kiteconnect import KiteConnect
             from app.db.redis import redis_client, KEY_ZERODHA_ACCESS_TOKEN
 
@@ -106,7 +107,8 @@ class ZerodhaBroker(BrokerBase):
             self._kite.set_access_token(token)
 
             # Quick connectivity check — fetch profile
-            profile = self._kite.profile()
+            loop = asyncio.get_running_loop()
+            profile = await loop.run_in_executor(None, self._kite.profile)
 
             self._connected = True
 
@@ -146,7 +148,9 @@ class ZerodhaBroker(BrokerBase):
             raise RuntimeError("ZerodhaBroker not connected")
 
         try:
-            margins = self._kite.margins()
+            import asyncio
+            loop = asyncio.get_running_loop()
+            margins = await loop.run_in_executor(None, self._kite.margins)
             equity  = margins.get("equity", {})
 
             return {
@@ -175,7 +179,9 @@ class ZerodhaBroker(BrokerBase):
             raise RuntimeError("ZerodhaBroker not connected")
 
         try:
-            raw = self._kite.positions()
+            import asyncio
+            loop = asyncio.get_running_loop()
+            raw = await loop.run_in_executor(None, self._kite.positions)
             day_positions = raw.get("day", [])
 
             return [
@@ -243,21 +249,31 @@ class ZerodhaBroker(BrokerBase):
             else self._kite.ORDER_TYPE_LIMIT
         )
 
+        from app.brokers.symbol_mapper import map_symbol, get_exchange
+        mapped_symbol = map_symbol(symbol, broker="zerodha")
+        exchange = get_exchange(symbol, broker="zerodha")
+
         try:
-            order_id = self._kite.place_order(
-                variety          = self._kite.VARIETY_REGULAR,
-                exchange         = self._kite.EXCHANGE_NSE,
-                tradingsymbol    = symbol,
-                transaction_type = transaction_type,
-                quantity         = int(quantity),
-                product          = self._kite.PRODUCT_MIS,   # MIS = intraday
-                order_type       = kite_order_type,
-                price            = price,    # None for MARKET orders
-            )
+            import asyncio
+            loop = asyncio.get_running_loop()
+            
+            def _place():
+                return self._kite.place_order(
+                    variety          = self._kite.VARIETY_REGULAR,
+                    exchange         = exchange,
+                    tradingsymbol    = mapped_symbol,
+                    transaction_type = transaction_type,
+                    quantity         = int(quantity),
+                    product          = self._kite.PRODUCT_MIS,   # MIS = intraday
+                    order_type       = kite_order_type,
+                    price            = price,    # None for MARKET orders
+                )
+            
+            order_id = await loop.run_in_executor(None, _place)
 
             logger.info(
                 f"✅ ZerodhaBroker | ORDER PLACED | "
-                f"{direction} {quantity} {symbol} | order_id={order_id}"
+                f"{direction} {quantity} {symbol} ({mapped_symbol} on {exchange}) | order_id={order_id}"
             )
 
             # Fetch the actual fill price after placement
@@ -290,9 +306,14 @@ class ZerodhaBroker(BrokerBase):
             return False
 
         try:
-            self._kite.cancel_order(
-                variety=self._kite.VARIETY_REGULAR,
-                order_id=order_id,
+            import asyncio
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: self._kite.cancel_order(
+                    variety=self._kite.VARIETY_REGULAR,
+                    order_id=order_id,
+                )
             )
             logger.info(f"✅ ZerodhaBroker | CANCELLED order={order_id}")
             return True
@@ -308,18 +329,20 @@ class ZerodhaBroker(BrokerBase):
     async def get_ltp(self, symbol: str) -> float:
         """
         Get the Last Traded Price (LTP) for a symbol.
-
-        We pass the full exchange:symbol format to Zerodha.
-        Example: "NSE:RELIANCE"
         """
+        from app.brokers.symbol_mapper import map_symbol, get_exchange
+        mapped_symbol = map_symbol(symbol, broker="zerodha")
+        exchange = get_exchange(symbol, broker="zerodha")
 
         if not self._connected:
             return 0.0
 
         try:
-            data = self._kite.ltp(f"NSE:{symbol}")
-            return data[f"NSE:{symbol}"]["last_price"]
+            import asyncio
+            loop = asyncio.get_running_loop()
+            data = await loop.run_in_executor(None, self._kite.ltp, f"{exchange}:{mapped_symbol}")
+            return data[f"{exchange}:{mapped_symbol}"]["last_price"]
 
         except Exception as e:
-            logger.error(f"ZerodhaBroker.get_ltp failed for {symbol}: {e}")
+            logger.error(f"ZerodhaBroker.get_ltp failed for {symbol} ({mapped_symbol}): {e}")
             return 0.0

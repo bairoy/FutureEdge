@@ -46,6 +46,15 @@ export interface WorkflowRunResponse {
   execution_error: string | null;
   completed_nodes: string[];
   logs: string[];
+  execution_summary?: {
+    market_open: boolean;
+    symbol_mapped: string;
+    shares_requested: number | null;
+    position_rupees: number;
+    method: "kelly_based" | "user_override";
+    kelly_fraction: number;
+    blocking_reason: string | null;
+  };
 }
 
 export interface HITLResumeResponse {

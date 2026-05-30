@@ -32,14 +32,18 @@ from app.graph.runtime import get_workflow_graph
 from app.graph.state import MarketContext, PortfolioSnapshot
 from app.data.feed import load_historical_candles, get_current_price_yfinance
 from app.core.config import settings
+from app.api.dependencies.rate_limiter import rate_limit
 
 
 router = APIRouter(prefix="/api/v1", tags=["Workflow"])
 
 
 class RunWorkflowRequest(BaseModel):
-    symbol:        str  = ""
-    use_live_data: bool = True
+    symbol:          str   = ""
+    use_live_data:   bool  = True
+    quantity:        int | None = None      # user enters exact shares
+    position_rupees: float | None = None    # OR user enters rupee amount
+    override_kelly:  bool = False           # if True, skip Kelly sizing
 
 
 class HITLResumeRequest(BaseModel):
@@ -52,7 +56,11 @@ class HITLResumeRequest(BaseModel):
 # RUN WORKFLOW
 # ============================================================
 
-@router.post("/workflow/run", summary="Start a new agent workflow cycle")
+@router.post(
+    "/workflow/run",
+    dependencies=[Depends(rate_limit(limit=1, window_seconds=30))],
+    summary="Start a new agent workflow cycle",
+)
 async def run_workflow(
     request:      RunWorkflowRequest,
     current_user: User         = Depends(require_trader),
@@ -72,9 +80,18 @@ async def run_workflow(
     symbol = request.symbol or settings.DEFAULT_SYMBOL
 
     # Fetch market data
+    import asyncio
+    loop = asyncio.get_running_loop()
     if request.use_live_data:
-        candles = load_historical_candles(symbol, period="2d", interval="1m")
-        price   = get_current_price_yfinance(symbol)
+        candles = await loop.run_in_executor(
+            None,
+            lambda: load_historical_candles(symbol, period="2d", interval="1m")
+        )
+        price   = await loop.run_in_executor(
+            None,
+            get_current_price_yfinance,
+            symbol
+        )
     else:
         candles = []
         price   = 0.0
@@ -137,11 +154,14 @@ async def run_workflow(
             ],
         )
 
-    # Pass user_id into the cycle so agents/execution can record it
+    # Pass user_id and overrides into the cycle
     result = await run_agent_cycle(
         market_context = market_context,
         portfolio      = portfolio,
         user_id        = current_user.id,
+        user_override_quantity = request.quantity,
+        user_override_rupees = request.position_rupees,
+        override_kelly = request.override_kelly,
     )
 
     state    = result["state"]
@@ -170,6 +190,29 @@ async def run_workflow(
         f"run_id={run_id} | symbol={symbol}"
     )
 
+    from app.brokers.symbol_mapper import is_market_open, map_symbol
+    shares_requested = None
+    if request.quantity is not None:
+        shares_requested = request.quantity
+    elif request.position_rupees is not None:
+        shares_requested = int(request.position_rupees / price) if price > 0 else 0
+    elif consensus:
+        shares_requested = int(consensus.size / price) if price > 0 else 0
+
+    method = "kelly_based"
+    if request.quantity is not None or request.position_rupees is not None or request.override_kelly:
+        method = "user_override"
+
+    execution_summary = {
+        "market_open": is_market_open(),
+        "symbol_mapped": map_symbol(symbol),
+        "shares_requested": shares_requested,
+        "position_rupees": round(request.position_rupees or (consensus.size if consensus else 0.0), 2),
+        "method": method,
+        "kelly_fraction": 0.02,  # standard default fallback
+        "blocking_reason": state.get("execution_error")
+    }
+
     return {
         "thread_id":       run_id,
         "hitl_status":     state.get("hitl_status", "UNKNOWN"),
@@ -182,6 +225,7 @@ async def run_workflow(
                 "decision":   v.decision,
                 "confidence": v.confidence,
                 "reasoning":  v.reasoning,
+                "metadata":   v.metadata,
             }
             for v in [
                 state.get("signal_vote"),
@@ -195,6 +239,7 @@ async def run_workflow(
         "execution_error": state.get("execution_error"),
         "completed_nodes": state.get("completed_nodes", []),
         "logs":            state.get("logs", []),
+        "execution_summary": execution_summary,
     }
 
 
@@ -261,11 +306,11 @@ async def resume_workflow(
         raise HTTPException(status_code=500, detail=f"Resume failed: {str(e)}")
 
     # Update workflow run record
-    from datetime import datetime
+    from datetime import datetime, timezone
     workflow_run.status           = "COMPLETED"
     workflow_run.hitl_reviewed_by = current_user.id
-    workflow_run.hitl_decided_at  = datetime.utcnow()
-    workflow_run.completed_at     = datetime.utcnow()
+    workflow_run.hitl_decided_at  = datetime.now(timezone.utc)
+    workflow_run.completed_at     = datetime.now(timezone.utc)
     workflow_run.completed_nodes  = state.get("completed_nodes", [])
     workflow_run.error_message    = state.get("execution_error")
     await db.commit()

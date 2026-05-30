@@ -1,0 +1,540 @@
+# README 5 — DATABASE OPERATIONS
+
+## Database Architecture
+
+FutureEdge uses **three** databases with distinct purposes:
+
+| Database | Type | Purpose |
+|---|---|---|
+| PostgreSQL | Relational | Users, trades, workflow runs, auth tokens, LangGraph checkpoints |
+| Redis | In-memory cache | Kill switch, tick stream, pub/sub channels, indicator cache, agent weights |
+| Qdrant | Vector DB | Episodic memory (trade situation embeddings for similarity search) |
+
+---
+
+## PostgreSQL: Table Map
+
+### Table: `users`
+**File:** `backend/app/db/models/user.py`
+
+```sql
+CREATE TABLE users (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email         VARCHAR UNIQUE NOT NULL,
+    hashed_password VARCHAR NOT NULL,
+    full_name     VARCHAR,
+    role          VARCHAR DEFAULT 'viewer',  -- viewer | trader | risk_manager | admin
+    is_active     BOOLEAN DEFAULT TRUE,
+    last_login_at TIMESTAMP WITH TIME ZONE,
+    created_at    TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+```
+
+**Calling function:** `UserRepo.get_by_email()`, `UserRepo.get_by_id()`
+**Query:**
+```python
+# auth_router.py login()
+user = await UserRepo.get_by_email(db, body.email)
+# SQL: SELECT * FROM users WHERE email = $1 LIMIT 1
+```
+
+**Returned data chain:**
+```
+Database: User ORM object
+    ↓
+auth_router: verify password, create tokens
+    ↓
+Response: UserProfile (email, role, full_name — no hashed_password)
+```
+
+---
+
+### Table: `refresh_tokens`
+**File:** `backend/app/db/models/refresh_token.py`
+
+```sql
+CREATE TABLE refresh_tokens (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID REFERENCES users(id),
+    token       TEXT NOT NULL,          -- full JWT string
+    is_revoked  BOOLEAN DEFAULT FALSE,
+    device_info VARCHAR(255),
+    ip_address  VARCHAR(45),
+    expires_at  TIMESTAMP WITH TIME ZONE,
+    last_used_at TIMESTAMP WITH TIME ZONE,
+    created_at  TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+```
+
+**Calling functions:**
+```python
+# auth_router.py login() — store new token
+db_token = RefreshToken(user_id=user.id, token=refresh_token_str, ...)
+db.add(db_token)
+await db.commit()
+
+# auth_router.py refresh_token() — look up and rotate
+result = await db.execute(select(RefreshToken).where(
+    RefreshToken.token == body.refresh_token,
+    RefreshToken.user_id == user_id,
+    RefreshToken.is_revoked == False,   # only active tokens
+))
+db_token = result.scalar_one_or_none()
+
+# If found: revoke old, create new
+db_token.is_revoked = True
+new_db_token = RefreshToken(user_id=user.id, token=new_refresh_token_str, ...)
+db.add(new_db_token)
+await db.commit()
+```
+
+**Data chain:**
+```
+Login: password check → create access + refresh tokens → store refresh in DB → return both
+Refresh: validate refresh JWT → DB lookup (not revoked) → revoke old → create new → return both
+Logout: DB lookup → set is_revoked=True → user's session ends
+```
+
+---
+
+### Table: `trades`
+**File:** `backend/app/db/models/trade.py`
+
+```sql
+CREATE TABLE trades (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id          UUID REFERENCES users(id),
+    run_id           VARCHAR,           -- links to workflow_runs and Qdrant
+    symbol           VARCHAR NOT NULL,
+    direction        VARCHAR NOT NULL,  -- LONG | SHORT | NONE
+    size             FLOAT,             -- position size in Rupees
+    quantity         INTEGER,           -- number of shares
+    entry_price      FLOAT,
+    stop_loss        FLOAT,             -- set by orchestrator (ATR-based)
+    take_profit      FLOAT,             -- set by orchestrator (ATR-based)
+    exit_price       FLOAT,             -- set when trade closes
+    realized_pnl     FLOAT,             -- calculated at close
+    pnl_pct          FLOAT,             -- percentage return
+    status           VARCHAR DEFAULT 'OPEN',  -- OPEN | CLOSED | REJECTED | FAILED
+    risk_score       FLOAT,
+    hitl_required    BOOLEAN DEFAULT FALSE,
+    human_approved   BOOLEAN,
+    human_notes      TEXT,
+    agent_consensus  JSONB,             -- full agent votes array
+    broker           VARCHAR,           -- "mock" | "zerodha"
+    broker_order_id  VARCHAR,
+    actual_fill_price FLOAT,
+    slippage         FLOAT,
+    opened_at        TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    closed_at        TIMESTAMP WITH TIME ZONE
+);
+```
+
+#### Query 1 — Save new trade
+**Calling function:** `execution_agent.py` → `TradeRepo.save_trade()`
+```python
+trade = Trade(
+    user_id=user_id, run_id=run_id, symbol="NIFTY 50",
+    direction="LONG", size=4000.0, quantity=1,
+    entry_price=22300.0, stop_loss=21633.1, take_profit=23634.0,
+    status="OPEN", risk_score=0.42,
+    agent_consensus=[{agent votes as dicts}],
+    broker="mock", broker_order_id="ORDER-123",
+    actual_fill_price=22311.0,
+    slippage=11.0,   # 22311 - 22300
+)
+session.add(trade)
+await session.commit()
+```
+
+**Returned data chain:**
+```
+Broker order result → Trade ORM object created → session.commit() → session.refresh(trade)
+    ↓
+trade.id is now set (UUID generated by DB)
+    ↓
+Qdrant: store_trade_memory(run_id=trade.run_id, ...)
+    ↓
+Redis: publish(CHANNEL_TRADE_EXECUTED, trade details)
+    ↓
+Frontend WebSocket: trade table updates
+```
+
+#### Query 2 — Close trade
+**Calling function:** `exit_monitor.py` → `TradeRepo.close_trade()`
+```python
+result = await session.execute(
+    select(Trade).where(
+        Trade.id == trade_id,
+        Trade.user_id == user_id,   # security: owner-only
+    )
+)
+trade = result.scalar_one_or_none()
+
+trade.exit_price   = 21400.0   # current price when SL hit
+trade.closed_at    = datetime.now(UTC)
+trade.status       = "CLOSED"
+trade.realized_pnl = (21400.0 - 22300.0) * 1   # = -900.0
+trade.pnl_pct      = ((21400 - 22300) / 22300) * 100   # = -4.04%
+
+await session.commit()
+```
+
+**Returned data chain:**
+```
+closed_trade.realized_pnl = -900.0
+    ↓
+exit_monitor._daily_pnl += -900.0
+    ↓
+update_trade_outcome(run_id, outcome="LOSS", pnl_pct=-4.04)  → Qdrant update
+    ↓
+maybe_update_weights(user_id, symbol)  → recalibrate agent weights if time
+    ↓
+_check_daily_loss_cap()  → if > 3%, activate kill switch
+    ↓
+redis.publish(CHANNEL_TRADE_EXECUTED, {event: "TRADE_CLOSED", pnl: -900.0})
+```
+
+#### Query 3 — Get recent closed trades for Kelly criterion
+**Calling function:** `risk_agent.py` → `_calculate_kelly()` → `TradeRepo.get_recent_closed_trades()`
+```python
+result = await session.execute(
+    select(Trade)
+    .where(
+        Trade.user_id == user_id,           # per-user
+        Trade.symbol == symbol,             # per-symbol
+        Trade.status == "CLOSED",
+        Trade.realized_pnl.is_not(None),    # must have PnL data
+    )
+    .order_by(Trade.closed_at.desc())       # most recent first
+    .limit(50)                              # last 50 closed trades
+)
+trades = result.scalars().all()
+```
+
+**Data chain:**
+```
+trades list [Trade objects]
+    ↓
+calculate_win_stats(trades):
+    winners = [t for t in trades if t.realized_pnl > 0]
+    losers  = [t for t in trades if t.realized_pnl <= 0]
+    win_rate = len(winners) / len(trades)        # e.g. 0.60
+    avg_win  = mean([t.realized_pnl for t in winners])  # e.g. 1500.0
+    avg_loss = abs(mean([t.realized_pnl for t in losers]))  # e.g. 800.0
+    ↓
+Kelly formula:
+    b = avg_win / avg_loss = 1500/800 = 1.875
+    q = 1 - 0.60 = 0.40
+    full_kelly = (0.60 * 1.875 - 0.40) / 1.875 = 0.387
+    half_kelly = 0.387 / 2 = 0.193
+    kelly = clamp(0.193, 0.02, 0.25) = 0.193  ← position fraction
+    ↓
+orchestrator:
+    position_rupees = 100000 * 0.193 = ₹19,300
+```
+
+---
+
+### Table: `workflow_runs`
+**File:** `backend/app/db/models/workflow_run.py`
+
+```sql
+CREATE TABLE workflow_runs (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID REFERENCES users(id),
+    run_id          VARCHAR UNIQUE,     -- links to LangGraph checkpoint thread_id
+    symbol          VARCHAR,
+    direction       VARCHAR,
+    risk_score      FLOAT,
+    status          VARCHAR DEFAULT 'RUNNING',  -- RUNNING | COMPLETED | HITL_PENDING | FAILED
+    hitl_required   BOOLEAN DEFAULT FALSE,
+    hitl_reviewed_by UUID REFERENCES users(id),
+    hitl_decided_at TIMESTAMP WITH TIME ZONE,
+    completed_at    TIMESTAMP WITH TIME ZONE,
+    completed_nodes JSONB,             -- which nodes ran
+    error_message   TEXT,
+    started_at      TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+```
+
+**Data chain:**
+```
+workflow_router.run_workflow() creates WorkflowRun with status="RUNNING" or "HITL_PENDING"
+    ↓
+resume_workflow() updates status="COMPLETED", hitl_reviewed_by, hitl_decided_at
+    ↓
+get_workflow_status() reads this record + checks LangGraph for is_paused
+    ↓
+Frontend: displays workflow history per user
+```
+
+---
+
+## Redis: Key/Value Map
+
+### Key 1: Kill Switch
+```python
+KEY_TRADING_HALT = "TRADING_HALT"
+
+# Write (halt)
+await redis_client.set("TRADING_HALT", "1")
+
+# Read (execution_agent, every trade attempt)
+halt = await redis_client.get("TRADING_HALT")
+# Returns: "1" (halted) or "0" or None (not halted)
+```
+
+**Data chain:**
+```
+kill_switch_router.halt()
+    ↓
+redis.set("TRADING_HALT", "1")
+    ↓
+execution_node runs, first action:
+    halt = await redis.get("TRADING_HALT")
+    if halt == "1": return {"execution_error": "KILL_SWITCH_ACTIVE"}
+```
+
+### Key 2: Indicator Cache
+```python
+KEY_INDICATORS = "futureedge:indicators:{symbol}"
+
+# Read (indicator_cache.py)
+cached = await redis_client.get(f"futureedge:indicators:NIFTY 50")
+if cached:
+    data = json.loads(cached)
+    if time.time() - data["computed_at"] < 60:
+        return {**data, "from_cache": True}
+
+# Write (after computing fresh indicators)
+await redis_client.setex(
+    f"futureedge:indicators:NIFTY 50",
+    60,              # TTL: 60 seconds
+    json.dumps(result)
+)
+```
+
+**Data chain:**
+```
+signal_agent calls get_indicators(symbol, candles)
+    ↓
+indicator_cache checks Redis key: "futureedge:indicators:NIFTY 50"
+    ↓
+Cache hit (< 60s old): returns cached RSI, MACD, Bollinger
+Cache miss: computes fresh, stores in Redis with 60s TTL, returns result
+    ↓
+signal_agent uses indicators for scoring
+```
+
+### Key 3: Agent Weights
+```python
+WEIGHTS_KEY = "futureedge:agent_weights"
+
+# Read (orchestrator, each cycle)
+raw = await redis_client.get("futureedge:agent_weights")
+weights = json.loads(raw) if raw else DEFAULT_WEIGHTS
+
+# Write (weight_updater, every 20 closed trades)
+await redis_client.set("futureedge:agent_weights", json.dumps({
+    "SignalAgent": 0.32, "SentimentAgent": 0.28, "RiskAgent": 0.22, "PortfolioAgent": 0.18
+}))
+```
+
+### Redis Streams: Tick Data
+```python
+STREAM_TICKS = "futureedge:ticks"
+
+# Write (KiteTicker callback, every tick)
+r.xadd(
+    "futureedge:ticks",
+    {"token": "256265", "ltp": "22300.5", "open": "22280.0", ...},
+    maxlen=1000,   # keep last 1000 ticks, discard older
+)
+
+# Read (get_latest_tick — for exit monitor and agents)
+entries = await redis_client.xrevrange("futureedge:ticks", count=1)
+_, fields = entries[0]
+current_price = float(fields["ltp"])   # = 22300.5
+```
+
+**Data chain:**
+```
+NSE → KiteTicker WebSocket tick
+    ↓
+NSETickPublisher._publish_tick_sync()
+    ↓
+Redis Stream: "futureedge:ticks" (max 1000 entries)
+    ↓
+exit_monitor: await get_latest_tick() → current_price for SL/TP check
+broker.get_ltp(): uses ticker or last stream entry
+```
+
+### Redis Pub/Sub Channels
+
+| Channel | Publisher | Subscriber | Data |
+|---|---|---|---|
+| `futureedge:agent_results` | `orchestrator_node` | `market_router` WebSocket | Agent votes, trade proposal |
+| `futureedge:trade_executed` | `execution_agent`, `exit_monitor` | `market_router` WebSocket | Trade placed/closed |
+| `futureedge:hitl_pending` | `orchestrator_node` | `market_router` WebSocket | HITL approval needed |
+| `futureedge:kill_switch` | `kill_switch_service` | `market_router` WebSocket | Halt/resume notification |
+
+```python
+# Publish (orchestrator_node, after each cycle)
+await redis_client.publish(
+    "futureedge:agent_results",
+    json.dumps({"run_id": "a1b2c3", "direction": "LONG", "risk_score": 0.42, "votes": [...]}),
+)
+
+# Subscribe (market_router WebSocket handler)
+pubsub = redis_client.pubsub()
+await pubsub.subscribe("futureedge:agent_results", "futureedge:trade_executed", ...)
+async for message in pubsub.listen():
+    if message["type"] == "message":
+        await websocket.send_text(message["data"])
+```
+
+---
+
+## Qdrant: Vector Collection
+
+### Collection: `trade_memories`
+```
+Collection config:
+  name:     "trade_memories"
+  vectors:  12-dimensional floats
+  distance: Cosine similarity
+
+Each point:
+  id:      UUID
+  vector:  [0.273, 0.012, 0.3, 0.09, 0.35, 0.0, 0.0, 0.0, 0.0, 0.68, 0.12, 0.42]
+  payload: {
+    run_id, user_id, symbol, direction, regime, risk_score,
+    agent_votes: {"SignalAgent": "BUY", ...},
+    outcome: "WIN" | "LOSS" | "NEUTRAL",
+    pnl_pct: 1.2
+  }
+```
+
+**Write operation (execution_agent after trade):**
+```python
+def _store():
+    client = get_qdrant_client()
+    point = PointStruct(
+        id=str(uuid4()),
+        vector=market_vector,       # 12 floats from embedder.py
+        payload={
+            "run_id": "a1b2c3", "symbol": "NIFTY 50",
+            "direction": "LONG", "regime": "RANGEBOUND",
+            "outcome": "NEUTRAL",   # updated when trade closes
+            "pnl_pct": 0.0,
+            "agent_votes": {"SignalAgent": "BUY", ...},
+        }
+    )
+    client.upsert(collection_name="trade_memories", points=[point])
+
+# Called in thread pool (QdrantClient is synchronous)
+await loop.run_in_executor(None, _store)
+```
+
+**Read operation (orchestrator before proposal):**
+```python
+def _retrieve():
+    results = client.search(
+        collection_name="trade_memories",
+        query_vector=current_market_vector,   # 12 floats of current situation
+        query_filter=Filter(must=[
+            FieldCondition(key="symbol", match=MatchValue(value="NIFTY 50"))
+        ]),
+        limit=5,         # top-5 most similar
+        with_payload=True,
+    )
+    return [
+        {
+            "symbol": hit.payload["symbol"],
+            "outcome": hit.payload["outcome"],
+            "pnl_pct": hit.payload["pnl_pct"],
+            "similarity": hit.score,   # cosine similarity 0-1
+        }
+        for hit in results
+    ]
+
+memories = await loop.run_in_executor(None, _retrieve)
+```
+
+**Update operation (exit_monitor when trade closes):**
+```python
+def _update():
+    # Find point by run_id using scroll (not search — different API)
+    results, _ = client.scroll(
+        collection_name="trade_memories",
+        scroll_filter=Filter(must=[FieldCondition(key="run_id", match=MatchValue(value="a1b2c3"))]),
+        limit=1,
+        with_payload=True,
+    )
+    if results:
+        client.set_payload(
+            collection_name="trade_memories",
+            payload={"outcome": "LOSS", "pnl_pct": -4.04},
+            points=[results[0].id],
+        )
+```
+
+**Data chain (complete Qdrant lifecycle):**
+```
+orchestrator_node: build_market_vector() → 12 floats
+    ↓
+retrieve_similar_memories(vector, symbol) → 5 past similar trades with outcomes
+    ↓
+orchestrator_node: inject memories into LLM prompt
+    ↓
+execution_agent: store_trade_memory(run_id, vector, outcome="NEUTRAL")
+    ↓ (hours or days later)
+exit_monitor: trade hits SL/TP → close_trade() → pnl=-900
+    ↓
+update_trade_outcome(run_id, outcome="LOSS", pnl_pct=-4.04)
+    ↓ (next cycle with similar market conditions)
+retrieve_similar_memories(): returns this trade as "LOSS" → orchestrator is more cautious
+```
+
+---
+
+## LangGraph Checkpoints in PostgreSQL
+
+LangGraph creates its own tables for checkpoint storage:
+
+```sql
+-- Created automatically by checkpointer.setup()
+CREATE TABLE IF NOT EXISTS checkpoints (
+    thread_id   TEXT,
+    checkpoint_id TEXT,
+    checkpoint  BYTEA,   -- serialised AgentState
+    metadata    JSONB,
+    created_at  TIMESTAMP
+);
+```
+
+**Write (when interrupt() fires in human_review_node):**
+```python
+# LangGraph internal — you don't write this code
+# When interrupt() is called:
+# 1. Serialise entire AgentState to bytes
+# 2. Store in checkpoints table with thread_id="a1b2c3d4"
+# 3. Raise GraphInterrupt to stop execution
+# 4. ainvoke() catches GraphInterrupt and returns early result
+```
+
+**Read (when resume API is called):**
+```python
+# workflow_router.resume_workflow():
+config = {"configurable": {"thread_id": "a1b2c3d4"}}
+
+# graph.ainvoke(Command(resume={...}), config=config):
+# 1. LangGraph reads checkpoint from DB for thread_id="a1b2c3d4"
+# 2. Deserialises AgentState
+# 3. Resumes execution from after interrupt()
+# 4. human_response = {"decision": "APPROVE", "notes": "..."}
+```
+
+**Why the AsyncPostgresSaver must stay alive:**
+The checkpointer connection must remain open between the pause (interrupt) and the resume. This is why `runtime.lifespan()` uses `async with AsyncPostgresSaver.from_conn_string(...)` as the outermost context manager — it wraps the entire application lifetime.

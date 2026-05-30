@@ -20,7 +20,7 @@ This lets you trace: which agent cycle → which trade → which outcome.
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import String, Float, Boolean, DateTime, JSON, Text, ForeignKey
+from sqlalchemy import String, Float, Integer, Boolean, DateTime, JSON, Text, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -71,7 +71,9 @@ class Trade(Base):
 
     symbol:      Mapped[str]   = mapped_column(String(30))
     direction:   Mapped[str]   = mapped_column(String(10))  # LONG | SHORT | NONE
-    size:        Mapped[float] = mapped_column(Float)        # number of shares
+    size:        Mapped[float] = mapped_column(Float)        # position size in Rupees
+    quantity:    Mapped[int]   = mapped_column(Integer, default=0,
+                                               comment="Number of shares/contracts traded")
     entry_price: Mapped[float] = mapped_column(Float)
 
     stop_loss:   Mapped[float | None] = mapped_column(Float, nullable=True)

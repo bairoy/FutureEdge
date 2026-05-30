@@ -57,6 +57,23 @@ async def execution_node(state: AgentState) -> dict:
     try:
 
         # ====================================================
+        # LAYER 0: NSE MARKET HOURS CHECK
+        # ====================================================
+        from app.brokers.symbol_mapper import is_market_open
+        from app.core.config import settings
+        
+        if settings.ACTIVE_BROKER.lower() != "mock" and not is_market_open():
+            logger.warning(
+                f"MARKET CLOSED | Execution blocked | run_id={run_id} | user_id={user_id}"
+            )
+            return {
+                "executed_trade":  None,
+                "execution_error": "MARKET_CLOSED",
+                "completed_nodes": ["execution"],
+                "logs":            ["Execution blocked — National Stock Exchange (NSE) is closed."],
+            }
+
+        # ====================================================
         # LAYER 1: KILL SWITCH
         # ====================================================
         # Redis key TRADING_HALT="1" means halt all trading.
@@ -82,7 +99,7 @@ async def execution_node(state: AgentState) -> dict:
         # HOLD decisions produce direction="NONE" and size=0.
         # Nothing to execute — return cleanly.
 
-        if proposal.direction == "NONE" or proposal.size <= 0:
+        if proposal.direction == "NONE" or (proposal.size <= 0 and not state.get("user_override_quantity")):
             logger.info(f"No trade to execute (HOLD) | run_id={run_id}")
             return {
                 "executed_trade":  None,
@@ -109,20 +126,20 @@ async def execution_node(state: AgentState) -> dict:
             }
 
         # ====================================================
-        # CONVERT RUPEES TO SHARES
+        # CONVERT RUPEES TO SHARES (WITH OVERRIDES)
         # ====================================================
-        # The orchestrator gives position size in Rupees (₹).
-        # We convert to integer shares by dividing by current price.
-        #
-        # Example:
-        #   position_rupees = ₹4,000
-        #   current_price   = ₹2,500 per share
-        #   shares          = floor(4000 / 2500) = 1 share
-        #
-        # We always round DOWN — never exceed the intended size.
-
         price  = proposal.entry_price
-        shares = int(proposal.size / price) if price > 0 else 0
+
+        if state.get("user_override_quantity") is not None:
+            shares = int(state["user_override_quantity"])
+            logger.info(f"Using user override quantity: {shares} shares")
+        elif state.get("user_override_rupees") is not None:
+            user_rupees = float(state["user_override_rupees"])
+            shares = int(user_rupees / price) if price > 0 else 0
+            logger.info(f"Using user override rupees: ₹{user_rupees} -> {shares} shares")
+        else:
+            shares = int(proposal.size / price) if price > 0 else 0
+            logger.info(f"Using Kelly size: ₹{proposal.size:.2f} -> {shares} shares")
 
         if shares <= 0:
             logger.warning(
@@ -134,7 +151,7 @@ async def execution_node(state: AgentState) -> dict:
                 "execution_error": "POSITION_TOO_SMALL",
                 "completed_nodes": ["execution"],
                 "logs": [
-                    f"Position ₹{proposal.size:.0f} too small at ₹{price:.2f}"
+                    f"Position too small: calculated {shares} shares at ₹{price:.2f}"
                 ],
             }
 
@@ -149,14 +166,26 @@ async def execution_node(state: AgentState) -> dict:
         # so this code never needs to change when switching brokers.
 
         broker = get_broker()
-        await broker.connect()
+        # Broker connection is established at startup via lifespan.
+        # Only reconnect if the connection was lost.
+        if not await broker.is_connected():
+            await broker.connect()
+
+        # SEBI compliance: use LIMIT orders with a price buffer
+        # instead of MARKET orders (prohibited via API as of 2026).
+        # Buffer: 0.05% above LTP for BUY, 0.05% below for SELL.
+        price_buffer = price * 0.0005  # 0.05%
+        if proposal.direction == "LONG":
+            limit_price = round(price + price_buffer, 2)
+        else:
+            limit_price = round(price - price_buffer, 2)
 
         order_result = await broker.place_order(
             symbol     = proposal.symbol,
             direction  = proposal.direction,
             quantity   = float(shares),
-            order_type = "MARKET",
-            price      = price,
+            order_type = "LIMIT",
+            price      = limit_price,
         )
 
         # ====================================================
@@ -225,6 +254,7 @@ async def execution_node(state: AgentState) -> dict:
                     proposal          = proposal,
                     run_id            = run_id,
                     user_id           = user_id,
+                    quantity          = shares,
                     broker            = broker_name,
                     broker_order_id   = order_result.order_id if order_result.success else None,
                     actual_fill_price = order_result.fill_price if order_result.success else None,
@@ -236,6 +266,37 @@ async def execution_node(state: AgentState) -> dict:
             logger.error(
                 f"DB write failed for trade run_id={run_id}: {db_err}"
             )
+
+        # ====================================================
+        # WRITE TO QDRANT EPISODIC MEMORY (Phase 2 — new)
+        # ====================================================
+        market_vector = state.get("market_vector")
+        if market_vector is not None:
+            try:
+                from app.memory.qdrant_store import store_trade_memory
+                
+                agent_votes_dict = {
+                    vote.agent: vote.decision
+                    for vote in proposal.agent_consensus
+                }
+                
+                # Initially NEUTRAL outcome with 0.0 P&L pct.
+                # The exit monitor will update this to WIN/LOSS when closed.
+                await store_trade_memory(
+                    run_id=run_id,
+                    user_id=user_id,
+                    symbol=proposal.symbol,
+                    direction=proposal.direction,
+                    vector=market_vector,
+                    outcome="NEUTRAL",
+                    pnl_pct=0.0,
+                    regime=state["market_context"].regime if hasattr(state["market_context"], "regime") else "UNKNOWN",
+                    agent_votes=agent_votes_dict,
+                    risk_score=proposal.risk_score,
+                )
+                logger.info(f"Episodic memory stored in Qdrant for run_id={run_id}")
+            except Exception as q_err:
+                logger.warning(f"Failed to store episodic memory in Qdrant: {q_err}")
 
         # ====================================================
         # PUBLISH TO REDIS PUB/SUB

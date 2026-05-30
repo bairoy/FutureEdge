@@ -43,7 +43,8 @@ from zoneinfo import ZoneInfo
 import yfinance as yf
 from loguru import logger
 
-from app.db.redis import redis_client, STREAM_TICKS
+from app.db.redis import redis_client, STREAM_TICKS, KEY_ZERODHA_ACCESS_TOKEN
+import redis as sync_redis
 from app.core.config import settings
 
 
@@ -232,14 +233,10 @@ class NSETickPublisher:
     """
 
     def __init__(self, instrument_tokens: list[int]):
-        """
-        instrument_tokens: list of Zerodha integer tokens to subscribe to.
-        Example: [256265] for NIFTY 50
-        """
-
         self._tokens    = instrument_tokens
         self._ticker    = None
         self._running   = False
+        self._redis_sync = None  # Persistent sync Redis client
 
     def start(self) -> None:
         """
@@ -249,19 +246,15 @@ class NSETickPublisher:
         Call this from your lifespan startup after market opens.
         """
 
-        import redis as sync_redis
-        from app.db.redis import KEY_ZERODHA_ACCESS_TOKEN
-
-        # Get token from Redis dynamically
+        # Initialize persistent sync Redis client
         try:
-            r = sync_redis.Redis(
+            self._redis_sync = sync_redis.Redis(
                 host=settings.REDIS_HOST,
                 port=settings.REDIS_PORT,
                 db=settings.REDIS_DB,
                 decode_responses=True,
             )
-            token = r.get(KEY_ZERODHA_ACCESS_TOKEN)
-            r.close()
+            token = self._redis_sync.get(KEY_ZERODHA_ACCESS_TOKEN)
         except Exception as re:
             logger.warning(f"Could not check Redis for Zerodha access token: {re}")
             token = None
@@ -315,12 +308,15 @@ class NSETickPublisher:
         except Exception as e:
             logger.error(f"NSETickPublisher start failed: {e}")
 
-    def stop(self) -> None:
-        """Stop the WebSocket connection cleanly."""
-
         if self._ticker and self._running:
             self._ticker.stop()
             self._running = False
+            if self._redis_sync:
+                try:
+                    self._redis_sync.close()
+                except Exception:
+                    pass
+                self._redis_sync = None
             logger.info("🔴 NSETickPublisher stopped")
 
     # --------------------------------------------------------
@@ -391,16 +387,17 @@ class NSETickPublisher:
         We use redis.Redis (sync) not redis.asyncio here.
         """
 
-        import redis as sync_redis
-        from app.core.config import settings
-
-        # Synchronous Redis client for this thread
-        r = sync_redis.Redis(
-            host=settings.REDIS_HOST,
-            port=settings.REDIS_PORT,
-            db=settings.REDIS_DB,
-            decode_responses=True,
-        )
+        # Use persistent sync Redis client if available, fallback otherwise
+        if self._redis_sync:
+            r = self._redis_sync
+        else:
+            import redis as sync_redis
+            r = sync_redis.Redis(
+                host=settings.REDIS_HOST,
+                port=settings.REDIS_PORT,
+                db=settings.REDIS_DB,
+                decode_responses=True,
+            )
 
         token = tick.get("instrument_token", 0)
         ltp   = tick.get("last_price", 0.0)
@@ -427,7 +424,9 @@ class NSETickPublisher:
 
         logger.debug(f"📊 Tick | token={token} | LTP={ltp}")
 
-        r.close()
+        # Do NOT close if using persistent client
+        if not self._redis_sync:
+            r.close()
 
 
 # ============================================================

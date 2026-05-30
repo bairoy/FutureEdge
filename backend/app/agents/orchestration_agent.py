@@ -40,15 +40,10 @@ from app.graph.state import (
 from app.db.redis import redis_client, CHANNEL_AGENT_RESULTS, CHANNEL_HITL_PENDING
 
 
-# ============================================================
-# AGENT WEIGHTS
-# ============================================================
-
-# Higher weight = more influence on the final decision.
-# Phase 2: these will be dynamically updated based on
-# each agent's historical prediction accuracy.
-
-AGENT_WEIGHTS = {
+# Default weights — used only if Redis has no stored weights.
+# The orchestrator now reads from Redis via get_agent_weights()
+# so these are just the initial fallback.
+DEFAULT_AGENT_WEIGHTS = {
     "SignalAgent":    0.30,
     "SentimentAgent": 0.20,
     "RiskAgent":      0.25,
@@ -107,6 +102,16 @@ async def orchestrator_node(state: AgentState) -> dict:
         symbol  = ctx.symbol
         price   = ctx.current_price
         run_id  = state["run_id"]
+
+        # --------------------------------------------------------
+        # LOAD ADAPTIVE WEIGHTS FROM REDIS
+        # --------------------------------------------------------
+        # Phase 2: weights are updated by weight_updater.py based
+        # on each agent's historical prediction accuracy.
+        # Falls back to DEFAULT_AGENT_WEIGHTS if Redis is empty.
+
+        from app.jobs.weight_updater import get_agent_weights
+        agent_weights = await get_agent_weights()
 
         # --------------------------------------------------------
         # COLLECT VOTES
@@ -180,7 +185,7 @@ async def orchestrator_node(state: AgentState) -> dict:
         total_wt   = 0.0
 
         for vote in votes:
-            wt = AGENT_WEIGHTS.get(vote.agent, 0.2)
+            wt = agent_weights.get(vote.agent, 0.2)
             total_wt += wt
 
             if vote.decision == "BUY":
@@ -263,6 +268,45 @@ async def orchestrator_node(state: AgentState) -> dict:
             hitl_reasons.append(f"Large position: ₹{position_rupees:.2f}")
 
         # --------------------------------------------------------
+        # EPISODIC MEMORY: RETRIEVE SIMILAR PAST TRADES (Phase 2 — new)
+        # --------------------------------------------------------
+        episodic_memories = []
+        market_vector = None
+        try:
+            from app.data.indicator_cache import get_indicators
+            from app.memory.embedder import build_market_vector
+            from app.memory.qdrant_store import retrieve_similar_memories
+
+            ind = await get_indicators(symbol, ctx.ohlcv_1m)
+            rsi              = ind.get("rsi", 50.0)
+            macd_hist        = ind.get("macd_hist", 0.0)
+            bollinger_upper  = ind.get("bollinger_upper", price)
+            bollinger_lower  = ind.get("bollinger_lower", price)
+
+            market_vector = build_market_vector(
+                rsi=rsi,
+                macd_hist=macd_hist,
+                bollinger_upper=bollinger_upper,
+                bollinger_lower=bollinger_lower,
+                current_price=price,
+                volatility_24h=ctx.volatility_24h,
+                sentiment_score=ctx.sentiment_score,
+                regime=ctx.regime if hasattr(ctx, "regime") else "UNKNOWN",
+                buy_score=buy_score,
+                sell_score=sell_score,
+                risk_score=risk_score,
+            )
+
+            episodic_memories = await retrieve_similar_memories(
+                vector=market_vector,
+                symbol=symbol,
+                limit=5,
+            )
+            logger.info(f"Retrieved {len(episodic_memories)} similar past trades from Qdrant")
+        except Exception as mem_err:
+            logger.warning(f"Failed to query past memories: {mem_err}")
+
+        # --------------------------------------------------------
         # GENERATE LLM RATIONALE  (only if not holding)
         # --------------------------------------------------------
         llm_rationale = None
@@ -270,7 +314,7 @@ async def orchestrator_node(state: AgentState) -> dict:
         if decision != "HOLD" and settings.LLM_REASONING_ENABLED:
             try:
                 from app.models.llm_reasoner import generate_trade_rationale
-                memories = state.get("episodic_memory", [])
+                memories = episodic_memories
                 regime = ctx.regime if hasattr(ctx, "regime") else "UNKNOWN"
                 
                 llm_rationale = await generate_trade_rationale(
@@ -305,6 +349,26 @@ async def orchestrator_node(state: AgentState) -> dict:
         )
 
         # --------------------------------------------------------
+        # SET STOP-LOSS & TAKE-PROFIT  (ATR-based)
+        # --------------------------------------------------------
+        # Without SL/TP, the exit monitor has nothing to enforce
+        # and trades stay OPEN forever.
+        #
+        # Using volatility as ATR proxy:
+        #   SL = 1.5 × ATR (tight enough to limit loss)
+        #   TP = 3.0 × ATR (2:1 reward-to-risk ratio)
+
+        if direction != "NONE" and price > 0:
+            atr_proxy = max(ctx.volatility_24h * price, price * 0.005)  # floor at 0.5%
+
+            if direction == "LONG":
+                proposal.stop_loss   = round(price - (1.5 * atr_proxy), 2)
+                proposal.take_profit = round(price + (3.0 * atr_proxy), 2)
+            elif direction == "SHORT":
+                proposal.stop_loss   = round(price + (1.5 * atr_proxy), 2)
+                proposal.take_profit = round(price - (3.0 * atr_proxy), 2)
+
+        # --------------------------------------------------------
         # PUBLISH TO REDIS  (frontend WebSocket picks this up)
         # --------------------------------------------------------
 
@@ -326,6 +390,8 @@ async def orchestrator_node(state: AgentState) -> dict:
             "llm_rationale":   llm_rationale,
             "hitl_required":   hitl_required,
             "hitl_status":     "PENDING" if hitl_required else "NOT_REQUIRED",
+            "episodic_memory": episodic_memories,
+            "market_vector":   market_vector,
             "completed_nodes": ["orchestrator"],
             "logs":            [f"Orchestrator generated {decision} for {symbol}"],
         }
@@ -343,6 +409,8 @@ async def orchestrator_node(state: AgentState) -> dict:
             "hitl_required":   True,
             "hitl_status":     "PENDING",
             "execution_error": str(e),
+            "episodic_memory": [],
+            "market_vector":   None,
             "completed_nodes": ["orchestrator"],
             "logs":            [f"Orchestrator failed: {e}"],
         }
@@ -388,6 +456,7 @@ async def _publish_results(
                     "decision":   v.decision,
                     "confidence": v.confidence,
                     "reasoning":  v.reasoning,
+                    "metadata":   v.metadata,
                 }
                 for v in votes
             ],

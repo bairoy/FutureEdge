@@ -9,7 +9,7 @@ can write it to the trades table.
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from loguru import logger
 from langgraph.graph import StateGraph, START, END
@@ -74,6 +74,9 @@ async def run_agent_cycle(
     market_context: MarketContext,
     portfolio:      PortfolioSnapshot,
     user_id:        str | None = None,   # NEW: which user triggered this
+    user_override_quantity: int | None = None,
+    user_override_rupees: float | None = None,
+    override_kelly: bool = False,
     config:         dict | None = None,
 ) -> dict:
     """
@@ -99,6 +102,11 @@ async def run_agent_cycle(
         "market_context": market_context,
         "portfolio":      portfolio,
 
+        # User overrides
+        "user_override_quantity": user_override_quantity,
+        "user_override_rupees":   user_override_rupees,
+        "override_kelly":         override_kelly,
+
         # Agent outputs (populated by each agent node)
         "signal_vote":    None,
         "sentiment_vote": None,
@@ -119,8 +127,9 @@ async def run_agent_cycle(
         # Observability + user tracking
         "run_id":          run_id,
         "user_id":         user_id or "anonymous",
-        "timestamp":       datetime.utcnow().isoformat(),
+        "timestamp":       datetime.now(timezone.utc).isoformat(),
         "episodic_memory": [],
+        "market_vector":   None,
         "logs":            [],
         "completed_nodes": [],
     }
@@ -128,7 +137,7 @@ async def run_agent_cycle(
     if config is None:
         config = {"configurable": {"thread_id": run_id}}
 
-    logger.info(f"Starting workflow | run_id={run_id} | user_id={user_id}")
+    logger.info(f"Starting workflow | run_id={run_id} | user_id={user_id} | qty_override={user_override_quantity} | rupees_override={user_override_rupees}")
 
     result = await graph.ainvoke(initial_state, config=config)
 

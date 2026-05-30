@@ -30,6 +30,7 @@ import { PnLChart } from "@/components/charts/PnLChart";
 import { AgentVoteCard } from "@/components/dashboard/AgentVoteCard";
 import { SymbolSearch } from "@/components/dashboard/SymbolSearch";
 import { StatCard } from "@/components/dashboard/StatCard";
+import { TradeOrderPanel } from "@/components/trading/TradeOrderPanel";
 import { showToast } from "@/components/ui/Toast";
 import api from "@/lib/api";
 import type { WorkflowRunResponse, Trade } from "@/types";
@@ -48,6 +49,15 @@ export default function DashboardPage() {
   const [running, setRunning] = useState(false);
   const [runResult, setRunResult] = useState<WorkflowRunResponse | null>(null);
   const [useMockPortfolio, setUseMockPortfolio] = useState(false);
+  const [tradeConfig, setTradeConfig] = useState<{
+    quantity: number | null;
+    positionRupees: number | null;
+    overrideKelly: boolean;
+  }>({
+    quantity: null,
+    positionRupees: null,
+    overrideKelly: false,
+  });
 
   // Fetch history when symbol changes
   const { setTicks } = useTradingStore();
@@ -106,6 +116,9 @@ export default function DashboardPage() {
       const { data } = await api.post<WorkflowRunResponse>("/api/v1/workflow/run", {
         symbol: currentSymbol,
         use_live_data: !useMockPortfolio,
+        quantity: tradeConfig.quantity,
+        position_rupees: tradeConfig.positionRupees,
+        override_kelly: tradeConfig.overrideKelly,
       });
 
       setRunResult(data);
@@ -133,7 +146,7 @@ export default function DashboardPage() {
           });
         }
       } else if (data.execution_error) {
-        showToast(`Error: ${data.execution_error}`, "error");
+        showToast(data.execution_error, "error");
       } else {
         showToast(`Cycle complete — ${data.direction}`, "success");
       }
@@ -187,44 +200,72 @@ export default function DashboardPage() {
 
       {/* ── Run result banner ───────────────────────────────── */}
       {runResult && (
-        <div className={`p-3.5 rounded-xl border text-sm animate-slide-up flex flex-wrap items-center justify-between gap-3
+        <div className={`p-4 rounded-2xl border text-sm animate-slide-up flex flex-col gap-3
           ${runResult.hitl_status === "PENDING"
             ? "bg-amber-500/10 border-amber-500/30 text-amber-300"
             : "bg-green-500/10 border-green-500/30 text-green-300"
           }`}>
-          <div className="flex items-center gap-2 font-medium">
-            <AlertTriangle className="w-4 h-4" />
-            <div>
-              {runResult.hitl_status === "PENDING"
-                ? "⏸ Paused — awaiting HITL approval"
-                : `✓ ${runResult.direction} | risk=${runResult.risk_score?.toFixed(2)}`
-              }
-              <p className="text-[10px] opacity-60 mt-0.5 uppercase tracking-wider">thread: {runResult.thread_id}</p>
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 font-medium">
+              <AlertTriangle className="w-4 h-4" />
+              <div>
+                {runResult.hitl_status === "PENDING"
+                  ? "⏸ Paused — awaiting HITL approval"
+                  : `✓ ${runResult.direction} | Risk Score: ${runResult.risk_score?.toFixed(2)}`
+                }
+                <p className="text-[10px] opacity-60 mt-0.5 uppercase tracking-wider">thread: {runResult.thread_id}</p>
+              </div>
             </div>
+
+            {runResult.hitl_status === "PENDING" && (
+              <button
+                onClick={() => {
+                  if (runResult.proposal && runResult.votes) {
+                    setHITLPending({
+                      threadId: runResult.thread_id,
+                      symbol: runResult.proposal.symbol || currentSymbol,
+                      direction: runResult.proposal.direction,
+                      size: runResult.proposal.size,
+                      entryPrice: runResult.proposal.entry_price,
+                      riskScore: runResult.proposal.risk_score,
+                      llmRationale: runResult.proposal.llm_rationale || null,
+                      reasons: runResult.reasons || [],
+                      memories: [],
+                      votes: runResult.votes,
+                    });
+                  }
+                }}
+                className="px-3.5 py-1.5 bg-amber-500 text-black text-xs font-bold rounded-lg hover:bg-amber-400 transition-colors shadow-lg shadow-amber-500/10"
+              >
+                Review & Approve
+              </button>
+            )}
           </div>
 
-          {runResult.hitl_status === "PENDING" && (
-            <button
-              onClick={() => {
-                if (runResult.proposal && runResult.votes) {
-                  setHITLPending({
-                    threadId: runResult.thread_id,
-                    symbol: runResult.proposal.symbol || currentSymbol,
-                    direction: runResult.proposal.direction,
-                    size: runResult.proposal.size,
-                    entryPrice: runResult.proposal.entry_price,
-                    riskScore: runResult.proposal.risk_score,
-                    llmRationale: runResult.proposal.llm_rationale || null,
-                    reasons: runResult.reasons || [],
-                    memories: [],
-                    votes: runResult.votes,
-                  });
-                }
-              }}
-              className="px-3 py-1.5 bg-amber-500 text-black text-xs font-bold rounded-lg hover:bg-amber-400 transition-colors shadow-lg"
-            >
-              Review & Approve
-            </button>
+          {/* Execution Summary Panel */}
+          {runResult.execution_summary && (
+            <div className="mt-1 pt-2.5 border-t border-current/15 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs opacity-90">
+              <div className="flex flex-col bg-black/10 p-2 rounded-lg border border-current/5">
+                <span className="text-[10px] opacity-60 uppercase font-semibold">Mapped Symbol</span>
+                <span className="font-bold font-mono mt-0.5">{runResult.execution_summary.symbol_mapped}</span>
+              </div>
+              <div className="flex flex-col bg-black/10 p-2 rounded-lg border border-current/5">
+                <span className="text-[10px] opacity-60 uppercase font-semibold">Requested Shares</span>
+                <span className="font-bold mt-0.5">
+                  {runResult.execution_summary.shares_requested ?? "—"}
+                </span>
+              </div>
+              <div className="flex flex-col bg-black/10 p-2 rounded-lg border border-current/5">
+                <span className="text-[10px] opacity-60 uppercase font-semibold">Target Value</span>
+                <span className="font-bold font-mono mt-0.5">
+                  ₹{runResult.execution_summary.position_rupees.toLocaleString("en-IN", { maximumFractionDigits: 1 })}
+                </span>
+              </div>
+              <div className="flex flex-col bg-black/10 p-2 rounded-lg border border-current/5">
+                <span className="text-[10px] opacity-60 uppercase font-semibold">Sizing Method</span>
+                <span className="font-bold uppercase mt-0.5">{runResult.execution_summary.method.replace("_", " ")}</span>
+              </div>
+            </div>
           )}
         </div>
       )}
@@ -270,15 +311,19 @@ export default function DashboardPage() {
           <PriceChart ticks={ticks} height={280} />
         </div>
 
-        {/* PnL chart — takes 1 of 3 columns */}
-        <div className="card p-4">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="font-semibold text-gray-100 text-sm">Cumulative PnL</h2>
-            <span className="text-xs text-gray-600">
-              {trades?.filter((t) => t.realized_pnl != null).length ?? 0} closed
-            </span>
+        {/* Sizing Config & PnL chart — takes 1 of 3 columns */}
+        <div className="flex flex-col gap-5">
+          <TradeOrderPanel onConfigChange={setTradeConfig} disabled={running} />
+          
+          <div className="card p-4 flex-1">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="font-semibold text-gray-100 text-sm">Cumulative PnL</h2>
+              <span className="text-xs text-gray-600">
+                {trades?.filter((t) => t.realized_pnl != null).length ?? 0} closed
+              </span>
+            </div>
+            <PnLChart trades={trades ?? []} height={190} />
           </div>
-          <PnLChart trades={trades ?? []} height={280} />
         </div>
       </div>
 

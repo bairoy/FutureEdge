@@ -53,10 +53,12 @@ class TradeRepo:
         proposal:          TradeProposal,
         run_id:            str,
         user_id:           str,               # NEW: which user owns this trade
+        quantity:          int  = 0,           # actual number of shares traded
         broker:            str  = "mock",
         broker_order_id:   str | None  = None,
         actual_fill_price: float | None = None,
         workflow_run_id:   str | None  = None,
+        status:            str | None  = None,  # NEW: optional custom status (e.g. REJECTED)
     ) -> Trade:
         """
         Write a new trade record to the database.
@@ -76,6 +78,10 @@ class TradeRepo:
         if actual_fill_price is not None:
             slippage = round(actual_fill_price - proposal.entry_price, 4)
 
+        # Resolve status
+        if status is None:
+            status = "OPEN" if proposal.direction != "NONE" else "NONE"
+
         trade = Trade(
             user_id          = user_id,
             run_id           = run_id,
@@ -83,13 +89,12 @@ class TradeRepo:
             symbol           = proposal.symbol,
             direction        = proposal.direction,
             size             = proposal.size,
+            quantity         = quantity,
             entry_price      = proposal.entry_price,
             stop_loss        = proposal.stop_loss,
             take_profit      = proposal.take_profit,
             risk_score       = proposal.risk_score,
-
-            # OPEN for actual trades, NONE for HOLD decisions
-            status = "OPEN" if proposal.direction != "NONE" else "NONE",
+            status           = status,
 
             hitl_required  = proposal.human_approved is not None,
             human_approved = proposal.human_approved,
@@ -163,20 +168,34 @@ class TradeRepo:
         trade.closed_at = datetime.now(timezone.utc)
         trade.status     = "CLOSED"
 
-        # Calculate profit or loss
-        if trade.direction == "LONG":
-            trade.realized_pnl = (exit_price - trade.entry_price) * trade.size
-        elif trade.direction == "SHORT":
-            trade.realized_pnl = (trade.entry_price - exit_price) * trade.size
+        # Calculate profit or loss using QUANTITY (shares), not SIZE (rupees)
+        if trade.quantity > 0:
+            if trade.direction == "LONG":
+                trade.realized_pnl = round(
+                    (exit_price - trade.entry_price) * trade.quantity, 4
+                )
+            elif trade.direction == "SHORT":
+                trade.realized_pnl = round(
+                    (trade.entry_price - exit_price) * trade.quantity, 4
+                )
+            else:
+                trade.realized_pnl = 0.0
         else:
+            # Fallback for legacy trades without quantity
             trade.realized_pnl = 0.0
 
-        # Percentage return = PnL / (entry_price × size) × 100
-        if trade.entry_price > 0 and trade.size > 0:
-            trade.pnl_pct = round(
-                (trade.realized_pnl / (trade.entry_price * trade.size)) * 100,
-                4,
-            )
+        # Percentage return = (exit - entry) / entry × 100
+        if trade.entry_price > 0:
+            if trade.direction == "LONG":
+                trade.pnl_pct = round(
+                    ((exit_price - trade.entry_price) / trade.entry_price) * 100,
+                    4,
+                )
+            elif trade.direction == "SHORT":
+                trade.pnl_pct = round(
+                    ((trade.entry_price - exit_price) / trade.entry_price) * 100,
+                    4,
+                )
 
         await session.commit()
         await session.refresh(trade)

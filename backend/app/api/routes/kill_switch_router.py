@@ -32,23 +32,16 @@ async def halt_trading(
     current_user: User = Depends(require_risk_manager),
 ):
     """
-    Set TRADING_HALT=1 in Redis. Blocks all new executions.
+    Halt all trading activity and log the event.
     Only risk_manager and admin can call this.
     """
+    from app.services.kill_switch_service import activate_kill_switch
 
-    await redis_client.set(KEY_TRADING_HALT, "1")
-
-    payload = {
-        "halted":    True,
-        "reason":    request.reason,
-        "halted_by": current_user.email,
-        "halted_at": datetime.utcnow().isoformat(),
-    }
-
-    await redis_client.publish(CHANNEL_KILL_SWITCH, json.dumps(payload))
-
-    logger.critical(
-        f"KILL SWITCH ACTIVATED | by={current_user.email} | reason={request.reason}"
+    await activate_kill_switch(
+        duration_seconds=14400,  # 4 hours default
+        reason=request.reason,
+        user_id=current_user.id,
+        user_email=current_user.email,
     )
 
     return {"status": "halted", "reason": request.reason, "by": current_user.email}
@@ -58,19 +51,13 @@ async def halt_trading(
 async def resume_trading(
     current_user: User = Depends(require_risk_manager),
 ):
-    """Set TRADING_HALT=0 in Redis. Trading resumes on next cycle."""
+    """Resume trading activity and log the event."""
+    from app.services.kill_switch_service import release_kill_switch
 
-    await redis_client.set(KEY_TRADING_HALT, "0")
-
-    payload = {
-        "halted":     False,
-        "resumed_by": current_user.email,
-        "resumed_at": datetime.utcnow().isoformat(),
-    }
-
-    await redis_client.publish(CHANNEL_KILL_SWITCH, json.dumps(payload))
-
-    logger.info(f"Kill switch released | by={current_user.email}")
+    await release_kill_switch(
+        user_id=current_user.id,
+        user_email=current_user.email,
+    )
 
     return {"status": "active", "by": current_user.email}
 

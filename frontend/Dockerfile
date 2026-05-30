@@ -17,7 +17,9 @@ WORKDIR /app
 # npm ci only reruns when package.json/lock changes, saving time.
 COPY package.json package-lock.json* ./
 
-RUN npm ci --legacy-peer-deps
+RUN npm config set fetch-retry-maxtimeout 120000 && \
+    npm config set fetch-retries 5 && \
+    npm ci --legacy-peer-deps
 
 # Copy rest of source
 COPY . .
@@ -28,7 +30,7 @@ ENV PORT=3000
 ENV NEXT_TELEMETRY_DISABLED=1
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-  CMD wget -qO- http://localhost:3000/health 2>/dev/null || curl -sf http://localhost:3000 || exit 1
+  CMD wget --spider http://localhost:3000/ || exit 1
 
 # Default: development with hot reload
 # docker-compose overrides this to `npm run dev`

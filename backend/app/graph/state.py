@@ -98,6 +98,13 @@ class AgentState(TypedDict):
     user_id: str
 
     # --------------------------------------------------------
+    # USER OVERRIDES (Quantity, Rupees, Kelly)
+    # --------------------------------------------------------
+    user_override_quantity: Optional[int]
+    user_override_rupees:   Optional[float]
+    override_kelly:         bool
+
+    # --------------------------------------------------------
     # MARKET + PORTFOLIO INPUTS
     # --------------------------------------------------------
     symbol:         str
@@ -136,5 +143,6 @@ class AgentState(TypedDict):
     run_id:          str
     timestamp:       str
     episodic_memory: list[dict]   # Phase 2: filled from Qdrant
+    market_vector:   Optional[list[float]]  # Phase 2: computed market embedding vector
     logs:            Annotated[list[str], operator.add]
     completed_nodes: Annotated[list[str], operator.add]

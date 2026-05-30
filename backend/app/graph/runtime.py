@@ -172,6 +172,30 @@ async def lifespan(app):
             logger.warning(f"Broker connection failed: {settings.ACTIVE_BROKER}")
 
         # --------------------------------------------------------
+        # STEP 6: INITIALISE QDRANT COLLECTION (Phase 2 — new)
+        # --------------------------------------------------------
+        try:
+            from app.memory.qdrant_store import init_collection
+            import asyncio
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, init_collection)
+            logger.info("Qdrant collection check/creation complete")
+        except Exception as q_err:
+            logger.error(f"Failed to initialise Qdrant collection: {q_err}")
+
+        # --------------------------------------------------------
+        # STEP 7: START EXIT MONITORING ENGINE (Phase 2 — new)
+        # --------------------------------------------------------
+        from app.jobs.exit_monitor import exit_monitor
+        await exit_monitor.start()
+
+        # --------------------------------------------------------
+        # STEP 8: START POSITION RECONCILER (Phase 2B — new)
+        # --------------------------------------------------------
+        from app.jobs.position_reconciler import position_reconciler
+        await position_reconciler.start()
+
+        # --------------------------------------------------------
         # APP RUNS HERE
         # --------------------------------------------------------
 
@@ -185,6 +209,8 @@ async def lifespan(app):
 
         logger.info("Shutting down FutureEdge...")
 
+        await position_reconciler.stop()
+        await exit_monitor.stop()
         tick_publisher.stop()
         await broker.disconnect()
 

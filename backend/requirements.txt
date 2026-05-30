@@ -28,6 +28,7 @@ langgraph-checkpoint-postgres>=2.0.0   # PostgreSQL checkpointer for HITL
 SQLAlchemy==2.0.30                 # async ORM
 asyncpg==0.31.0                    # async PostgreSQL driver
 psycopg[binary]>=3.1.0             # psycopg3 for LangGraph checkpointer
+alembic>=1.13.0                    # database migration tool
 
 # ============================================================
 # DATABASE — REDIS

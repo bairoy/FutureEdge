@@ -80,7 +80,7 @@ def should_human_review(state: AgentState) -> str:
 # HUMAN REVIEW NODE
 # ============================================================
 
-def human_review_node(state: AgentState) -> dict:
+async def human_review_node(state: AgentState) -> dict:
     """
     REAL interrupt-based HITL node.
 
@@ -105,6 +105,7 @@ def human_review_node(state: AgentState) -> dict:
 
     proposal: TradeProposal = state["consensus"]
     run_id: str             = state["run_id"]
+    user_id: str            = state.get("user_id", "anonymous")
 
     # --------------------------------------------------------
     # LOG INTERRUPT REQUEST
@@ -164,7 +165,7 @@ def human_review_node(state: AgentState) -> dict:
         # Any other exception during the interrupt() call
         # (e.g. serialisation error) → reject trade safely.
         logger.exception(f"HITL setup failure: {e}")
-        return _reject(proposal, run_id, reason=str(e))
+        return await _reject(proposal, run_id, user_id, reason=str(e))
 
     # --------------------------------------------------------
     # WORKFLOW RESUMES HERE
@@ -185,7 +186,7 @@ def human_review_node(state: AgentState) -> dict:
     if decision == "APPROVE":
         return _approve(proposal, run_id, notes)
 
-    return _reject(proposal, run_id, reason=notes or "Rejected by human")
+    return await _reject(proposal, run_id, user_id, reason=notes or "Rejected by human")
 
 
 # ============================================================
@@ -213,9 +214,10 @@ def _approve(
     }
 
 
-def _reject(
+async def _reject(
     proposal: TradeProposal,
     run_id:   str,
+    user_id:  str,
     reason:   str,
 ) -> dict:
 
@@ -223,6 +225,24 @@ def _reject(
     proposal.human_notes    = reason
 
     logger.warning(f"❌ HUMAN REJECTED    | run_id={run_id} | reason={reason}")
+
+    # Write the rejected trade to the database for an audit trail
+    from app.db.postgres import AsyncSessionLocal
+    from app.db.repos.trade_repo import TradeRepo
+
+    try:
+        async with AsyncSessionLocal() as session:
+            await TradeRepo.save_trade(
+                session=session,
+                proposal=proposal,
+                run_id=run_id,
+                user_id=user_id,
+                quantity=0,
+                status="REJECTED",
+            )
+            logger.info(f"Audit: Rejected trade saved to DB | run_id={run_id}")
+    except Exception as db_err:
+        logger.error(f"Failed to save rejected trade to DB: {db_err}")
 
     return {
         "consensus":       proposal,

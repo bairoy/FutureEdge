@@ -51,6 +51,7 @@ WS   /api/v1/market/stream?token=.. → live WebSocket stream (viewer+)
 """
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from app.graph.runtime import lifespan
@@ -73,7 +74,10 @@ from app.api.routes.market_router import router as market_router
 from app.api.routes.zerodha_router import router as zerodha_router
 from app.api.routes.trades_router       import router as trades_router
 from app.api.routes.backtest_router import router as backtest_router
+from app.core.logging import setup_logging
 
+# Initialize structured logging
+setup_logging()
 
 # ============================================================
 # CREATE APP
@@ -87,6 +91,15 @@ app = FastAPI(
     ),
     version     = "1.0.0",
     lifespan    = lifespan,   # handles startup/shutdown
+)
+
+# CORS configuration (Phase 2 — new)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify actual domains
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -113,12 +126,58 @@ app.include_router(backtest_router)
 # HEALTH CHECK
 # ============================================================
 
+from sqlalchemy import text
+from app.db.postgres import AsyncSessionLocal
+from app.db.redis import redis_client
+
+async def check_postgres() -> bool:
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+        return True
+    except Exception as e:
+        logger.error(f"HealthCheck: Postgres check failed: {e}")
+        return False
+
+async def check_redis() -> bool:
+    try:
+        await redis_client.ping()
+        return True
+    except Exception as e:
+        logger.error(f"HealthCheck: Redis check failed: {e}")
+        return False
+
+async def check_qdrant() -> bool:
+    try:
+        import asyncio
+        from app.memory.qdrant_store import get_qdrant_client
+        def _check():
+            client = get_qdrant_client()
+            client.get_collections()
+            return True
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _check)
+    except Exception as e:
+        logger.error(f"HealthCheck: Qdrant check failed: {e}")
+        return False
+
 @app.get("/health", tags=["ops"], summary="Service health check")
 async def health():
     """
-    Simple health check endpoint.
-    Returns 200 OK if the service is running.
-    Used by Docker health checks and load balancers.
-    No authentication required.
+    Service health check endpoint verifying core dependencies.
     """
-    return {"status": "ok", "service": "futureedge"}
+    pg_ok = await check_postgres()
+    redis_ok = await check_redis()
+    qdrant_ok = await check_qdrant()
+
+    status = "ok" if (pg_ok and redis_ok and qdrant_ok) else "degraded"
+
+    return {
+        "status": status,
+        "service": "futureedge",
+        "dependencies": {
+            "postgres": "ok" if pg_ok else "down",
+            "redis": "ok" if redis_ok else "down",
+            "qdrant": "ok" if qdrant_ok else "down",
+        }
+    }

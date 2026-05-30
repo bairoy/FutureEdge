@@ -84,6 +84,42 @@ async def signal_agent_node(state: AgentState) -> dict:
         from_cache      = ind["from_cache"]
 
         # --------------------------------------------------------
+        # CALL MARKET TOOLS (Order Book Spread & Live Price)
+        # --------------------------------------------------------
+        from app.agents.tools.market_tools import get_live_price, get_order_book
+        
+        live_price = await get_live_price(symbol)
+        order_book = await get_order_book(symbol)
+        
+        bids = order_book.get("bids", [])
+        asks = order_book.get("asks", [])
+        spread_pct = 0.0
+        best_bid = 0.0
+        best_ask = 0.0
+        if bids and asks:
+            best_bid = bids[0]["price"]
+            best_ask = asks[0]["price"]
+            if best_bid > 0:
+                spread_pct = (best_ask - best_bid) / best_bid
+
+        # --------------------------------------------------------
+        # VOLUME SPIKE DETECTION
+        # --------------------------------------------------------
+        volume_spike = False
+        avg_volume = 0.0
+        latest_volume = 0
+        if ctx.ohlcv_1m and len(ctx.ohlcv_1m) > 1:
+            volumes = [c.get("volume", 0) for c in ctx.ohlcv_1m]
+            latest_volume = volumes[-1]
+            if len(volumes) > 20:
+                avg_volume = sum(volumes[-21:-1]) / 20.0
+            else:
+                avg_volume = sum(volumes[:-1]) / len(volumes[:-1])
+            
+            if avg_volume > 0 and latest_volume > (avg_volume * 2.0):
+                volume_spike = True
+
+        # --------------------------------------------------------
         # REGIME-AWARE SCORING SYSTEM
         # --------------------------------------------------------
         regime = ctx.regime if hasattr(ctx, "regime") else "RANGEBOUND"
@@ -153,6 +189,21 @@ async def signal_agent_node(state: AgentState) -> dict:
             score = rsi_score + macd_score + bb_score
             reasons.append("Regime: Unknown (Baseline indicator scoring applied)")
 
+        # --- Volume Confirmation ---
+        if volume_spike:
+            # Confirm buy/sell directional pressure with volume expansion
+            if score > 0:
+                score *= 1.25
+                reasons.append(f"Volume spike confirmed Buy pressure (+25%)")
+            elif score < 0:
+                score *= 1.25
+                reasons.append(f"Volume spike confirmed Sell pressure (+25%)")
+
+        # --- Bid/Ask Spread confirmation ---
+        if spread_pct > 0.005:  # Wide spread (> 0.5%)
+            score *= 0.5
+            reasons.append(f"Wide bid/ask spread ({spread_pct*100:.2f}%) — signal score halved")
+
         # --- Volatility filter ---
         # High volatility makes all signals less reliable.
         if ctx.volatility_24h > 0.05:
@@ -199,6 +250,9 @@ async def signal_agent_node(state: AgentState) -> dict:
                 "final_score":      round(score, 4),
                 "volatility_24h":   ctx.volatility_24h,
                 "indicators_cached": from_cache,
+                "volume_spike":     volume_spike,
+                "live_price":       live_price,
+                "spread_pct":       round(spread_pct, 6),
             },
         )
 
