@@ -126,10 +126,13 @@ export function useWebSocket() {
           size: d.proposal.size,
           entryPrice: d.proposal.entry_price,
           riskScore: d.proposal.risk_score,
+          stopLoss: d.proposal.stop_loss,
+          takeProfit: d.proposal.take_profit,
           llmRationale: d.llm_rationale,
           reasons: d.reasons,
           memories: d.memories ?? [],
           votes: d.proposal.votes,
+          hitlRequired: (d as any).proposal?.hitl_required,
         };
         setHITLPending(pending);
         break;

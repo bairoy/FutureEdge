@@ -77,6 +77,7 @@ async def run_agent_cycle(
     user_override_quantity: int | None = None,
     user_override_rupees: float | None = None,
     override_kelly: bool = False,
+    paper_trade: bool = True,
     config:         dict | None = None,
 ) -> dict:
     """
@@ -106,6 +107,7 @@ async def run_agent_cycle(
         "user_override_quantity": user_override_quantity,
         "user_override_rupees":   user_override_rupees,
         "override_kelly":         override_kelly,
+        "paper_trade":            paper_trade,
 
         # Agent outputs (populated by each agent node)
         "signal_vote":    None,

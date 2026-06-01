@@ -49,6 +49,7 @@ export default function DashboardPage() {
   const [running, setRunning] = useState(false);
   const [runResult, setRunResult] = useState<WorkflowRunResponse | null>(null);
   const [useMockPortfolio, setUseMockPortfolio] = useState(false);
+  const paperTrade = useTradingStore((s) => s.paperTrade);
   const [tradeConfig, setTradeConfig] = useState<{
     quantity: number | null;
     positionRupees: number | null;
@@ -85,6 +86,7 @@ export default function DashboardPage() {
   interface BrokerPortfolio {
     connected: boolean;
     mock_data?: boolean;
+    paper_mode?: boolean;
     account: {
       total_equity: number;
       margin_used: number;
@@ -102,7 +104,7 @@ export default function DashboardPage() {
 
   // Fetch broker portfolio details — refreshes every 10 seconds
   const { data: portfolio } = useSWR<BrokerPortfolio>(
-    `/api/v1/broker/portfolio${useMockPortfolio ? "?mock=true" : ""}`,
+    `/api/v1/broker/portfolio?paper=${paperTrade}${useMockPortfolio ? "&mock=true" : ""}`,
     fetcher,
     { refreshInterval: 10_000 }
   );
@@ -119,6 +121,7 @@ export default function DashboardPage() {
         quantity: tradeConfig.quantity,
         position_rupees: tradeConfig.positionRupees,
         override_kelly: tradeConfig.overrideKelly,
+        paper_trade: paperTrade,
       });
 
       setRunResult(data);
@@ -139,6 +142,8 @@ export default function DashboardPage() {
             size: data.proposal.size,
             entryPrice: data.proposal.entry_price,
             riskScore: data.proposal.risk_score,
+            stopLoss: data.proposal.stop_loss,
+            takeProfit: data.proposal.take_profit,
             llmRationale: data.proposal.llm_rationale || null,
             reasons: data.reasons || [],
             memories: [],
@@ -228,6 +233,8 @@ export default function DashboardPage() {
                       size: runResult.proposal.size,
                       entryPrice: runResult.proposal.entry_price,
                       riskScore: runResult.proposal.risk_score,
+                      stopLoss: runResult.proposal.stop_loss,
+                      takeProfit: runResult.proposal.take_profit,
                       llmRationale: runResult.proposal.llm_rationale || null,
                       reasons: runResult.reasons || [],
                       memories: [],
@@ -336,9 +343,17 @@ export default function DashboardPage() {
               <div className="flex items-center gap-2">
                 <Briefcase className="w-4 h-4 text-blue-400" />
                 <h2 className="font-semibold text-gray-100 text-sm">Account Funds</h2>
-                {portfolio?.mock_data && (
-                  <span className="px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 text-[10px] font-semibold border border-amber-500/20">
+                {portfolio?.paper_mode ? (
+                  <span className="px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 text-[10px] font-bold border border-amber-500/20">
+                    Paper
+                  </span>
+                ) : portfolio?.mock_data ? (
+                  <span className="px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400 text-[10px] font-bold border border-blue-500/20">
                     Mock
+                  </span>
+                ) : (
+                  <span className="px-1.5 py-0.5 rounded bg-green-500/10 text-green-400 text-[10px] font-bold border border-green-500/20">
+                    Live
                   </span>
                 )}
               </div>
@@ -387,9 +402,17 @@ export default function DashboardPage() {
             <div className="flex items-center gap-2">
               <Wallet className="w-4 h-4 text-purple-400" />
               <h2 className="font-semibold text-gray-100 text-sm">Open Positions</h2>
-              {portfolio?.mock_data && (
-                <span className="px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 text-[10px] font-semibold border border-amber-500/20 animate-pulse">
+              {portfolio?.paper_mode ? (
+                <span className="px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 text-[10px] font-bold border border-amber-500/20">
+                  Paper
+                </span>
+              ) : portfolio?.mock_data ? (
+                <span className="px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400 text-[10px] font-bold border border-blue-500/20">
                   Mock
+                </span>
+              ) : (
+                <span className="px-1.5 py-0.5 rounded bg-green-500/10 text-green-400 text-[10px] font-bold border border-green-500/20">
+                  Live
                 </span>
               )}
             </div>

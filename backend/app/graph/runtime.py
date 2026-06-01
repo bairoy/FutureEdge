@@ -89,7 +89,17 @@ async def lifespan(app):
 
     logger.info("Connecting to PostgreSQL checkpointer...")
 
-    async with AsyncPostgresSaver.from_conn_string(_build_db_uri()) as checkpointer:
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+    serde = JsonPlusSerializer(
+        pickle_fallback=True,
+        allowed_msgpack_modules=[
+            ("app.graph.state", "MarketContext"),
+            ("app.graph.state", "PortfolioSnapshot"),
+            ("app.graph.state", "AgentVote"),
+            ("app.graph.state", "TradeProposal"),
+        ]
+    )
+    async with AsyncPostgresSaver.from_conn_string(_build_db_uri(), serde=serde) as checkpointer:
 
         await checkpointer.setup()
         logger.info("Checkpoint tables ready")
@@ -190,10 +200,36 @@ async def lifespan(app):
         await exit_monitor.start()
 
         # --------------------------------------------------------
-        # STEP 8: START POSITION RECONCILER (Phase 2B — new)
+        # STEP 8: START POSITION RECONCILER
         # --------------------------------------------------------
         from app.jobs.position_reconciler import position_reconciler
         await position_reconciler.start()
+
+        # --------------------------------------------------------
+        # STEP 9: START TRAILING STOP UPDATER  (new)
+        # Dynamically moves stop-loss levels for winning trades.
+        # --------------------------------------------------------
+        from app.jobs.trailing_stop_updater import trailing_stop_updater
+        await trailing_stop_updater.start()
+
+        # --------------------------------------------------------
+        # STEP 10: START APSCHEDULER CRON JOBS  (new)
+        # Handles: pre-market warmup, weight updates, daily P&L logging.
+        # --------------------------------------------------------
+        from app.jobs.scheduler import scheduler
+        scheduler.start()
+        logger.info(f"APScheduler started with {len(scheduler.get_jobs())} jobs")
+
+        # --------------------------------------------------------
+        # STEP 11: PRELOAD INSTRUMENT MASTER  (new)
+        # Cache Zerodha's instrument list for symbol search.
+        # --------------------------------------------------------
+        try:
+            from app.services.instrument_service import load_instruments
+            instruments = await load_instruments("NSE")
+            logger.info(f"Instrument master loaded: {len(instruments)} NSE instruments")
+        except Exception as inst_err:
+            logger.warning(f"Instrument preload failed (non-fatal): {inst_err}")
 
         # --------------------------------------------------------
         # APP RUNS HERE
@@ -210,11 +246,14 @@ async def lifespan(app):
         logger.info("Shutting down FutureEdge...")
 
         await position_reconciler.stop()
+        await trailing_stop_updater.stop()
         await exit_monitor.stop()
+        scheduler.shutdown(wait=False)
         tick_publisher.stop()
         await broker.disconnect()
 
         logger.info("Shutdown complete")
+
 
     logger.info("PostgreSQL checkpointer closed")
 

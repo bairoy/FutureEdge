@@ -98,11 +98,12 @@ class AgentState(TypedDict):
     user_id: str
 
     # --------------------------------------------------------
-    # USER OVERRIDES (Quantity, Rupees, Kelly)
+    # USER OVERRIDES (Quantity, Rupees, Kelly, Paper Trade)
     # --------------------------------------------------------
     user_override_quantity: Optional[int]
     user_override_rupees:   Optional[float]
     override_kelly:         bool
+    paper_trade:            bool
 
     # --------------------------------------------------------
     # MARKET + PORTFOLIO INPUTS

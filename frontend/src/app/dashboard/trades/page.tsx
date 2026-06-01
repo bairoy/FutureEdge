@@ -129,7 +129,10 @@ export default function TradesPage() {
                         </span>
                       </td>
 
-                      <td className="px-4 py-3 text-gray-300">{trade.size}</td>
+                      <td className="px-4 py-3">
+                        <div className="text-gray-200 font-medium font-mono">{trade.quantity ?? 0}</div>
+                        <div className="text-[10px] text-gray-500 font-mono">₹{(trade.size ?? 0).toLocaleString("en-IN")} total</div>
+                      </td>
 
                       <td className="px-4 py-3 text-gray-300">
                         ₹{trade.entry_price.toLocaleString("en-IN")}

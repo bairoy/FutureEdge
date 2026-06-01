@@ -66,6 +66,8 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
   const { user, setUser, setLoading, isLoading } = useAuthStore();
   const hitlPending = useTradingStore((s) => s.hitlPending);
+  const paperTrade = useTradingStore((s) => s.paperTrade);
+  const setPaperTrade = useTradingStore((s) => s.setPaperTrade);
 
   const [zerodhaStatus, setZerodhaStatus] = useState<{ is_zerodha: boolean; connected: boolean } | null>(null);
   const [checkingZerodha, setCheckingZerodha] = useState(false);
@@ -105,11 +107,21 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
         const newUrl = window.location.pathname;
         window.history.replaceState({}, "", newUrl);
       }
+
+      // Load paper trade setting and sync with backend
+      const savedPaper = localStorage.getItem("fe-paper-trade");
+      const currentPaperVal = savedPaper !== "false";
+      setPaperTrade(currentPaperVal);
+
+      api.post("/auth/broker/select", { broker: currentPaperVal ? "mock" : "zerodha" })
+        .then(() => checkZerodhaStatus())
+        .catch((err) => console.error("Failed to sync broker selection on mount:", err));
+    } else {
+      checkZerodhaStatus();
     }
-    checkZerodhaStatus();
     const interval = setInterval(checkZerodhaStatus, 30_000);
     return () => clearInterval(interval);
-  }, []);
+  }, [setPaperTrade]);
 
   // Start WebSocket + sync kill switch state
   useWebSocket();
@@ -266,6 +278,38 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
             {pathname.split("/").filter(Boolean).pop()?.replace("-", " ") ?? "Dashboard"}
           </span>
           <div className="flex items-center gap-3">
+            {/* Paper Trading Toggle */}
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-gray-800 bg-gray-950/40 select-none">
+              <span className="text-xs font-semibold text-gray-300">Enable Paper Trading</span>
+              <button
+                type="button"
+                onClick={async () => {
+                  const newVal = !paperTrade;
+                  setPaperTrade(newVal);
+                  if (typeof window !== "undefined") {
+                    localStorage.setItem("fe-paper-trade", String(newVal));
+                  }
+                  try {
+                    await api.post("/auth/broker/select", { broker: newVal ? "mock" : "zerodha" });
+                    showToast(newVal ? "Paper Trading Enabled" : "Live Trading Enabled (Zerodha)", "success");
+                    checkZerodhaStatus();
+                  } catch (err) {
+                    showToast("Failed to change broker mode", "error");
+                  }
+                }}
+                className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                  paperTrade ? "bg-amber-500" : "bg-gray-700"
+                }`}
+                title={paperTrade ? "Paper Trading is Enabled (Simulated)" : "Paper Trading is Disabled (Real Broker)"}
+              >
+                <span
+                  className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-205 ease-in-out ${
+                    paperTrade ? "translate-x-4" : "translate-x-0"
+                  }`}
+                />
+              </button>
+            </div>
+
             {zerodhaStatus?.is_zerodha && (
               zerodhaStatus.connected ? (
                 <button

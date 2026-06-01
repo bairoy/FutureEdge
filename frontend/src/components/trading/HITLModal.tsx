@@ -44,26 +44,46 @@ import type { AgentVote, EpisodicMemory } from "@/types";
 
 export function HITLModal() {
   const { hitlPending, setHITLPending } = useTradingStore();
-  const { canApproveHITL } = useAuthStore();
+  const { canApproveHITL, canTrade } = useAuthStore();
 
   const [notes, setNotes] = useState("");
+  const [quantity, setQuantity] = useState<number | "">(
+    hitlPending && hitlPending.entryPrice > 0
+      ? Math.max(1, Math.floor(hitlPending.size / hitlPending.entryPrice))
+      : 1
+  );
   const [submitting, setSubmitting] = useState(false);
   const [active, setActive] = useState<"APPROVE" | "REJECT" | null>(null);
 
   if (!hitlPending) return null;
 
   const { threadId, symbol, direction, size, entryPrice, riskScore,
-    llmRationale, reasons, memories, votes } = hitlPending;
+    stopLoss, takeProfit, llmRationale, reasons, memories, votes, hitlRequired } = hitlPending;
+
+  const isRisky = hitlRequired ?? (reasons && reasons.length > 0);
+  const allowedToApprove = isRisky ? canApproveHITL() : canTrade();
 
   async function submit(decision: "APPROVE" | "REJECT") {
-    if (!canApproveHITL()) return;
+    if (!allowedToApprove) return;
+    if (decision === "APPROVE" && (!quantity || Number(quantity) <= 0)) {
+      showToast("Order quantity is required to approve the trade", "error");
+      return;
+    }
+
     setActive(decision);
     setSubmitting(true);
 
     try {
-      await api.post("/api/v1/workflow/resume", { thread_id: threadId, decision, notes });
+      await api.post("/api/v1/workflow/resume", {
+        thread_id: threadId,
+        decision,
+        notes,
+        quantity: decision === "APPROVE" ? Number(quantity) : undefined,
+      });
       showToast(
-        decision === "APPROVE" ? "Trade approved — executing order" : "Trade rejected",
+        decision === "APPROVE" 
+          ? (isRisky ? "Trade approved — executing order" : "Trade submitted — executing order")
+          : (isRisky ? "Trade rejected" : "Trade cancelled"),
         decision === "APPROVE" ? "success" : "info"
       );
       setHITLPending(null);
@@ -95,16 +115,16 @@ export function HITLModal() {
         {/* ── Header ───────────────────────────────────────────── */}
         <div className="flex items-center justify-between p-5 border-b border-gray-800">
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg bg-amber-500/10 flex items-center justify-center">
-              <AlertTriangle className="w-4 h-4 text-amber-400" />
+            <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${isRisky ? "bg-amber-500/10" : "bg-blue-500/10"}`}>
+              <AlertTriangle className={`w-4 h-4 ${isRisky ? "text-amber-400" : "text-blue-400"}`} />
             </div>
             <div>
-              <h2 className="font-bold text-gray-100">Trade Requires Approval</h2>
-              <p className="text-xs text-gray-500 mt-0.5">Human-in-the-Loop review before execution</p>
+              <h2 className="font-bold text-gray-100">{isRisky ? "Trade Requires Approval" : "Confirm Trade Execution"}</h2>
+              <p className="text-xs text-gray-500 mt-0.5">{isRisky ? "Human-in-the-Loop review before execution" : "Verify details and select quantity to execute"}</p>
             </div>
           </div>
           <div className="flex items-center gap-3">
-            {!canApproveHITL() && (
+            {!allowedToApprove && (
               <span className="text-xs text-gray-500">
                 Read only
               </span>
@@ -118,18 +138,20 @@ export function HITLModal() {
         <div className="p-5 space-y-4">
 
           {/* ── Trade details ────────────────────────────────────── */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-3">
             {[
-              { label: "Symbol", value: symbol, cls: "text-gray-100" },
+              { label: "Symbol", value: symbol, cls: "text-gray-100 font-mono" },
               { label: "Direction", value: direction, cls: dirColor },
-              { label: "Size", value: `₹${size.toLocaleString("en-IN")}`, cls: "text-gray-100" },
+              { label: "Entry Price", value: `₹${entryPrice.toLocaleString("en-IN", { minimumFractionDigits: 2 })}`, cls: "text-gray-100 font-mono" },
+              { label: "Stop Loss", value: stopLoss ? `₹${stopLoss.toLocaleString("en-IN", { minimumFractionDigits: 2 })}` : "N/A", cls: "text-red-400 font-mono font-semibold" },
+              { label: "Target", value: takeProfit ? `₹${takeProfit.toLocaleString("en-IN", { minimumFractionDigits: 2 })}` : "N/A", cls: "text-green-400 font-mono font-semibold" },
               { label: "Risk Score", value: riskScore.toFixed(2), cls: riskColor },
             ].map(({ label, value, cls }) => (
               <div key={label} className="bg-gray-800/50 rounded-lg p-3">
-                <p className="section-label mb-1">{label}</p>
-                <div className="flex items-center gap-1.5">
-                  {label === "Direction" && <DirIcon className={`w-4 h-4 ${dirColor}`} />}
-                  <span className={`font-bold text-sm ${cls}`}>{value}</span>
+                <p className="section-label mb-1 text-[10px] uppercase text-gray-500 font-semibold">{label}</p>
+                <div className="flex items-center gap-1.5 mt-0.5">
+                  {label === "Direction" && <DirIcon className={`w-3.5 h-3.5 ${dirColor}`} />}
+                  <span className={`font-bold text-xs sm:text-sm ${cls}`}>{value}</span>
                 </div>
               </div>
             ))}
@@ -204,8 +226,52 @@ export function HITLModal() {
             </div>
           </div>
 
+          {/* ── Quantity Selection ────────────────────────────────── */}
+          {allowedToApprove && (
+            <div className="bg-gray-850/50 border border-gray-700/50 rounded-lg p-4 space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div>
+                  <label className="block text-sm font-semibold text-gray-200">
+                    Order Quantity (Shares) <span className="text-red-400">*</span>
+                  </label>
+                  <p className="text-xs text-gray-500 mt-0.5">
+                    Select how many shares to buy. Whole numbers only.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    placeholder="Qty"
+                    value={quantity}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (val === "") {
+                        setQuantity("");
+                      } else {
+                        const parsed = parseInt(val, 10);
+                        setQuantity(isNaN(parsed) ? "" : Math.max(1, parsed));
+                      }
+                    }}
+                    className="input w-36 font-mono text-center font-bold text-lg bg-black border-amber-500/30 text-amber-400 focus:border-amber-400 focus:ring-1 focus:ring-amber-400"
+                  />
+                  <span className="text-xs text-gray-400">shares</span>
+                </div>
+              </div>
+              {quantity && entryPrice ? (
+                <div className="text-right text-xs text-gray-400">
+                  Estimated Trade Value:{" "}
+                  <span className="font-bold text-gray-200 font-mono">
+                    ₹{(quantity * entryPrice).toLocaleString("en-IN", { minimumFractionDigits: 2 })}
+                  </span>
+                </div>
+              ) : null}
+            </div>
+          )}
+
           {/* ── Notes ────────────────────────────────────────────── */}
-          {canApproveHITL() && (
+          {allowedToApprove && (
             <div>
               <label className="block text-sm text-gray-400 mb-1.5">Reviewer notes (optional)</label>
               <textarea
@@ -219,7 +285,7 @@ export function HITLModal() {
           )}
 
           {/* ── Actions ──────────────────────────────────────────── */}
-          {canApproveHITL() ? (
+          {allowedToApprove ? (
             <div className="flex gap-3 pt-1">
               <button onClick={() => setHITLPending(null)} disabled={submitting}
                 className="px-4 py-2 bg-gray-800 text-gray-300 font-medium rounded-lg hover:bg-gray-700 hover:text-gray-100 transition-colors border border-gray-700">
@@ -228,19 +294,22 @@ export function HITLModal() {
               <button onClick={() => submit("REJECT")} disabled={submitting}
                 className="btn-danger flex items-center gap-2 flex-1 justify-center">
                 <XCircle className="w-4 h-4" />
-                {submitting && active === "REJECT" ? "Rejecting…" : "Reject Trade"}
+                {submitting && active === "REJECT" ? "Rejecting…" : isRisky ? "Reject Trade" : "Cancel Trade"}
               </button>
-              <button onClick={() => submit("APPROVE")} disabled={submitting}
-                className="btn-success flex items-center gap-2 flex-1 justify-center">
+              <button onClick={() => submit("APPROVE")} disabled={submitting || !quantity || Number(quantity) <= 0}
+                className="btn-success flex items-center gap-2 flex-1 justify-center disabled:opacity-50 disabled:cursor-not-allowed">
                 <CheckCircle className="w-4 h-4" />
-                {submitting && active === "APPROVE" ? "Approving…" : "Approve Trade"}
+                {submitting && active === "APPROVE" ? "Approving…" : isRisky ? "Approve Trade" : "Execute Trade"}
               </button>
             </div>
           ) : (
             <div className="flex flex-col items-center gap-3 pt-1">
               <p className="text-center text-sm text-gray-500">
-                Only <span className="text-blue-400">risk_manager</span> or{" "}
-                <span className="text-purple-400">admin</span> can approve or reject trades.
+                {isRisky ? (
+                  <>Only <span className="text-blue-400">risk_manager</span> or <span className="text-purple-400">admin</span> can approve or reject trades.</>
+                ) : (
+                  <>Only authorized <span className="text-blue-400">traders</span> can execute trades.</>
+                )}
               </p>
               <button onClick={() => setHITLPending(null)}
                 className="px-4 py-2 bg-gray-800 text-gray-300 font-medium rounded-lg hover:bg-gray-700 hover:text-gray-100 transition-colors border border-gray-700 w-full max-w-xs">

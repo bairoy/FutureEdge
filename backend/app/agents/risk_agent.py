@@ -33,6 +33,7 @@ from loguru import logger
 from app.graph.state import AgentState, AgentVote, PortfolioSnapshot, MarketContext
 from app.db.postgres import AsyncSessionLocal
 from app.db.repos.trade_repo import TradeRepo
+from app.brokers.symbol_mapper import is_market_open
 
 
 # ============================================================
@@ -173,7 +174,6 @@ async def risk_agent_node(state: AgentState) -> dict:
         # --------------------------------------------------------
         # CHECK 5: MARKET HOURS & TIME-OF-DAY RISK
         # --------------------------------------------------------
-        from app.brokers.symbol_mapper import is_market_open
         from app.core.config import settings
         import pytz
         from datetime import datetime

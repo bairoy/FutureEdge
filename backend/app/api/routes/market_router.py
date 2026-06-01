@@ -143,21 +143,13 @@ async def get_market_history(symbol: str):
 
 from app.core.config import settings
 
-SYMBOL_TO_TOKEN = {
-    "NIFTY 50": 256265,
-    "NIFTY50": 256265,
-    "NIFTY BANK": 260105,
-    "BANKNIFTY": 260105,
-    "RELIANCE": 738561,
-    "INFY": 408065,
-    "TCS": 2953217,
-}
-
 @router.websocket("/stream")
 async def market_stream(
     websocket: WebSocket,
     token: str | None = Query(default=None),
 ):
+    from app.services.instrument_service import get_instrument_token
+
     user_id = await _authenticate_websocket(token)
     if user_id is None:
         await websocket.close(code=4001, reason="Unauthorized")
@@ -167,6 +159,10 @@ async def market_stream(
     logger.info(f"WebSocket connected | user_id={user_id}")
 
     current_symbol = "NIFTY 50"
+    current_token = await get_instrument_token(current_symbol)
+    if not current_token:
+        current_token = settings.DEFAULT_INSTRUMENT_TOKEN
+
     pubsub = redis_client.pubsub()
     await pubsub.subscribe(
         CHANNEL_AGENT_RESULTS,
@@ -177,7 +173,7 @@ async def market_stream(
 
     # Background task to listen for commands FROM the client (like subscribe)
     async def listen_to_client():
-        nonlocal current_symbol
+        nonlocal current_symbol, current_token
         try:
             while True:
                 data = await websocket.receive_json()
@@ -186,8 +182,25 @@ async def market_stream(
                     # Clear current ticks for the new symbol
                     await websocket.send_json({"type": "clear_ticks"})
                     current_symbol = new_symbol
-                    logger.info(f"User {user_id} subscribed to {new_symbol}")
-                    # Notify feed manager to start tracking this symbol (Phase 2)
+                    
+                    resolved_token = await get_instrument_token(new_symbol)
+                    if resolved_token:
+                        current_token = resolved_token
+                    else:
+                        if new_symbol.upper() == settings.DEFAULT_SYMBOL.upper():
+                            current_token = settings.DEFAULT_INSTRUMENT_TOKEN
+                        else:
+                            current_token = None
+
+                    logger.info(f"User {user_id} subscribed to {new_symbol} (token: {current_token})")
+                    
+                    # Dynamically subscribe KiteTicker if active
+                    if current_token:
+                        try:
+                            from app.data.feed import tick_publisher
+                            tick_publisher.subscribe_tokens([current_token])
+                        except Exception as sub_err:
+                            logger.error(f"Error subscribing dynamically to {new_symbol}: {sub_err}")
         except:
             pass
 
@@ -203,14 +216,12 @@ async def market_stream(
                     for _, messages in entries:
                         for msg_id, fields in messages:
                             last_tick_id = msg_id
-                            # Only send if it matches current symbol (or if it's NIFTY and we're on NIFTY)
+                            
+                            # Only send if it matches the current subscribed token
                             tick_token = fields.get("token")
-                            expected_token = SYMBOL_TO_TOKEN.get(current_symbol.upper())
-                            if expected_token is None:
-                                if current_symbol.upper() == settings.DEFAULT_SYMBOL.upper():
-                                    expected_token = settings.DEFAULT_INSTRUMENT_TOKEN
+                            expected_token = current_token
 
-                            if tick_token and expected_token and str(tick_token) != str(expected_token):
+                            if not expected_token or not tick_token or str(tick_token) != str(expected_token):
                                 continue
 
                             await websocket.send_json({

@@ -74,6 +74,7 @@ from app.api.routes.market_router import router as market_router
 from app.api.routes.zerodha_router import router as zerodha_router
 from app.api.routes.trades_router       import router as trades_router
 from app.api.routes.backtest_router import router as backtest_router
+from app.api.routes.instruments_router import router as instruments_router
 from app.core.logging import setup_logging
 
 # Initialize structured logging
@@ -93,14 +94,38 @@ app = FastAPI(
     lifespan    = lifespan,   # handles startup/shutdown
 )
 
-# CORS configuration (Phase 2 — new)
+# CORS configuration
+# CRITICAL: In production, set FRONTEND_URL in .env to your actual domain.
+# Never use allow_origins=["*"] in production — it enables CSRF on trade routes.
+from app.core.config import settings as _settings
+
+allowed_origins = (
+    ["*"]
+    if _settings.APP_ENV == "development"
+    else [_settings.FRONTEND_URL]
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify actual domains
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# X-Request-ID middleware for distributed tracing
+import uuid as _uuid
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as _Request
+
+class RequestIDMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: _Request, call_next):
+        request_id = request.headers.get("X-Request-ID") or str(_uuid.uuid4())
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+app.add_middleware(RequestIDMiddleware)
 
 
 # ============================================================
@@ -120,6 +145,8 @@ app.include_router(market_router)
 app.include_router(zerodha_router)
 app.include_router(trades_router)       # /api/v1/trades
 app.include_router(backtest_router)
+app.include_router(instruments_router)  # /api/v1/instruments/search
+
 
 
 # ============================================================

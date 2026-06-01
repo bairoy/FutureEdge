@@ -10,6 +10,7 @@
 import { useState, useRef, useEffect } from "react";
 import { Search, X, ChevronRight, Hash } from "lucide-react";
 import { useTradingStore } from "@/store";
+import api from "@/lib/api";
 
 const COMMON_SYMBOLS = [
   { symbol: "NIFTY 50", type: "Index" },
@@ -50,11 +51,36 @@ export function SymbolSearch() {
     return () => document.removeEventListener("keydown", handler);
   }, []);
 
+  const [searchResults, setSearchResults] = useState<any[]>([]);
+  const [searching, setSearching] = useState(false);
+
+  useEffect(() => {
+    if (query.trim().length < 2) {
+      setSearchResults([]);
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      setSearching(true);
+      try {
+        const { data } = await api.get(`/api/v1/instruments/search?q=${encodeURIComponent(query)}`);
+        setSearchResults(data.results || []);
+      } catch (err) {
+        console.error("[SymbolSearch] Search failed:", err);
+      } finally {
+        setSearching(false);
+      }
+    }, 300);
+
+    return () => clearTimeout(timer);
+  }, [query]);
+
   const filtered = query.trim() === ""
     ? COMMON_SYMBOLS
-    : COMMON_SYMBOLS.filter(s => 
-        s.symbol.toLowerCase().includes(query.toLowerCase())
-      );
+    : searchResults.map(r => ({
+        symbol: r.tradingsymbol,
+        type: r.name ? `${r.exchange}: ${r.name}` : r.exchange,
+      }));
 
   function select(s: string) {
     setCurrentSymbol(s.toUpperCase());
@@ -86,7 +112,13 @@ export function SymbolSearch() {
           placeholder="Search symbol (e.g. RELIANCE)..."
           className="bg-transparent border-none outline-none text-sm text-gray-100 placeholder:text-gray-600 w-full font-medium"
           onKeyDown={(e) => {
-            if (e.key === "Enter" && query.trim()) select(query);
+            if (e.key === "Enter" && query.trim()) {
+              if (filtered.length > 0) {
+                select(filtered[0].symbol);
+              } else {
+                select(query);
+              }
+            }
             if (e.key === "Escape") setIsOpen(false);
           }}
         />
@@ -106,8 +138,9 @@ export function SymbolSearch() {
       {isOpen && (
         <div className="absolute top-full left-0 right-0 mt-2 bg-gray-900 border border-gray-800 rounded-xl shadow-2xl z-50 overflow-hidden animate-in fade-in slide-in-from-top-1 duration-200">
           <div className="p-1.5">
-            <p className="px-3 py-1.5 text-[10px] font-bold text-gray-500 uppercase tracking-widest">
-              {query ? "Search Results" : "Common Symbols"}
+            <p className="px-3 py-1.5 text-[10px] font-bold text-gray-500 uppercase tracking-widest flex items-center justify-between">
+              <span>{query ? "Search Results" : "Common Symbols"}</span>
+              {searching && <span className="animate-pulse text-blue-400">Searching...</span>}
             </p>
             
             <div className="space-y-0.5 mt-1">

@@ -138,13 +138,21 @@ async def execution_node(state: AgentState) -> dict:
             shares = int(user_rupees / price) if price > 0 else 0
             logger.info(f"Using user override rupees: ₹{user_rupees} -> {shares} shares")
         else:
-            shares = int(proposal.size / price) if price > 0 else 0
-            logger.info(f"Using Kelly size: ₹{proposal.size:.2f} -> {shares} shares")
+            logger.warning(
+                f"Execution blocked — no user override quantity specified | run_id={run_id}"
+            )
+            return {
+                "executed_trade":  None,
+                "execution_error": "QUANTITY_REQUIRED",
+                "completed_nodes": ["execution"],
+                "logs": [
+                    "Execution blocked — Quantity must be specified by the user."
+                ],
+            }
 
         if shares <= 0:
             logger.warning(
-                f"Position ₹{proposal.size:.0f} too small "
-                f"at ₹{price:.2f} per share | run_id={run_id}"
+                f"Position too small at ₹{price:.2f} per share | run_id={run_id}"
             )
             return {
                 "executed_trade":  None,
@@ -165,7 +173,17 @@ async def execution_node(state: AgentState) -> dict:
         # Both implement the same BrokerBase interface,
         # so this code never needs to change when switching brokers.
 
-        broker = get_broker()
+        is_paper = state.get("paper_trade", True)
+
+        if is_paper:
+            from app.brokers.mock import MockBroker
+            broker = MockBroker()
+            broker_name = "paper"
+        else:
+            broker = get_broker()
+            from app.core.config import settings
+            broker_name = settings.ACTIVE_BROKER
+
         # Broker connection is established at startup via lifespan.
         # Only reconnect if the connection was lost.
         if not await broker.is_connected():
@@ -191,9 +209,6 @@ async def execution_node(state: AgentState) -> dict:
         # ====================================================
         # BUILD TRADE RECORD
         # ====================================================
-
-        from app.core.config import settings
-        broker_name = settings.ACTIVE_BROKER
 
         if order_result.success:
             trade_record = {

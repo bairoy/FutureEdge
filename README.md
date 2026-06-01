@@ -86,6 +86,12 @@ futureedge/                          ← project root
 
 ---
 
+## 📚 Architectural & Quantitative Concepts
+
+To understand the core design choices, mathematics, database mappings, and patterns of this system, refer to the [CONCEPTS.md](file:///Users/baijuyadav/Desktop/futureedge/docs/CONCEPTS.md) guide.
+
+---
+
 ## 🚀 Getting Started
 
 Follow these steps to set up and run the system locally using Docker.

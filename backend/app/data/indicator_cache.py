@@ -198,13 +198,17 @@ def _calc_rsi(prices: pd.Series, period: int = 14) -> float:
 
     delta = prices.diff()
 
-    gain  = delta.where(delta > 0, 0).rolling(window=period).mean()
-    loss  = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    gain  = delta.clip(lower=0)
+    loss  = -delta.clip(upper=0)
+
+    # Welles Wilder's Smoothing RMA is equivalent to an EMA with alpha = 1 / period
+    avg_gain = gain.ewm(alpha=1.0/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0/period, adjust=False).mean()
 
     # Avoid division by zero
-    loss = loss.replace(0, 1e-10)
+    avg_loss = avg_loss.replace(0, 1e-10)
 
-    rs  = gain / loss
+    rs  = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs.iloc[-1]))
 
     return round(float(rsi), 2)

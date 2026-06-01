@@ -40,7 +40,8 @@ Stopped cleanly on shutdown.
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dt_time
+from zoneinfo import ZoneInfo
 
 from loguru import logger
 
@@ -49,6 +50,10 @@ from app.db.postgres import AsyncSessionLocal
 from app.db.repos.trade_repo import TradeRepo
 from app.db.redis import redis_client, CHANNEL_TRADE_EXECUTED
 from app.brokers.base import get_broker
+
+IST = ZoneInfo("Asia/Kolkata")
+MARKET_FORCE_EXIT_TIME = dt_time(15, 0)   # 3:00 PM IST — force-close all MIS positions
+MARKET_FORCE_EXIT_END_TIME = dt_time(15, 20)  # 3:20 PM IST — Zerodha auto-squareoff time limit
 
 
 class ExitMonitor:
@@ -123,12 +128,14 @@ class ExitMonitor:
         Query all OPEN trades and check each against current prices.
         """
 
-        # Reset daily P&L counter at start of each new trading day
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # Reset daily P&L counter at IST midnight (NOT UTC midnight).
+        # NSE trading day is 9:15 AM – 3:30 PM IST. If we reset at UTC midnight,
+        # the cap could be wrong by up to 5:30 hours.
+        today = datetime.now(IST).strftime("%Y-%m-%d")  # IST date
         if today != self._daily_pnl_reset_date:
             self._daily_pnl = 0.0
             self._daily_pnl_reset_date = today
-            logger.debug(f"ExitMonitor: daily P&L reset for {today}")
+            logger.debug(f"ExitMonitor: daily P&L reset for {today} IST")
 
         async with AsyncSessionLocal() as session:
             # Get all OPEN trades across all users
@@ -145,6 +152,30 @@ class ExitMonitor:
 
         if not open_trades:
             return  # nothing to monitor
+
+        # --------------------------------------------------------
+        # TIME-BASED FORCED EXIT at 3:00 PM IST
+        # NSE MIS (intraday) positions must be closed before 3:30 PM.
+        # We force-close at 3:00 PM to avoid broker auto-squareoff fees.
+        # --------------------------------------------------------
+        now_ist = datetime.now(IST)
+        if (
+            now_ist.weekday() <= 4  # Monday-Friday
+            and MARKET_FORCE_EXIT_TIME <= now_ist.time() <= MARKET_FORCE_EXIT_END_TIME
+        ):
+            logger.warning(
+                f"⏰ FORCED EXIT: Market close approaching (3:00 PM IST). "
+                f"Closing all {len(open_trades)} open trades."
+            )
+            broker = get_broker()
+            for trade in open_trades:
+                try:
+                    current_price = await broker.get_ltp(trade.symbol)
+                    if current_price > 0:
+                        await self._execute_exit(trade, current_price, "MARKET_CLOSE_FORCED")
+                except Exception as e:
+                    logger.error(f"Forced exit failed for trade {trade.id}: {e}")
+            return
 
         # Get current prices
         broker = get_broker()
@@ -235,7 +266,11 @@ class ExitMonitor:
         Place an exit order and close the trade in the database.
         """
 
-        broker = get_broker()
+        if trade.broker == "paper":
+            from app.brokers.mock import MockBroker
+            broker = MockBroker()
+        else:
+            broker = get_broker()
 
         # Place counter-order to close position
         if trade.quantity > 0:
@@ -288,12 +323,13 @@ class ExitMonitor:
 
         if closed_trade:
             pnl = closed_trade.realized_pnl or 0.0
-            self._daily_pnl += pnl
+            if closed_trade.broker != "paper":
+                self._daily_pnl += pnl
 
             logger.info(
                 f"✅ Trade CLOSED | {reason} | "
                 f"trade={trade.id} | PnL=₹{pnl:.2f} | "
-                f"daily_pnl=₹{self._daily_pnl:.2f}"
+                f"daily_pnl=₹{self._daily_pnl:.2f} (excluding paper)"
             )
 
             # Update episodic memory outcome in Qdrant (Phase 2 — new)
@@ -393,6 +429,8 @@ class ExitMonitor:
                     f"limit={settings.MAX_DAILY_LOSS_PCT}% | "
                     f"KILL SWITCH ACTIVATED"
                 )
+
+
 
         except Exception as e:
             logger.error(f"Daily loss cap check failed: {e}")

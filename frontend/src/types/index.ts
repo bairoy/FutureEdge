@@ -75,6 +75,7 @@ export interface Trade {
   symbol: string;
   direction: "LONG" | "SHORT" | "NONE";
   size: number;
+  quantity: number;
   entry_price: number;
   risk_score: number;
   status: "OPEN" | "CLOSED" | "REJECTED" | "FAILED" | "NONE";
@@ -157,7 +158,10 @@ export interface HITLPendingMessage {
       size: number;
       entry_price: number;
       risk_score: number;
+      stop_loss?: number;
+      take_profit?: number;
       votes: AgentVote[];
+      hitl_required?: boolean;
     };
   };
 }

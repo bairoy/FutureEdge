@@ -134,7 +134,17 @@ async def main():
     # INIT GRAPH WITH CHECKPOINTER  (same as lifespan() does)
     # --------------------------------------------------------
 
-    async with AsyncPostgresSaver.from_conn_string(DB_URI) as checkpointer:
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+    serde = JsonPlusSerializer(
+        pickle_fallback=True,
+        allowed_msgpack_modules=[
+            ("app.graph.state", "MarketContext"),
+            ("app.graph.state", "PortfolioSnapshot"),
+            ("app.graph.state", "AgentVote"),
+            ("app.graph.state", "TradeProposal"),
+        ]
+    )
+    async with AsyncPostgresSaver.from_conn_string(DB_URI, serde=serde) as checkpointer:
 
         await checkpointer.setup()
 

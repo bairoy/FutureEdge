@@ -36,7 +36,7 @@ DB_URI = (
 )
 
 
-async def resume(thread_id: str, decision: str, notes: str = ""):
+async def resume(thread_id: str, decision: str, notes: str = "", quantity: int | None = None):
 
     decision = decision.upper()
 
@@ -46,17 +46,31 @@ async def resume(thread_id: str, decision: str, notes: str = ""):
 
     config = {"configurable": {"thread_id": thread_id}}
 
-    async with AsyncPostgresSaver.from_conn_string(DB_URI) as checkpointer:
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+    serde = JsonPlusSerializer(
+        pickle_fallback=True,
+        allowed_msgpack_modules=[
+            ("app.graph.state", "MarketContext"),
+            ("app.graph.state", "PortfolioSnapshot"),
+            ("app.graph.state", "AgentVote"),
+            ("app.graph.state", "TradeProposal"),
+        ]
+    )
+    async with AsyncPostgresSaver.from_conn_string(DB_URI, serde=serde) as checkpointer:
 
         runtime._checkpointer  = checkpointer
         runtime.workflow_graph = create_graph().compile(checkpointer=checkpointer)
 
         graph = runtime.workflow_graph
 
-        logger.info(f"Resuming | thread_id={thread_id} | decision={decision}")
+        logger.info(f"Resuming | thread_id={thread_id} | decision={decision} | quantity={quantity}")
+
+        resume_payload = {"decision": decision, "notes": notes}
+        if quantity is not None:
+            resume_payload["quantity"] = quantity
 
         result = await graph.ainvoke(
-            Command(resume={"decision": decision, "notes": notes}),
+            Command(resume=resume_payload),
             config=config,
         )
 
@@ -73,13 +87,16 @@ async def resume(thread_id: str, decision: str, notes: str = ""):
 
 
 if __name__ == "__main__":
+    import argparse
 
-    if len(sys.argv) < 3:
-        print(__doc__)
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Resume a paused HITL workflow from the command line."
+    )
+    parser.add_argument("thread_id", help="The thread/run ID to resume")
+    parser.add_argument("decision", choices=["APPROVE", "approve", "REJECT", "reject"], help="Decision: APPROVE or REJECT")
+    parser.add_argument("notes", nargs="?", default="", help="Optional notes or rejection reasons")
+    parser.add_argument("-q", "--quantity", type=int, default=None, help="Optional quantity override for APPROVE")
 
-    _thread_id = sys.argv[1]
-    _decision  = sys.argv[2]
-    _notes     = sys.argv[3] if len(sys.argv) > 3 else ""
+    args = parser.parse_args()
 
-    asyncio.run(resume(_thread_id, _decision, _notes))
+    asyncio.run(resume(args.thread_id, args.decision, args.notes, args.quantity))

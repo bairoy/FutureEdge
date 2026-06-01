@@ -2,7 +2,7 @@ import asyncio
 from pprint import pprint
 from app.graph.backtester import run_backtest
 
-async def test():
+async def run_simulation():
     print("Running backtest simulation for RELIANCE...")
     res = await run_backtest(
         symbol="RELIANCE",
@@ -24,4 +24,4 @@ async def test():
     print(f"\nEQUITY CURVE POINTS: {len(res['equity_curve'])}")
 
 if __name__ == "__main__":
-    asyncio.run(test())
+    asyncio.run(run_simulation())

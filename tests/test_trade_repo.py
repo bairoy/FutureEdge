@@ -16,7 +16,9 @@ from app.db.repos.trade_repo import TradeRepo
 from app.graph.state import TradeProposal
 
 
-@pytest.fixture
+import pytest_asyncio
+
+@pytest_asyncio.fixture
 async def db_session():
     # Use in-memory SQLite for fast isolated testing
     engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)

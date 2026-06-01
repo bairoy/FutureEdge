@@ -103,35 +103,19 @@ async def get_instrument_details(symbol: str) -> dict:
     """
     Get trading instrument details (token, exchange, lot size).
     """
+    from app.services.instrument_service import get_instrument_token
+    
     mapped_symbol = map_symbol(symbol)
     exchange = get_exchange(symbol)
-    broker = get_broker()
     
-    token = None
-    lot_size = 1
-    
-    # If Zerodha is active/connected, we can lookup the instrument details
-    if await broker.is_connected() and hasattr(broker, "_kite") and broker._kite:
-        try:
-            import asyncio
-            loop = asyncio.get_running_loop()
-            # In production, we'd cache this list. Let's do a mock search or look at kite.instruments
-            # To be efficient, we can lookup common tokens from a local dict first
-            common_tokens = {
-                "NIFTYBEES": 3771905,
-                "BANKBEES": 3773185,
-                "RELIANCE": 738561,
-                "INFY": 408065,
-                "TCS": 2953217,
-            }
-            token = common_tokens.get(mapped_symbol)
-        except Exception as e:
-            logger.warning(f"Could not fetch instrument token: {e}")
+    token = await get_instrument_token(symbol)
+    if not token:
+        token = await get_instrument_token(mapped_symbol)
             
     return {
         "symbol": symbol,
         "mapped_symbol": mapped_symbol,
         "exchange": exchange,
         "token": token or "MOCK_TOKEN",
-        "lot_size": lot_size,
+        "lot_size": 1,
     }

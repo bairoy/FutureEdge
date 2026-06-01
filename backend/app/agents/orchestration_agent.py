@@ -182,16 +182,21 @@ async def orchestrator_node(state: AgentState) -> dict:
 
         buy_score  = 0.0
         sell_score = 0.0
-        total_wt   = 0.0
+        active_wt  = 0.0
+        hold_wt    = 0.0
 
         for vote in votes:
             wt = agent_weights.get(vote.agent, 0.2)
-            total_wt += wt
+            if vote.decision in ("BUY", "SELL"):
+                active_wt += wt
+                if vote.decision == "BUY":
+                    buy_score  += wt * vote.confidence
+                elif vote.decision == "SELL":
+                    sell_score += wt * vote.confidence
+            else:
+                hold_wt += wt
 
-            if vote.decision == "BUY":
-                buy_score  += wt * vote.confidence
-            elif vote.decision == "SELL":
-                sell_score += wt * vote.confidence
+        total_wt = active_wt + 0.25 * hold_wt
 
         if total_wt > 0:
             buy_score  /= total_wt
@@ -255,17 +260,18 @@ async def orchestrator_node(state: AgentState) -> dict:
         hitl_required = False
         hitl_reasons  = []
 
-        if risk_score > 0.70:
-            hitl_required = True
-            hitl_reasons.append(f"High risk score: {risk_score:.2f}")
+        if direction != "NONE":
+            if risk_score > 0.70:
+                hitl_required = True
+                hitl_reasons.append(f"High risk score: {risk_score:.2f}")
 
-        if disagreement > 0.40:
-            hitl_required = True
-            hitl_reasons.append(f"High agent disagreement: {disagreement:.2f}")
+            if disagreement > 0.40:
+                hitl_required = True
+                hitl_reasons.append(f"High agent disagreement: {disagreement:.2f}")
 
-        if position_rupees > (portfolio.total_equity * 0.05):
-            hitl_required = True
-            hitl_reasons.append(f"Large position: ₹{position_rupees:.2f}")
+            if position_rupees > (portfolio.total_equity * 0.05):
+                hitl_required = True
+                hitl_reasons.append(f"Large position: ₹{position_rupees:.2f}")
 
         # --------------------------------------------------------
         # EPISODIC MEMORY: RETRIEVE SIMILAR PAST TRADES (Phase 2 — new)

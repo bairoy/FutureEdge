@@ -46,33 +46,20 @@ def should_human_review(state: AgentState) -> str:
     "human_review"  → pause workflow, request approval
     "execute"       → continue directly to execution
     """
+    proposal = state.get("consensus")
+    if not proposal or proposal.direction == "NONE":
+        return "execute"
 
-    # --------------------------------------------------------
-    # ORCHESTRATOR REQUESTED HITL
-    # --------------------------------------------------------
-
-    # Orchestrator sets this flag when it detects:
-    # - high risk score
-    # - large position size
-    # - low agent confidence
-    # - agent disagreement
-
-    if state.get("hitl_required", False):
+    # If the trade is flagged as risky (hitl_required is True), it must go to human review
+    if state.get("hitl_required"):
         return "human_review"
 
-    # --------------------------------------------------------
-    # RISK AGENT REQUESTED MODIFICATION
-    # --------------------------------------------------------
-
-    risk_vote = state.get("risk_vote")
-
-    if risk_vote and risk_vote.decision == "MODIFY":
+    # If the trade is not risky, but the user did not specify the quantity/override,
+    # we must still pause so the user can enter/confirm the quantity.
+    if state.get("user_override_quantity") is None and state.get("user_override_rupees") is None:
         return "human_review"
 
-    # --------------------------------------------------------
-    # DEFAULT → DIRECT EXECUTION
-    # --------------------------------------------------------
-
+    # Otherwise, execute immediately
     return "execute"
 
 
@@ -140,6 +127,8 @@ async def human_review_node(state: AgentState) -> dict:
                 "size":        proposal.size,
                 "entry_price": proposal.entry_price,
                 "risk_score":  proposal.risk_score,
+                "hitl_required": state.get("hitl_required", False),
+                "reasons":       state.get("hitl_reasons", []),
 
                 # Per-agent reasoning
                 "agent_votes": [
@@ -178,13 +167,14 @@ async def human_review_node(state: AgentState) -> dict:
 
     decision: str = human_response.get("decision", "REJECT").upper()
     notes:    str = human_response.get("notes", "")
+    quantity: int | None = human_response.get("quantity")
 
     # --------------------------------------------------------
     # APPLY DECISION
     # --------------------------------------------------------
 
     if decision == "APPROVE":
-        return _approve(proposal, run_id, notes)
+        return _approve(proposal, run_id, notes, quantity)
 
     return await _reject(proposal, run_id, user_id, reason=notes or "Rejected by human")
 
@@ -197,14 +187,15 @@ def _approve(
     proposal: TradeProposal,
     run_id:   str,
     notes:    str,
+    quantity: int | None = None,
 ) -> dict:
 
     proposal.human_approved = True
     proposal.human_notes    = notes
 
-    logger.info(f"✅ HUMAN APPROVED     | run_id={run_id}")
+    logger.info(f"✅ HUMAN APPROVED     | run_id={run_id} | quantity={quantity}")
 
-    return {
+    res = {
         "consensus":       proposal,
         "hitl_status":     "APPROVED",
         "completed_nodes": ["human_review"],
@@ -212,6 +203,10 @@ def _approve(
             f"HITL approved trade for {proposal.symbol}"
         ],
     }
+    if quantity is not None:
+        res["user_override_quantity"] = quantity
+        res["logs"].append(f"User selected trade quantity: {quantity} shares")
+    return res
 
 
 async def _reject(

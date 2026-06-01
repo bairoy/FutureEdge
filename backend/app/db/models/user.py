@@ -133,6 +133,47 @@ class User(Base):
     )
 
     # --------------------------------------------------------
+    # ZERODHA CREDENTIALS  (per-user, encrypted at rest)
+    # Each user stores their own Zerodha API credentials.
+    # - zerodha_api_key:              plain text (not secret by itself)
+    # - zerodha_api_secret:           encrypted with AES-256-GCM
+    # - zerodha_access_token_encrypted: encrypted with AES-256-GCM
+    #
+    # Use app.services.token_manager.encrypt_token() / decrypt_token()
+    # to read/write these fields.
+    # --------------------------------------------------------
+
+    zerodha_api_key: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+        default=None,
+        comment="User's Zerodha API key (not secret by itself)",
+    )
+
+    zerodha_api_secret: Mapped[str | None] = mapped_column(
+        String(512),
+        nullable=True,
+        default=None,
+        comment="AES-256 encrypted Zerodha API secret",
+    )
+
+    zerodha_access_token_encrypted: Mapped[str | None] = mapped_column(
+        String(1024),
+        nullable=True,
+        default=None,
+        comment="AES-256 encrypted Zerodha daily access token (expires 6 AM IST)",
+    )
+
+    # WhatsApp number for HITL and P&L alerts
+    # Format: "+919876543210" (with country code)
+    whatsapp_number: Mapped[str | None] = mapped_column(
+        String(20),
+        nullable=True,
+        default=None,
+        comment="WhatsApp number for trade alerts e.g. +919876543210",
+    )
+
+    # --------------------------------------------------------
     # RELATIONSHIPS
     # These let SQLAlchemy join tables automatically.
     # "lazy='dynamic'" means the query is not run until you

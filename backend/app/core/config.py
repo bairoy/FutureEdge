@@ -57,6 +57,18 @@ class Settings(BaseSettings):
     # --------------------------------------------------------
     APP_ENV: str = "development"
     LOG_LEVEL: str = "INFO"
+    FRONTEND_URL: str = "http://localhost:3000"
+    ENCRYPTION_KEY: str = ""
+
+    # --------------------------------------------------------
+    # NOTIFICATIONS (Twilio/WhatsApp — disabled, everything on dashboard)
+    # --------------------------------------------------------
+    WHATSAPP_ALERTS_ENABLED: bool = False
+    ADMIN_WHATSAPP_NUMBER: str = ""
+    TWILIO_ACCOUNT_SID: str = ""
+    TWILIO_AUTH_TOKEN: str = ""
+    TWILIO_WHATSAPP_FROM: str = ""
+    NOTIFY_PHONE_NUMBER: str = ""
 
     # --------------------------------------------------------
     # JWT AUTHENTICATION
@@ -97,7 +109,7 @@ class Settings(BaseSettings):
     MIN_TRADES_FOR_WEIGHT_UPDATE: int = 10
 
     # --------------------------------------------------------
-    # EXIT MONITORING (Phase 2 — new)
+    # EXIT MONITORING & STRATEGY
     #
     # EXIT_MONITOR_INTERVAL_SECONDS:
     #   How often the exit monitor checks open trades against
@@ -111,6 +123,20 @@ class Settings(BaseSettings):
     MAX_DAILY_LOSS_PCT: float = 3.0
     POSITION_RECONCILE_INTERVAL_SECONDS: int = 300
     RECONCILE_AUTO_HALT: bool = True
+    
+    # Trailing Stop Config
+    TRAILING_STOP_ENABLED: bool = True
+    TRAILING_STOP_TRIGGER_PCT: float = 2.0
+    TRAILING_STOP_DISTANCE_PCT: float = 1.5
+
+    # Watchlist
+    WATCHLIST_SYMBOLS: str = "NIFTY 50,BANKNIFTY"
+
+    # --------------------------------------------------------
+    # APSCHEDULER SETTINGS
+    # --------------------------------------------------------
+    SCHEDULER_MAX_INSTANCES: int = 1
+    SCHEDULER_MISFIRE_GRACE_TIME: int = 30
 
     model_config = SettingsConfigDict(
         env_file=".env",

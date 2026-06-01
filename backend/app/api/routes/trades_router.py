@@ -117,6 +117,7 @@ def _serialize(t: Trade) -> dict:
         "symbol":            t.symbol,
         "direction":         t.direction,
         "size":              t.size,
+        "quantity":          t.quantity,
         "entry_price":       t.entry_price,
         "stop_loss":         t.stop_loss,
         "take_profit":       t.take_profit,

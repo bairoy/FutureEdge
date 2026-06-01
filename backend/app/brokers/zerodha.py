@@ -276,17 +276,60 @@ class ZerodhaBroker(BrokerBase):
                 f"{direction} {quantity} {symbol} ({mapped_symbol} on {exchange}) | order_id={order_id}"
             )
 
-            # Fetch the actual fill price after placement
-            fill_price = await self.get_ltp(symbol)
+            # Poll for order status to verify it is actually filled (SEBI limit compliance)
+            filled = False
+            average_price = 0.0
+            latest_status = "OPEN"
 
-            return OrderResult(
-                success      = True,
-                order_id     = str(order_id),
-                fill_price   = fill_price,
-                quantity     = quantity,
-                status       = "COMPLETE",
-                raw_response = {"order_id": order_id, "symbol": symbol},
-            )
+            for _ in range(10):  # 10 attempts * 200ms = 2.0s
+                await asyncio.sleep(0.2)
+                try:
+                    def _get_history():
+                        return self._kite.order_history(order_id)
+                    history = await loop.run_in_executor(None, _get_history)
+                    if history:
+                        latest = history[-1]
+                        latest_status = latest.get("status")
+                        if latest_status == "COMPLETE":
+                            filled = True
+                            average_price = float(latest.get("average_price", 0.0))
+                            break
+                        elif latest_status in ("REJECTED", "CANCELLED"):
+                            break
+                except Exception as status_err:
+                    logger.warning(f"Error checking order status for {order_id}: {status_err}")
+
+            if filled:
+                logger.info(f"✅ ZerodhaBroker | ORDER FILLED | order_id={order_id} @ price={average_price}")
+                return OrderResult(
+                    success      = True,
+                    order_id     = str(order_id),
+                    fill_price   = average_price if average_price > 0 else await self.get_ltp(symbol),
+                    quantity     = quantity,
+                    status       = "COMPLETE",
+                    raw_response = {"order_id": order_id, "symbol": symbol},
+                )
+            else:
+                logger.warning(
+                    f"⚠️ ZerodhaBroker | ORDER UNFILLED/TIMEOUT | "
+                    f"order_id={order_id} (status: {latest_status}) — cancelling..."
+                )
+                try:
+                    def _cancel():
+                        return self._kite.cancel_order(self._kite.VARIETY_REGULAR, order_id)
+                    await loop.run_in_executor(None, _cancel)
+                except Exception as cancel_err:
+                    logger.error(f"Failed to cancel unfilled order {order_id}: {cancel_err}")
+
+                return OrderResult(
+                    success       = False,
+                    order_id      = str(order_id),
+                    fill_price    = 0.0,
+                    quantity      = 0.0,
+                    status        = "CANCELLED" if latest_status != "REJECTED" else "REJECTED",
+                    error_message = f"Order unfilled after 2s timeout (status: {latest_status})",
+                    raw_response  = {"order_id": order_id, "symbol": symbol},
+                )
 
         except Exception as e:
             logger.error(f"❌ ZerodhaBroker.place_order failed: {e}")

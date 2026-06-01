@@ -39,10 +39,13 @@ export interface HITLPending {
   size: number;
   entryPrice: number;
   riskScore: number;
+  stopLoss?: number;
+  takeProfit?: number;
   llmRationale: string | null;
   reasons: string[];
   memories: EpisodicMemory[];
   votes: AgentVote[];
+  hitlRequired?: boolean;
 }
 
 // ─── AUTH STORE ───────────────────────────────────────────────
@@ -92,6 +95,7 @@ interface TradingState {
   hitlPending: HITLPending | null;
   killSwitch: KillSwitchStatus;
   currentSymbol: string;
+  paperTrade: boolean;
 
   addTick: (tick: TickPoint) => void;
   setTicks: (ticks: TickPoint[]) => void;
@@ -100,6 +104,7 @@ interface TradingState {
   setHITLPending: (h: HITLPending | null) => void;
   setKillSwitch: (s: KillSwitchStatus) => void;
   setCurrentSymbol: (s: string) => void;
+  setPaperTrade: (val: boolean) => void;
 }
 
 export const useTradingStore = create<TradingState>((set) => ({
@@ -111,6 +116,7 @@ export const useTradingStore = create<TradingState>((set) => ({
   hitlPending: null,
   killSwitch: { halted: false, status: "ACTIVE" },
   currentSymbol: "NIFTY 50",
+  paperTrade: true, // Default to true
 
   // Keep only last 500 ticks so memory stays bounded
   addTick: (tick) =>
@@ -126,4 +132,5 @@ export const useTradingStore = create<TradingState>((set) => ({
   setHITLPending: (hitlPending) => set({ hitlPending }),
   setKillSwitch: (killSwitch) => set({ killSwitch }),
   setCurrentSymbol: (currentSymbol) => set({ currentSymbol }),
+  setPaperTrade: (paperTrade) => set({ paperTrade }),
 }));

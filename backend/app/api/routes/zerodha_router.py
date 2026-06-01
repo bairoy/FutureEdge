@@ -1,10 +1,14 @@
 import os
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Depends, HTTPException
 from fastapi.responses import HTMLResponse
 from loguru import logger
+from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.db.redis import redis_client, KEY_ZERODHA_ACCESS_TOKEN
+from app.auth.dependencies import get_db, require_viewer
+from app.db.models.user import User
 
 router = APIRouter()
 
@@ -76,6 +80,47 @@ async def get_zerodha_status():
     is_zerodha = settings.ACTIVE_BROKER.lower() == "zerodha"
     connected = False
     
+    if is_zerodha:
+        try:
+            connected = await broker.is_connected()
+        except Exception as e:
+            logger.warning(f"Failed to check broker connection: {e}")
+            connected = False
+            
+    return {
+        "active_broker": settings.ACTIVE_BROKER,
+        "is_zerodha": is_zerodha,
+        "connected": connected
+    }
+
+
+class BrokerSelectRequest(BaseModel):
+    broker: str  # "mock" or "zerodha"
+
+
+@router.post("/auth/broker/select", summary="Set the active broker dynamically")
+async def select_broker(
+    req: BrokerSelectRequest,
+    current_user: User = Depends(require_viewer),
+):
+    broker_name = req.broker.lower()
+    if broker_name not in ["mock", "zerodha"]:
+        raise HTTPException(status_code=400, detail="Invalid broker. Must be 'mock' or 'zerodha'.")
+    
+    settings.ACTIVE_BROKER = broker_name
+    
+    try:
+        update_env_file("ACTIVE_BROKER", broker_name)
+        logger.info(f"Updated ACTIVE_BROKER in .env to: {broker_name}")
+    except Exception as e:
+        logger.error(f"Failed to update ACTIVE_BROKER in .env file: {e}")
+
+    logger.info(f"Dynamically switched ACTIVE_BROKER to: {broker_name}")
+    
+    from app.brokers.base import get_broker
+    broker = get_broker()
+    is_zerodha = broker_name == "zerodha"
+    connected = False
     if is_zerodha:
         try:
             connected = await broker.is_connected()
@@ -217,14 +262,125 @@ async def zerodha_callback(request: Request):
 
 
 @router.get("/api/v1/broker/portfolio")
-async def get_broker_portfolio(mock: bool = False):
+async def get_broker_portfolio(
+    mock: bool = False,
+    paper: bool = False,
+    current_user: User = Depends(require_viewer),
+    db: AsyncSession = Depends(get_db),
+):
     """
     Returns live account margins and positions from the active broker.
     If mock=True is passed, or if the active broker is not connected/fails,
     it falls back to mock portfolio details for easy local UI testing.
+    If paper=True is passed, it calculates simulated paper trading margins and positions from the database.
     """
     from app.brokers.base import get_broker
     from app.brokers.mock import MockBroker
+
+    if paper:
+        try:
+            # 1. Fetch open paper trades
+            from sqlalchemy import select, and_
+            from app.db.models.trade import Trade
+            
+            result = await db.execute(
+                select(Trade).where(
+                    and_(
+                        Trade.user_id == current_user.id,
+                        Trade.status == "OPEN",
+                        Trade.broker == "paper"
+                    )
+                )
+            )
+            open_trades = result.scalars().all()
+            
+            # Fetch closed paper trades of today for daily P&L
+            from datetime import datetime, time, timezone
+            import pytz
+            IST = pytz.timezone("Asia/Kolkata")
+            today_start = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+            
+            closed_result = await db.execute(
+                select(Trade).where(
+                    and_(
+                        Trade.user_id == current_user.id,
+                        Trade.status == "CLOSED",
+                        Trade.broker == "paper",
+                        Trade.closed_at >= today_start
+                    )
+                )
+            )
+            closed_trades = closed_result.scalars().all()
+            realized_pnl_today = sum(t.realized_pnl or 0.0 for t in closed_trades)
+            
+            # 2. Get current price & calculate PnL for each open paper position
+            positions = []
+            unrealized_pnl = 0.0
+            margin_used = 0.0
+            
+            broker = get_broker()
+            for t in open_trades:
+                try:
+                    is_connected = await broker.is_connected()
+                    if not is_connected:
+                        await broker.connect()
+                    current_price = await broker.get_ltp(t.symbol)
+                except Exception:
+                    try:
+                        from app.data.feed import get_current_price_yfinance
+                        import asyncio
+                        loop = asyncio.get_running_loop()
+                        current_price = await loop.run_in_executor(
+                            None, get_current_price_yfinance, t.symbol
+                        )
+                    except Exception:
+                        current_price = t.entry_price
+                
+                # Calculate P&L
+                if t.direction == "LONG":
+                    pos_qty = t.quantity
+                    pnl = (current_price - t.entry_price) * t.quantity
+                else:
+                    pos_qty = -t.quantity
+                    pnl = (t.entry_price - current_price) * t.quantity
+                    
+                unrealized_pnl += pnl
+                margin_used += t.entry_price * t.quantity
+                
+                positions.append({
+                    "symbol": t.symbol,
+                    "quantity": pos_qty,
+                    "avg_price": t.entry_price,
+                    "pnl": round(pnl, 2),
+                    "notional": round(current_price * t.quantity, 2)
+                })
+                
+            starting_equity = 1000000.0  # ₹10 Lakhs paper money
+            total_equity = starting_equity + realized_pnl_today + unrealized_pnl
+            margin_available = total_equity - margin_used
+            
+            return {
+                "connected": True,
+                "mock_data": True,
+                "paper_mode": True,
+                "account": {
+                    "total_equity": round(total_equity, 2),
+                    "margin_used": round(margin_used, 2),
+                    "margin_available": round(margin_available, 2),
+                    "unrealized_pnl": round(unrealized_pnl, 2)
+                },
+                "positions": positions
+            }
+            
+        except Exception as pe:
+            logger.error(f"Failed to calculate paper portfolio: {pe}")
+            return {
+                "connected": False,
+                "mock_data": True,
+                "account": {"total_equity": 0.0, "margin_used": 0.0, "margin_available": 0.0, "unrealized_pnl": 0.0},
+                "positions": [],
+                "error": str(pe)
+            }
 
     if mock:
         try:

@@ -50,8 +50,9 @@ def precompute_indicators_and_regimes(df: pd.DataFrame) -> pd.DataFrame:
     loss = -delta.clip(upper=0)
 
     period = 14
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean().replace(0, 1e-10)
+    # Welles Wilder's Smoothing RMA
+    avg_gain = gain.ewm(alpha=1.0/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0/period, adjust=False).mean().replace(0, 1e-10)
 
     rs = avg_gain / avg_loss
     df["rsi"] = 100 - (100 / (1 + rs))
@@ -83,7 +84,8 @@ def precompute_indicators_and_regimes(df: pd.DataFrame) -> pd.DataFrame:
     tr3 = (df["low"] - df["close"].shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    atr = tr.rolling(window=period).mean().replace(0, 1e-10)
+    # Welles Wilder's Smoothing RMA
+    atr = tr.ewm(alpha=1.0/period, adjust=False).mean().replace(0, 1e-10)
 
     # DM (+DM, -DM)
     up_move = df["high"].diff()
@@ -91,21 +93,27 @@ def precompute_indicators_and_regimes(df: pd.DataFrame) -> pd.DataFrame:
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-    plus_di = 100 * (pd.Series(plus_dm).rolling(window=period).mean() / atr)
-    minus_di = 100 * (pd.Series(minus_dm).rolling(window=period).mean() / atr)
+    plus_dm_series = pd.Series(plus_dm, index=df.index)
+    minus_dm_series = pd.Series(minus_dm, index=df.index)
+    plus_dm_smoothed = plus_dm_series.ewm(alpha=1.0/period, adjust=False).mean()
+    minus_dm_smoothed = minus_dm_series.ewm(alpha=1.0/period, adjust=False).mean()
+
+    plus_di = 100 * (plus_dm_smoothed / atr)
+    minus_di = 100 * (minus_dm_smoothed / atr)
 
     denom = plus_di + minus_di
     denom = denom.replace(0, 1e-10)
     dx = 100 * (plus_di - minus_di).abs() / denom
-    df["adx"] = dx.rolling(window=period).mean().fillna(20.0)
+    df["adx"] = dx.ewm(alpha=1.0/period, adjust=False).mean().fillna(20.0)
 
     # EMA Slope
     ema20 = df["close"].ewm(span=20, adjust=False).mean()
     df["ema_slope"] = ema20.diff(3).fillna(0.0)
 
-    # Volatility
+    # Volatility (std of log returns over last 30 candles, scaled to daily)
     returns = np.log(df["close"] / df["close"].shift(1))
-    df["vol"] = returns.rolling(window=30).std().fillna(0.02)
+    df["raw_vol"] = returns.rolling(window=30).std()
+    df["vol"] = (df["raw_vol"] * np.sqrt(375)).fillna(0.02)
 
     # Classify Regime for each row
     regimes = []
@@ -191,6 +199,7 @@ async def run_backtest(
         current_candle = candles[t]
         timestamp = current_candle["timestamp"]
         open_price = current_candle["open"]
+        exited_this_candle = False
 
         # Slices indicators at t-1 to compute inputs before current candle open
         row_prev = df.iloc[t - 1]
@@ -314,9 +323,10 @@ async def run_backtest(
 
             position = 0
             direction = "NONE"
+            exited_this_candle = True
 
         # --- Check execution signals (BUY/SELL Reversals or New entries) ---
-        if position == 0:
+        if position == 0 and not exited_this_candle:
             if decision == "BUY":
                 # Open LONG position
                 trade_size_val = cash * (size_pct / 100.0)

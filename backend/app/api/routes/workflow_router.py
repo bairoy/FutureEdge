@@ -44,12 +44,15 @@ class RunWorkflowRequest(BaseModel):
     quantity:        int | None = None      # user enters exact shares
     position_rupees: float | None = None    # OR user enters rupee amount
     override_kelly:  bool = False           # if True, skip Kelly sizing
+    paper_trade:     bool = True           # if True, runs simulated paper trade
 
 
 class HITLResumeRequest(BaseModel):
-    thread_id: str    # the run_id returned from /workflow/run
-    decision:  str    # "APPROVE" or "REJECT"
-    notes:     str = ""
+    thread_id:       str    # the run_id returned from /workflow/run
+    decision:        str    # "APPROVE" or "REJECT"
+    notes:           str = ""
+    quantity:        int | None = None
+    position_rupees: float | None = None
 
 
 # ============================================================
@@ -162,6 +165,7 @@ async def run_workflow(
         user_override_quantity = request.quantity,
         user_override_rupees = request.position_rupees,
         override_kelly = request.override_kelly,
+        paper_trade    = request.paper_trade,
     )
 
     state    = result["state"]
@@ -250,19 +254,17 @@ async def run_workflow(
 @router.post("/workflow/resume", summary="Resume a paused HITL workflow")
 async def resume_workflow(
     request:      HITLResumeRequest,
-    current_user: User         = Depends(require_risk_manager),
+    current_user: User         = Depends(require_trader),
     db:           AsyncSession = Depends(get_db),
 ):
     """
-    Resume a paused workflow after human approval/rejection.
+    Resume a paused workflow after human approval/rejection/confirmation.
 
     SECURITY CHECK:
     ---------------
     We verify the workflow_run exists in the DB.
-    Any authenticated risk_manager can approve any pending HITL.
-    (In production you may want: only the original user's manager can approve.)
-
-    Only risk_manager and admin roles can call this.
+    - Risky trades (hitl_required = True) require risk_manager or admin role.
+    - Non-risky sizing confirmation trades can be resumed by any trader.
     """
 
     decision = request.decision.upper()
@@ -282,6 +284,13 @@ async def resume_workflow(
             detail=f"Workflow run '{request.thread_id}' not found.",
         )
 
+    # Authorization Check: risky trades require risk_manager or admin role
+    if workflow_run.hitl_required and current_user.role not in {"risk_manager", "admin"}:
+        raise HTTPException(
+            status_code=403,
+            detail="Only a risk_manager or admin can approve or reject risky trades."
+        )
+
     if workflow_run.status != "HITL_PENDING":
         raise HTTPException(
             status_code=400,
@@ -298,7 +307,12 @@ async def resume_workflow(
     try:
         graph  = get_workflow_graph()
         state  = await graph.ainvoke(
-            Command(resume={"decision": decision, "notes": request.notes}),
+            Command(resume={
+                "decision":        decision,
+                "notes":           request.notes,
+                "quantity":        request.quantity,
+                "position_rupees": request.position_rupees,
+            }),
             config=config,
         )
     except Exception as e:

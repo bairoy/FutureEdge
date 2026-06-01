@@ -45,7 +45,8 @@ async def regime_agent_node(state: AgentState) -> dict:
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         
         period = 14
-        atr = tr.rolling(window=period).mean()
+        # Welles Wilder's Smoothing RMA
+        atr = tr.ewm(alpha=1.0/period, adjust=False).mean()
         atr = atr.replace(0, 1e-10) # avoid division by zero
 
         # 2. Directional Movement (+DM, -DM)
@@ -55,14 +56,19 @@ async def regime_agent_node(state: AgentState) -> dict:
         plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
         minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-        plus_di = 100 * (pd.Series(plus_dm).rolling(window=period).mean() / atr)
-        minus_di = 100 * (pd.Series(minus_dm).rolling(window=period).mean() / atr)
+        plus_dm_series = pd.Series(plus_dm, index=df.index)
+        minus_dm_series = pd.Series(minus_dm, index=df.index)
+        plus_dm_smoothed = plus_dm_series.ewm(alpha=1.0/period, adjust=False).mean()
+        minus_dm_smoothed = minus_dm_series.ewm(alpha=1.0/period, adjust=False).mean()
+
+        plus_di = 100 * (plus_dm_smoothed / atr)
+        minus_di = 100 * (minus_dm_smoothed / atr)
 
         # 3. DX and ADX (Average Directional Index)
         denom = plus_di + minus_di
         denom = denom.replace(0, 1e-10)
         dx = 100 * (plus_di - minus_di).abs() / denom
-        adx = dx.rolling(window=period).mean()
+        adx = dx.ewm(alpha=1.0/period, adjust=False).mean()
 
         latest_adx = float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 20.0
 
@@ -70,11 +76,12 @@ async def regime_agent_node(state: AgentState) -> dict:
         ema20 = df["close"].ewm(span=20, adjust=False).mean()
         ema_slope = float(ema20.diff(3).iloc[-1]) if len(ema20) >= 3 else 0.0
 
-        # 5. Volatility (std of log returns over last 30 candles)
+        # 5. Volatility (std of log returns over last 30 candles, scaled to daily)
         returns = np.log(df["close"] / df["close"].shift(1))
-        vol = float(returns.tail(30).std()) if len(returns) >= 30 else 0.02
-        if pd.isna(vol):
-            vol = 0.02
+        raw_vol = float(returns.tail(30).std()) if len(returns) >= 30 else 0.02 / np.sqrt(375)
+        if pd.isna(raw_vol):
+            raw_vol = 0.02 / np.sqrt(375)
+        vol = raw_vol * np.sqrt(375)
 
         # 6. Classification Logic
         # ADX > 25 indicates a strong trend

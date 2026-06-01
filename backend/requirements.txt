@@ -72,8 +72,33 @@ email-validator>=2.0.0
 bcrypt>=4.0.0
 PyJWT>=2.8.0
 
-openai
-anthropic>=0.28.0
+openai>=1.30.0              # GPT-4o for LLM trade rationale
+# anthropic removed — using OpenAI (GPT-4o) exclusively
+
+# ============================================================
+# ALERTING — WHATSAPP (Twilio) (Optional / Disabled)
+# pip install twilio
+# Required when WHATSAPP_ALERTS_ENABLED=true in .env
+# ============================================================
+# twilio>=8.0.0
+
+# ============================================================
+# SECURITY — TOKEN ENCRYPTION
+# AES-256-GCM for Zerodha token storage at rest
+# ============================================================
+cryptography>=42.0.0
+
+# ============================================================
+# SCHEDULING
+# APScheduler for cron-based market jobs (pre-market warmup,
+# daily P&L report, token refresh reminder, weight updates)
+# ============================================================
+APScheduler>=3.10.0
+
+# ============================================================
+# RATE LIMITING (optional — for production)
+# slowapi>=0.1.9
+# ============================================================
 
 # ============================================================
 # AI — FINBERT  (Phase 2 — optional, install separately)
