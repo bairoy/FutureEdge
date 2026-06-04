@@ -95,6 +95,7 @@ interface TradingState {
   hitlPending: HITLPending | null;
   killSwitch: KillSwitchStatus;
   currentSymbol: string;
+  paperTrade: boolean;
   runResult: WorkflowRunResponse | null;
 
   addTick: (tick: TickPoint) => void;

@@ -69,6 +69,13 @@ class PositionReconciler:
 
     async def reconcile(self) -> None:
         """Perform a single reconciliation check."""
+        # Skip reconciliation in paper/mock mode — the mock broker always returns
+        # zero positions, which would always mismatche against DB open trades and
+        # trigger a false kill switch every cycle.
+        if settings.ACTIVE_BROKER.lower() == "mock":
+            logger.debug("PositionReconciler: skipping in paper/mock mode")
+            return
+
         broker = get_broker()
         if not await broker.is_connected():
             logger.warning("PositionReconciler: Broker not connected, skipping check")

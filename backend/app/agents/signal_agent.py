@@ -81,6 +81,9 @@ async def signal_agent_node(state: AgentState) -> dict:
         bollinger_upper = ind["bollinger_upper"]
         bollinger_middle= ind["bollinger_middle"]
         bollinger_lower = ind["bollinger_lower"]
+        ema_9           = ind.get("ema_9", price)
+        ema_21          = ind.get("ema_21", price)
+        vwap            = ind.get("vwap", price)
         from_cache      = ind["from_cache"]
 
         # --------------------------------------------------------
@@ -120,18 +123,23 @@ async def signal_agent_node(state: AgentState) -> dict:
                 volume_spike = True
 
         # --------------------------------------------------------
-        # REGIME-AWARE SCORING SYSTEM
+        # REGIME-AWARE SCORING SYSTEM & INDICATORS
         # --------------------------------------------------------
         regime = ctx.regime if hasattr(ctx, "regime") else "RANGEBOUND"
         score   = 0.0
         reasons = []
 
-        # --- 1. RSI (Relative Strength Index) ---
+        # --- 1. Dynamic RSI (Relative Strength Index) ---
+        rsi_oversold = 40.0 if regime == "TRENDING_UP" else 30.0
+        rsi_overbought = 60.0 if regime == "TRENDING_DOWN" else 70.0
+        
         rsi_score = 0.0
-        if rsi < 30:
+        if rsi < rsi_oversold:
             rsi_score = 0.3
-        elif rsi > 70:
+            reasons.append(f"RSI oversold ({rsi:.1f} < {rsi_oversold})")
+        elif rsi > rsi_overbought:
             rsi_score = -0.3
+            reasons.append(f"RSI overbought ({rsi:.1f} > {rsi_overbought})")
 
         # --- 2. MACD (Moving Average Convergence Divergence) ---
         macd_score = 0.0
@@ -147,30 +155,64 @@ async def signal_agent_node(state: AgentState) -> dict:
         elif price > bollinger_upper:
             bb_score = -0.2
 
+        # --- 4. EMA 9/21 Crossover (Fast trend detector) ---
+        import pandas as pd
+        closes = pd.Series([c["close"] for c in ctx.ohlcv_1m], dtype=float)
+        ema_9_series = closes.ewm(span=9, adjust=False).mean()
+        ema_21_series = closes.ewm(span=21, adjust=False).mean()
+        
+        ema_9_curr = ema_9_series.iloc[-1]
+        ema_21_curr = ema_21_series.iloc[-1]
+        ema_9_prev = ema_9_series.iloc[-2] if len(ema_9_series) >= 2 else ema_9_curr
+        ema_21_prev = ema_21_series.iloc[-2] if len(ema_21_series) >= 2 else ema_21_curr
+        
+        crossover_score = 0.0
+        if ema_9_curr > ema_21_curr:
+            crossover_score = 0.2
+            if ema_9_prev <= ema_21_prev:
+                crossover_score += 0.1
+                reasons.append("Fresh EMA 9/21 Bullish Crossover")
+            else:
+                reasons.append("EMA 9 > EMA 21 (bullish trend)")
+        elif ema_9_curr < ema_21_curr:
+            crossover_score = -0.2
+            if ema_9_prev >= ema_21_prev:
+                crossover_score -= 0.1
+                reasons.append("Fresh EMA 9/21 Bearish Crossover")
+            else:
+                reasons.append("EMA 9 < EMA 21 (bearish trend)")
+
+        # --- 5. VWAP Position ---
+        vwap_score = 0.0
+        if price > vwap:
+            vwap_score = 0.15
+            reasons.append(f"Price above VWAP (₹{price:.2f} > ₹{vwap:.2f})")
+        elif price < vwap:
+            vwap_score = -0.15
+            reasons.append(f"Price below VWAP (₹{price:.2f} < ₹{vwap:.2f})")
+
         # --- DYNAMIC REGIME WEIGHTING ---
         if regime == "RANGEBOUND":
-            # Amplify mean-reversion (RSI + Bollinger) and suppress trend-following (MACD)
-            score = (rsi_score * 1.5) + (bb_score * 1.5) + (macd_score * 0.2)
+            # Amplify mean-reversion (RSI + Bollinger) and suppress trend-following (MACD, Crossover, VWAP)
+            score = (rsi_score * 1.5) + (bb_score * 1.5) + (macd_score * 0.2) + (vwap_score * 0.1)
             reasons.append("Regime: Rangebound (Mean Reversion amplified)")
-            if rsi < 30 or rsi > 70:
-                reasons.append(f"RSI trigger ({rsi:.1f})")
             if price < bollinger_lower or price > bollinger_upper:
                 reasons.append("Bollinger Band boundary trigger")
                 
         elif regime in ("TRENDING_UP", "TRENDING_DOWN"):
-            # Amplify trend-following (MACD) and ignore counter-trend mean reversion (RSI / Bollinger)
-            score = macd_score * 1.8
+            # Amplify trend-following (MACD, Crossover, VWAP) and ignore counter-trend mean reversion (RSI / Bollinger)
+            score = (macd_score * 1.2) + (crossover_score * 1.5) + (vwap_score * 1.2)
             
-            # Damp counter-trend signals
+            # Damp counter-trend RSI signals
             if regime == "TRENDING_UP":
-                if rsi_score < 0: # ignore overbought RSI sell signals
+                if rsi_score < 0:
                     logger.debug("SignalAgent | Dampened overbought RSI sell signal during TRENDING_UP")
-                if rsi_score > 0: # allow oversold pullbacks
+                if rsi_score > 0:
                     score += rsi_score * 0.5
             elif regime == "TRENDING_DOWN":
-                if rsi_score > 0: # ignore oversold RSI buy signals
+                if rsi_score > 0:
                     logger.debug("SignalAgent | Dampened oversold RSI buy signal during TRENDING_DOWN")
-                if rsi_score < 0: # allow overbought pullbacks
+                if rsi_score < 0:
                     score += rsi_score * 0.5
                     
             reasons.append(f"Regime: Trend Following ({regime.replace('_', ' ')})")
@@ -181,17 +223,49 @@ async def signal_agent_node(state: AgentState) -> dict:
                 
         elif regime == "HIGH_VOLATILITY":
             # Damp all signals across the board to remain conservative
-            score = ((rsi_score * 0.5) + (macd_score * 0.5) + (bb_score * 0.5)) * 0.5
+            score = ((rsi_score * 0.4) + (macd_score * 0.4) + (bb_score * 0.4) + (crossover_score * 0.4)) * 0.5
             reasons.append("Regime: High Volatility (Signals dampened by 50%)")
             
         else:
             # Fallback to standard baseline scoring
-            score = rsi_score + macd_score + bb_score
+            score = rsi_score + macd_score + bb_score + crossover_score + vwap_score
             reasons.append("Regime: Unknown (Baseline indicator scoring applied)")
+
+        # --- 6. Multi-timeframe trend confirmation ---
+        try:
+            df_1m = pd.DataFrame(ctx.ohlcv_1m)
+            df_1m["timestamp"] = pd.to_datetime(df_1m["timestamp"])
+            df_1m.set_index("timestamp", inplace=True)
+            
+            df_5m = df_1m.resample("5Min").agg({"close": "last"}).dropna()
+            df_15m = df_1m.resample("15Min").agg({"close": "last"}).dropna()
+            
+            trend_5m = 0
+            trend_15m = 0
+            
+            if len(df_5m) >= 21:
+                ema9_5m = df_5m["close"].ewm(span=9, adjust=False).mean().iloc[-1]
+                ema21_5m = df_5m["close"].ewm(span=21, adjust=False).mean().iloc[-1]
+                trend_5m = 1 if ema9_5m > ema21_5m else -1
+                
+            if len(df_15m) >= 21:
+                ema9_15m = df_15m["close"].ewm(span=9, adjust=False).mean().iloc[-1]
+                ema21_15m = df_15m["close"].ewm(span=21, adjust=False).mean().iloc[-1]
+                trend_15m = 1 if ema9_15m > ema21_15m else -1
+                
+            if score > 0.1:
+                if trend_5m == -1 or trend_15m == -1:
+                    score *= 0.6
+                    reasons.append("MTF warning: 5m or 15m trend is Bearish")
+            elif score < -0.1:
+                if trend_5m == 1 or trend_15m == 1:
+                    score *= 0.6
+                    reasons.append("MTF warning: 5m or 15m trend is Bullish")
+        except Exception as mtf_err:
+            logger.warning(f"Failed to calculate MTF confirmation: {mtf_err}")
 
         # --- Volume Confirmation ---
         if volume_spike:
-            # Confirm buy/sell directional pressure with volume expansion
             if score > 0:
                 score *= 1.25
                 reasons.append(f"Volume spike confirmed Buy pressure (+25%)")
@@ -200,12 +274,11 @@ async def signal_agent_node(state: AgentState) -> dict:
                 reasons.append(f"Volume spike confirmed Sell pressure (+25%)")
 
         # --- Bid/Ask Spread confirmation ---
-        if spread_pct > 0.005:  # Wide spread (> 0.5%)
+        if spread_pct > 0.005:
             score *= 0.5
             reasons.append(f"Wide bid/ask spread ({spread_pct*100:.2f}%) — signal score halved")
 
         # --- Volatility filter ---
-        # High volatility makes all signals less reliable.
         if ctx.volatility_24h > 0.05:
             score *= 0.7
             reasons.append(f"Elevated volatility ({ctx.volatility_24h*100:.1f}%) — signal dampened")
@@ -213,17 +286,12 @@ async def signal_agent_node(state: AgentState) -> dict:
         # --------------------------------------------------------
         # CONVERT SCORE TO DECISION
         # --------------------------------------------------------
-
-        # Threshold of ±0.2 avoids trading on weak/noisy signals
-
         if score > 0.2:
             decision   = "BUY"
             confidence = min(0.5 + score, 0.95)
-
         elif score < -0.2:
             decision   = "SELL"
             confidence = min(0.5 + abs(score), 0.95)
-
         else:
             decision   = "HOLD"
             confidence = 0.5 + abs(score)
@@ -233,7 +301,6 @@ async def signal_agent_node(state: AgentState) -> dict:
         # --------------------------------------------------------
         # BUILD VOTE
         # --------------------------------------------------------
-
         vote = AgentVote(
             agent     = "SignalAgent",
             decision  = decision,
@@ -247,6 +314,9 @@ async def signal_agent_node(state: AgentState) -> dict:
                 "bollinger_upper":  bollinger_upper,
                 "bollinger_middle": bollinger_middle,
                 "bollinger_lower":  bollinger_lower,
+                "ema_9":            ema_9,
+                "ema_21":           ema_21,
+                "vwap":             vwap,
                 "final_score":      round(score, 4),
                 "volatility_24h":   ctx.volatility_24h,
                 "indicators_cached": from_cache,

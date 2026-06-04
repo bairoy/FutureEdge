@@ -113,6 +113,17 @@ async def _weight_updater_daily():
         logger.error(f"Scheduler: weight update failed: {e}")
 
 
+async def _calibration_daily():
+    """Run daily agent calibration meta-analysis."""
+    logger.info("⏰ Scheduler: running daily agent calibration...")
+    try:
+        from app.agents.calibration_agent import run_calibration
+        result = await run_calibration()
+        logger.info(f"✅ Scheduler: daily agent calibration completed: {result}")
+    except Exception as e:
+        logger.error(f"Scheduler: daily agent calibration failed: {e}")
+
+
 async def _daily_pnl_report():
     """Compile daily P&L summary and log it."""
     from datetime import date
@@ -193,6 +204,16 @@ def build_scheduler() -> AsyncIOScheduler:
         CronTrigger(day_of_week="mon-fri", hour=16, minute=0, timezone=IST),
         id="weight_updater_daily",
         name="Daily Agent Weight Recalculation",
+        replace_existing=True,
+        misfire_grace_time=1800,
+    )
+
+    # 4:15 PM IST Mon-Fri — daily agent calibration
+    scheduler.add_job(
+        _calibration_daily,
+        CronTrigger(day_of_week="mon-fri", hour=16, minute=15, timezone=IST),
+        id="calibration_daily",
+        name="Daily Agent Calibration Analysis",
         replace_existing=True,
         misfire_grace_time=1800,
     )

@@ -38,6 +38,27 @@ AUTO_SQUAREOFF_HOUR   = 15
 AUTO_SQUAREOFF_MINUTE = 20
 
 
+# NSE symbol-to-sector mapping for correlation checks
+NSE_SECTORS = {
+    "RELIANCE": "Energy",
+    "INFY": "Technology",
+    "TCS": "Technology",
+    "HDFCBANK": "Financials",
+    "ICICIBANK": "Financials",
+    "SBIN": "Financials",
+    "AXISBANK": "Financials",
+    "KOTAKBANK": "Financials",
+    "BHARTIARTL": "Telecom",
+    "ITC": "FMCG",
+    "HINDUNILVR": "FMCG",
+    "LTIM": "Technology",
+    "WIPRO": "Technology",
+    "HCLTECH": "Technology",
+    "BANKNIFTY": "Financials",
+    "NIFTY 50": "Index",
+}
+
+
 # ============================================================
 # PORTFOLIO AGENT NODE  (async)
 # ============================================================
@@ -83,13 +104,47 @@ async def portfolio_agent_node(state: AgentState) -> dict:
             )
 
         # --------------------------------------------------------
+        # SECTOR CORRELATION CHECK
+        # --------------------------------------------------------
+        if decision != "VETO":
+            symbol_sector = NSE_SECTORS.get(symbol.upper(), "Unknown")
+            if symbol_sector != "Unknown" and symbol_sector != "Index":
+                sector_counts = {}
+                for pos in portfolio.open_positions:
+                    pos_sym = pos.get("symbol", "").upper()
+                    pos_sec = NSE_SECTORS.get(pos_sym, "Unknown")
+                    if pos_sec != "Unknown" and pos_sec != "Index":
+                        sector_counts[pos_sec] = sector_counts.get(pos_sec, 0) + 1
+                
+                current_sector_count = sector_counts.get(symbol_sector, 0)
+                total_sectorable_positions = sum(sector_counts.values())
+                
+                metadata["symbol_sector"] = symbol_sector
+                metadata["sector_positions_count"] = current_sector_count
+                
+                if total_sectorable_positions > 0:
+                    sector_ratio = current_sector_count / total_sectorable_positions
+                    if sector_ratio >= 0.5 and current_sector_count >= 2:
+                        decision = "VETO"
+                        confidence = 0.90
+                        reasons.append(
+                            f"Sector correlation risk: {current_sector_count} open positions in {symbol_sector} "
+                            f"({sector_ratio*100:.1f}% of sectorable portfolio) exceeds 50% limit"
+                        )
+                    elif current_sector_count >= 1:
+                        reasons.append(
+                            f"Elevated concentration in {symbol_sector} sector ({current_sector_count} open positions)"
+                        )
+                        confidence = min(confidence, 0.5)
+
+        # --------------------------------------------------------
         # CHECK 2: AVAILABLE MARGIN
         # --------------------------------------------------------
 
         # If less than 20% of equity is free, we should not
         # open new positions — we need buffer for drawdowns.
 
-        elif portfolio.margin_available < (portfolio.total_equity * 0.20):
+        if decision != "VETO" and portfolio.margin_available < (portfolio.total_equity * 0.20):
             decision   = "HOLD"
             confidence = 0.7
             reasons.append(

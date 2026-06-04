@@ -71,6 +71,12 @@ class Settings(BaseSettings):
     NOTIFY_PHONE_NUMBER: str = ""
 
     # --------------------------------------------------------
+    # TELEGRAM BOT CONFIG
+    # --------------------------------------------------------
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_CHAT_ID: str = ""
+
+    # --------------------------------------------------------
     # JWT AUTHENTICATION
     # --------------------------------------------------------
     JWT_SECRET_KEY: str = ""

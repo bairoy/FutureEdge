@@ -119,6 +119,7 @@ async def run_workflow(
                 margin_used      = float(acc.get("margin_used", 0.0)),
                 margin_available = float(acc.get("margin_available", 1000000.0)),
                 unrealized_pnl   = float(acc.get("unrealized_pnl", 0.0)),
+                realized_pnl_today = float(acc.get("realized_pnl_today", 0.0)),
                 open_positions   = paper_data.get("positions", []),
             )
             logger.info(f"Loaded paper portfolio: equity={portfolio.total_equity}, available={portfolio.margin_available}")
@@ -251,6 +252,7 @@ async def run_workflow(
                 state.get("sentiment_vote"),
                 state.get("risk_vote"),
                 state.get("portfolio_vote"),
+                state.get("macro_vote"),
             ]
             if v is not None
         ],

@@ -1,27 +1,6 @@
-"""
-app/agents/sentiment_agent.py
-==============================
-Sentiment agent — Phase 2 upgrade.
-
-WHAT CHANGED FROM PHASE 1:
-----------------------------
-1. Fetches REAL news from free RSS feeds (ET, Moneycontrol, Livemint)
-   via app/data/news_fetcher.py — no API key required.
-
-2. Uses FinBERT NLP model when FINBERT_ENABLED=true in .env
-   FinBERT understands financial language context — much more
-   accurate than keyword matching for ambiguous headlines.
-
-3. Falls back to keyword matching when FinBERT is disabled
-   (keeps Phase 1 behaviour as the default for light setups).
-
-TOGGLE:
--------
-.env:
-    FINBERT_ENABLED=false   → keyword matching (default, fast)
-    FINBERT_ENABLED=true    → FinBERT NLP (~800MB RAM, 5s startup)
-"""
-
+import email.utils
+from datetime import datetime, timezone
+import math
 from loguru import logger
 
 from app.core.config import settings
@@ -50,30 +29,53 @@ BEARISH_KEYWORDS = [
 
 
 # ============================================================
+# RECENCY WEIGHT CALCULATOR
+# ============================================================
+
+def _get_recency_weight(published_str: str) -> float:
+    """
+    Calculate exponential decay weight for articles based on age in minutes.
+    Half-life = 180 minutes (3 hours).
+    Weight ranges from 1.0 (new) to 0.1 (old baseline).
+    """
+    if not published_str:
+        return 1.0
+    try:
+        # RFC 2822 / RSS pubDate parsing
+        pub_dt = email.utils.parsedate_to_datetime(published_str)
+        now_dt = datetime.now(timezone.utc)
+        pub_dt = pub_dt.astimezone(timezone.utc)
+        
+        age_minutes = max(0.0, (now_dt - pub_dt).total_seconds() / 60.0)
+        # decay_rate = ln(2) / 180 = 0.00385
+        weight = math.exp(-0.00385 * age_minutes)
+        return max(0.1, min(1.0, weight))
+    except Exception:
+        try:
+            # ISO 8601 fallback
+            pub_dt = datetime.fromisoformat(published_str.replace("Z", "+00:00"))
+            if pub_dt.tzinfo is None:
+                pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+            now_dt = datetime.now(timezone.utc)
+            age_minutes = max(0.0, (now_dt - pub_dt).total_seconds() / 60.0)
+            return max(0.1, min(1.0, math.exp(-0.00385 * age_minutes)))
+        except Exception:
+            return 1.0
+
+
+# ============================================================
 # SENTIMENT AGENT NODE
 # ============================================================
 
 async def sentiment_agent_node(state: AgentState) -> dict:
     """
     Phase 2: fetches real news + uses FinBERT or keyword scoring.
-
-    Flow:
-    1. Try to fetch real news from RSS feeds (cached 5 min in Redis)
-    2. If no news in state AND feed fails → HOLD
-    3. If FinBERT enabled → run NLP inference
-    4. Else → keyword matching (Phase 1 logic)
-    5. Return AgentVote
+    Sentiment is recency-weighted: newer articles count for more.
     """
 
     try:
         ctx    = state["market_context"]
         symbol = ctx.symbol
-
-        # --------------------------------------------------------
-        # STEP 1: GET NEWS
-        # --------------------------------------------------------
-        # Use news already in MarketContext if available.
-        # If not, fetch from RSS feeds (free, no API key).
 
         news = ctx.recent_news
 
@@ -85,6 +87,31 @@ async def sentiment_agent_node(state: AgentState) -> dict:
             except Exception as e:
                 logger.warning(f"News fetch failed: {e}")
                 news = []
+
+        # Fetch yfinance real-time stock-specific news
+        ticker_news = []
+        try:
+            from app.agents.tools.news_tools import get_realtime_ticker_news
+            ticker_news = await get_realtime_ticker_news(symbol)
+        except Exception as e:
+            logger.warning(f"YFinance news fetch failed: {e}")
+
+        # Combine and de-duplicate by title
+        seen_titles = set()
+        merged_news = []
+        for article in ticker_news:
+            title = article.get("title", "").strip()
+            if title and title.lower() not in seen_titles:
+                seen_titles.add(title.lower())
+                merged_news.append(article)
+
+        for article in news:
+            title = article.get("title", "").strip()
+            if title and title.lower() not in seen_titles:
+                seen_titles.add(title.lower())
+                merged_news.append(article)
+
+        news = merged_news
 
         if not news:
             return {
@@ -99,22 +126,21 @@ async def sentiment_agent_node(state: AgentState) -> dict:
                 "logs":            ["SentimentAgent: no news"],
             }
 
-        headlines = [a.get("title", "") for a in news if a.get("title")]
-
         # --------------------------------------------------------
-        # STEP 2: SCORE SENTIMENT
+        # SCORE SENTIMENT
         # --------------------------------------------------------
 
         if settings.FINBERT_ENABLED:
-            result = await _score_with_finbert(headlines)
+            result = await _score_with_finbert(news)
         else:
-            result = _score_with_keywords(headlines)
+            result = _score_with_keywords(news)
 
         sentiment_score = result["score"]
         model_used      = result["model"]
+        headlines_count = len(news)
 
         # --------------------------------------------------------
-        # STEP 3: DECISION
+        # DECISION
         # --------------------------------------------------------
 
         if sentiment_score > 0.2:
@@ -122,7 +148,7 @@ async def sentiment_agent_node(state: AgentState) -> dict:
             confidence = min(0.5 + sentiment_score, 0.9)
             reasoning  = (
                 f"Bullish news sentiment "
-                f"({result.get('positive', 0)}/{len(headlines)} positive) "
+                f"({result.get('positive', 0)}/{headlines_count} positive) "
                 f"via {model_used}"
             )
 
@@ -131,7 +157,7 @@ async def sentiment_agent_node(state: AgentState) -> dict:
             confidence = min(0.5 + abs(sentiment_score), 0.9)
             reasoning  = (
                 f"Bearish news sentiment "
-                f"({result.get('negative', 0)}/{len(headlines)} negative) "
+                f"({result.get('negative', 0)}/{headlines_count} negative) "
                 f"via {model_used}"
             )
 
@@ -149,7 +175,7 @@ async def sentiment_agent_node(state: AgentState) -> dict:
             confidence = round(confidence, 3),
             reasoning  = reasoning,
             metadata   = {
-                "news_count":      len(headlines),
+                "news_count":      headlines_count,
                 "sentiment_score": round(sentiment_score, 3),
                 "positive":        result.get("positive", 0),
                 "negative":        result.get("negative", 0),
@@ -188,42 +214,114 @@ async def sentiment_agent_node(state: AgentState) -> dict:
 # FINBERT SCORING
 # ============================================================
 
-async def _score_with_finbert(headlines: list[str]) -> dict:
-    """Use FinBERT NLP model for sentiment scoring."""
+async def _score_with_finbert(news_articles: list[dict]) -> dict:
+    """Use FinBERT NLP model with recency weighting."""
 
-    from app.models.finbert import analyze_sentiment, is_loaded
+    from app.models.finbert import _finbert_pipeline, is_loaded
+    import asyncio
 
     if not is_loaded():
         logger.debug("FinBERT not loaded — falling back to keywords")
-        return _score_with_keywords(headlines)
+        return _score_with_keywords(news_articles)
 
-    return await analyze_sentiment(headlines)
+    headlines = [a.get("title", "") for a in news_articles if a.get("title")]
+    if not headlines:
+        return {
+            "score":    0.0,
+            "positive": 0,
+            "negative": 0,
+            "neutral":  0,
+            "model":    "finbert_recency_weighted",
+        }
+
+    loop = asyncio.get_running_loop()
+    def _run_inference():
+        return _finbert_pipeline(headlines)
+
+    try:
+        results = await loop.run_in_executor(None, _run_inference)
+    except Exception as e:
+        logger.error(f"FinBERT inference failed in agent: {e}")
+        return _score_with_keywords(news_articles)
+
+    positive_count = 0
+    negative_count = 0
+    neutral_count  = 0
+    weighted_score = 0.0
+    total_weight = 0.0
+
+    for article, result in zip(news_articles, results):
+        label      = result["label"].lower()
+        confidence = result["score"]
+        published  = article.get("published", "")
+        weight     = _get_recency_weight(published)
+
+        art_score = 0.0
+        if label == "positive":
+            positive_count += 1
+            art_score = confidence
+        elif label == "negative":
+            negative_count += 1
+            art_score = -confidence
+        else:
+            neutral_count += 1
+            
+        weighted_score += art_score * weight
+        total_weight += weight
+
+    score = weighted_score / total_weight if total_weight > 0 else 0.0
+
+    return {
+        "score":    round(score, 3),
+        "positive": positive_count,
+        "negative": negative_count,
+        "neutral":  neutral_count,
+        "model":    "finbert_recency_weighted",
+    }
 
 
 # ============================================================
 # KEYWORD SCORING  (Phase 1 fallback)
 # ============================================================
 
-def _score_with_keywords(headlines: list[str]) -> dict:
-    """Keyword matching — fast fallback when FinBERT is disabled."""
+def _score_with_keywords(news_articles: list[dict]) -> dict:
+    """Keyword matching with recency weighting."""
 
     bullish = 0
     bearish = 0
+    weighted_score = 0.0
+    total_weight = 0.0
 
-    for title in headlines:
+    for article in news_articles:
+        title     = article.get("title", "")
+        published = article.get("published", "")
+        weight    = _get_recency_weight(published)
         t = title.lower()
-        if any(kw in t for kw in BULLISH_KEYWORDS):
+
+        is_bull = any(kw in t for kw in BULLISH_KEYWORDS)
+        is_bear = any(kw in t for kw in BEARISH_KEYWORDS)
+
+        art_score = 0.0
+        if is_bull and not is_bear:
             bullish += 1
-        if any(kw in t for kw in BEARISH_KEYWORDS):
+            art_score = 1.0
+        elif is_bear and not is_bull:
+            bearish += 1
+            art_score = -1.0
+        elif is_bull and is_bear:
+            bullish += 1
             bearish += 1
 
-    total = len(headlines)
-    score = (bullish - bearish) / total if total > 0 else 0.0
+        weighted_score += art_score * weight
+        total_weight += weight
+
+    score = weighted_score / total_weight if total_weight > 0 else 0.0
+    total = len(news_articles)
 
     return {
         "score":    round(score, 3),
         "positive": bullish,
         "negative": bearish,
-        "neutral":  total - bullish - bearish,
-        "model":    "keyword_v1",
+        "neutral":  total - bullish - bearish if total > (bullish + bearish) else 0,
+        "model":    "keyword_v1_recency_weighted",
     }

@@ -119,6 +119,7 @@ class AgentState(TypedDict):
     sentiment_vote: Optional[AgentVote]
     risk_vote:      Optional[AgentVote]
     portfolio_vote: Optional[AgentVote]
+    macro_vote:     Optional[AgentVote]
 
     # --------------------------------------------------------
     # ORCHESTRATOR

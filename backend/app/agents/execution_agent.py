@@ -118,6 +118,25 @@ async def execution_node(state: AgentState) -> dict:
             logger.error(
                 f"HITL not approved | run_id={run_id} | user_id={user_id}"
             )
+            
+            # Notify the frontend of the rejection/failure so the dashboard syncs
+            try:
+                await redis_client.publish(
+                    CHANNEL_TRADE_EXECUTED,
+                    json.dumps({
+                        "run_id":    run_id,
+                        "user_id":   user_id,
+                        "symbol":    proposal.symbol,
+                        "direction": proposal.direction,
+                        "shares":    0,
+                        "price":     0.0,
+                        "status":    "REJECTED",
+                        "success":   False,
+                    }),
+                )
+            except Exception as pub_err:
+                logger.warning(f"Redis publish on reject failed: {pub_err}")
+
             return {
                 "executed_trade":  None,
                 "execution_error": "HITL_NOT_APPROVED",

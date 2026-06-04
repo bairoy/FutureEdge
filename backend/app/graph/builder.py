@@ -23,6 +23,7 @@ from app.agents.orchestration_agent import orchestrator_node
 from app.agents.human_agent         import human_review_node, should_human_review
 from app.agents.execution_agent     import execution_node
 from app.agents.regime_agent        import regime_agent_node
+from app.agents.macro_agent         import macro_agent_node
 
 
 def create_graph() -> StateGraph:
@@ -38,6 +39,7 @@ def create_graph() -> StateGraph:
     builder.add_node("sentiment_agent", sentiment_agent_node)
     builder.add_node("risk_agent",      risk_agent_node)
     builder.add_node("portfolio_agent", portfolio_agent_node)
+    builder.add_node("macro_agent",     macro_agent_node)
     builder.add_node("orchestrator",    orchestrator_node)
     builder.add_node("human_review",    human_review_node)
     builder.add_node("execution",       execution_node)
@@ -45,17 +47,19 @@ def create_graph() -> StateGraph:
     # Start by running the regime agent
     builder.add_edge(START, "regime_agent")
 
-    # Parallel fan-out: all 4 agents start simultaneously once regime is determined
+    # Parallel fan-out: all 5 agents start simultaneously once regime is determined
     builder.add_edge("regime_agent", "signal_agent")
     builder.add_edge("regime_agent", "sentiment_agent")
     builder.add_edge("regime_agent", "risk_agent")
     builder.add_edge("regime_agent", "portfolio_agent")
+    builder.add_edge("regime_agent", "macro_agent")
 
     # Fan-in: all agents must finish before orchestrator runs
     builder.add_edge("signal_agent",    "orchestrator")
     builder.add_edge("sentiment_agent", "orchestrator")
     builder.add_edge("risk_agent",      "orchestrator")
     builder.add_edge("portfolio_agent", "orchestrator")
+    builder.add_edge("macro_agent",     "orchestrator")
 
     # Conditional: HITL or direct execution
     builder.add_conditional_edges(
@@ -114,6 +118,7 @@ async def run_agent_cycle(
         "sentiment_vote": None,
         "risk_vote":      None,
         "portfolio_vote": None,
+        "macro_vote":     None,
 
         # Orchestrator
         "consensus": None,

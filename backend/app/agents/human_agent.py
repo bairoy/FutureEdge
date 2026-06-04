@@ -95,7 +95,7 @@ async def human_review_node(state: AgentState) -> dict:
     user_id: str            = state.get("user_id", "anonymous")
 
     # --------------------------------------------------------
-    # LOG INTERRUPT REQUEST
+    # LOG INTERRUPT REQUEST & SEND TELEGRAM ALERT
     # --------------------------------------------------------
 
     logger.warning(f"⏸️  HITL INTERRUPT    | run_id={run_id}")
@@ -104,6 +104,12 @@ async def human_review_node(state: AgentState) -> dict:
     logger.warning(f"    Size      = ${proposal.size:.2f}")
     logger.warning(f"    Risk      = {proposal.risk_score:.2f}")
     logger.warning("    Waiting for human review...")
+
+    try:
+        from app.services.telegram_service import send_hitl_trade_alert
+        await send_hitl_trade_alert(proposal, run_id, is_paper=state.get("paper_trade", True))
+    except Exception as tg_err:
+        logger.error(f"Failed to send Telegram HITL alert: {tg_err}")
 
     # --------------------------------------------------------
     # INTERRUPT — WORKFLOW PAUSES HERE

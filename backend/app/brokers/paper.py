@@ -96,7 +96,8 @@ async def calculate_paper_portfolio_data(db: AsyncSession, user_id: str) -> dict
                 "total_equity": round(total_equity, 2),
                 "margin_used": round(margin_used, 2),
                 "margin_available": round(margin_available, 2),
-                "unrealized_pnl": round(unrealized_pnl, 2)
+                "unrealized_pnl": round(unrealized_pnl, 2),
+                "realized_pnl_today": round(realized_pnl_today, 2)
             },
             "positions": positions
         }

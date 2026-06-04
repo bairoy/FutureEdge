@@ -160,13 +160,26 @@ async def risk_agent_node(state: AgentState) -> dict:
         # CHECK 4: DRAWDOWN LIMIT
         # --------------------------------------------------------
 
-        # If we are already sitting on large unrealised losses,
-        # taking on more risk is dangerous.
+        # Combined daily drawdown check: Sum realized_pnl_today + unrealized_pnl.
+        # Veto if total daily PnL drops below 5% of total equity.
+        total_daily_pnl = portfolio.realized_pnl_today + portfolio.unrealized_pnl
+        drawdown_limit = 0.05 * portfolio.total_equity
 
-        if portfolio.unrealized_pnl < -(0.05 * portfolio.total_equity):
+        metadata["realized_pnl_today"] = round(portfolio.realized_pnl_today, 2)
+        metadata["unrealized_pnl"]      = round(portfolio.unrealized_pnl, 2)
+        metadata["total_daily_pnl"]    = round(total_daily_pnl, 2)
+
+        if total_daily_pnl < -drawdown_limit:
+            decision = "VETO"
+            confidence = 0.98
             reasons.append(
-                f"Portfolio under stress — unrealised PnL: "
-                f"₹{portfolio.unrealized_pnl:.2f}"
+                f"Daily drawdown limit exceeded: total daily loss of ₹{abs(total_daily_pnl):.2f} "
+                f"exceeds limit of ₹{drawdown_limit:.2f} (5% of equity)"
+            )
+        elif total_daily_pnl < -(0.03 * portfolio.total_equity):
+            reasons.append(
+                f"Significant daily drawdown stress — combined daily PnL: "
+                f"₹{total_daily_pnl:.2f}"
             )
             if decision == "HOLD":
                 confidence = min(confidence, 0.6)
@@ -201,6 +214,50 @@ async def risk_agent_node(state: AgentState) -> dict:
                     else:
                         if decision == "HOLD":
                             confidence = min(confidence, 0.5)
+
+        # --------------------------------------------------------
+        # CHECK 6: UPCOMING CORPORATE EVENTS (Earnings / Splits / Dividends)
+        # --------------------------------------------------------
+        try:
+            from app.agents.tools.news_tools import get_upcoming_corporate_events
+            from datetime import datetime
+            
+            events = await get_upcoming_corporate_events(symbol)
+            metadata["corporate_events"] = events
+            
+            # Check for upcoming earnings dates
+            earnings_dates = events.get("Earnings Date")
+            if earnings_dates:
+                if isinstance(earnings_dates, str):
+                    earnings_dates = [earnings_dates]
+                
+                # Check if any earnings date is within 3 days
+                today = datetime.now().date()
+                for ed_str in earnings_dates:
+                    try:
+                        # Extract date part: first 10 characters
+                        ed_clean = ed_str.split(" ")[0][:10]
+                        ed_dt = datetime.strptime(ed_clean, "%Y-%m-%d").date()
+                        days_diff = (ed_dt - today).days
+                        
+                        if 0 <= days_diff <= 3:
+                            decision = "VETO"
+                            confidence = 0.95
+                            reasons.append(
+                                f"Upcoming earnings event on {ed_clean} ({days_diff} days away) represents excessive event risk — trade vetoed"
+                            )
+                            break
+                        elif -1 <= days_diff < 0:
+                            decision = "VETO"
+                            confidence = 0.95
+                            reasons.append(
+                                f"Recent earnings event on {ed_clean} (under 1 day ago) represents post-earnings volatility risk — trade vetoed"
+                            )
+                            break
+                    except Exception as parse_err:
+                        logger.warning(f"Error parsing earnings date '{ed_str}': {parse_err}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch corporate events for risk checking: {e}")
 
         # --------------------------------------------------------
         # KELLY CRITERION  (real calculation from trade history)

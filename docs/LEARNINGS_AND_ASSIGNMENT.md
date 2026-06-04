@@ -421,37 +421,42 @@ Write `test.html` with a `<script>` that opens `ws://localhost:8000/ws/live/RELI
 
 ---
 
-## Day 10 — AI Tools: Give Agents Real Data Sources
+## Day 10 — AI Tools & Alerts: Real-Time News, Corporate Events, and Telegram HITL
 
-**What you build**: 4 real tool functions that agents can call to get live market information.
+**What you build**: Implement 5 real tool functions including live market indicators, real-time news scraping, corporate events checks, and a Telegram Bot HITL notification webhook.
 
-**Why this matters**: An agent without tools is like a trader who can only look at price charts — blind to news, macro events, and institutional flows.
+**Why this matters**: Real-time news and upcoming corporate events prevent technical signals from walking into event-risk traps. A mobile Telegram bot allows you to approve or veto trades from your phone on the go without sitting at your terminal all day.
 
 ### Task
 Create `practice/phase4/day10/tools/`:
 
 **Tool 1 — `get_live_price(symbol) → float`**:
-- Try `yfinance.Ticker(f"{symbol}.NS").fast_info.last_price`
+- Try `yfinance.Ticker(f"{symbol}.NS").fast_info.last_price` or live broker LTP
 - Return `0.0` on failure, log the error
 
 **Tool 2 — `get_india_vix() → float`**:
 - Fetch `yfinance.Ticker("^INDIAVIX").fast_info.last_price`
 - Used by agents: if VIX > 20, market is fearful → reduce position sizes
 
-**Tool 3 — `get_real_news(symbol, max_articles=10) → list[dict]`**:
-- Use the `NewsAPI` free tier (register at newsapi.org, get free key)
-- Endpoint: `https://newsapi.org/v2/everything?q={symbol}&language=en&sortBy=publishedAt`
-- Return: `[{title, published_at, source, url}]`
+**Tool 3 — `get_realtime_ticker_news(symbol) → list[dict]`**:
+- Fetch news for symbol via yfinance or NewsAPI.
+- Return `[{title, source, link, published}]`
 - Cache in Redis for 5 minutes: key = `"news:{symbol}"`
 
-**Tool 4 — `get_nse_market_status() → dict`**:
-- Check if current IST time is between 09:15 and 15:30 on weekdays
-- Return `{is_open: bool, session: "pre-market"|"market"|"after-hours", time_to_open_minutes: int}`
+**Tool 4 — `get_upcoming_corporate_events(symbol) → dict`**:
+- Fetch upcoming calendar via `yfinance.Ticker(symbol).calendar`.
+- Returns key events like upcoming earnings dates to trigger risk vetoes.
+
+**Tool 5 — `send_telegram_alert(run_id, proposal) → dict`**:
+- Send formatted HTML trade proposal messages with Inline Keyboard buttons `Approve` and `Reject` to the user's phone via `https://api.telegram.org/bot<TOKEN>/sendMessage`.
+
+**Tool 6 — `telegram_webhook_receiver`**:
+- Build a FastAPI route that listens for Telegram's callback query POST requests, extracts `action` and `run_id`, and resumes the LangGraph agent state.
 
 **Testing your tools**:
 ```python
 import asyncio
-asyncio.run(main())   # call each tool and print results
+asyncio.run(main())   # call each tool, send a mock telegram button message, and print results
 ```
 
 ---

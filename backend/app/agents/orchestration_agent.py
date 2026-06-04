@@ -44,10 +44,11 @@ from app.db.redis import redis_client, CHANNEL_AGENT_RESULTS, CHANNEL_HITL_PENDI
 # The orchestrator now reads from Redis via get_agent_weights()
 # so these are just the initial fallback.
 DEFAULT_AGENT_WEIGHTS = {
-    "SignalAgent":    0.30,
-    "SentimentAgent": 0.20,
-    "RiskAgent":      0.25,
-    "PortfolioAgent": 0.25,
+    "SignalAgent":    0.25,
+    "SentimentAgent": 0.15,
+    "RiskAgent":      0.20,
+    "PortfolioAgent": 0.20,
+    "MacroAgent":     0.20,
 }
 
 
@@ -123,6 +124,7 @@ async def orchestrator_node(state: AgentState) -> dict:
                 state.get("sentiment_vote"),
                 state.get("risk_vote"),
                 state.get("portfolio_vote"),
+                state.get("macro_vote"),
             ]
             if v is not None
         ]
@@ -180,10 +182,11 @@ async def orchestrator_node(state: AgentState) -> dict:
         # WEIGHTED CONSENSUS SCORING
         # --------------------------------------------------------
 
-        buy_score  = 0.0
-        sell_score = 0.0
-        active_wt  = 0.0
-        hold_wt    = 0.0
+        buy_score      = 0.0
+        sell_score     = 0.0
+        hold_conf_wt   = 0.0   # weighted sum of HOLD agent confidences
+        active_wt      = 0.0
+        hold_wt        = 0.0
 
         for vote in votes:
             wt = agent_weights.get(vote.agent, 0.2)
@@ -193,8 +196,9 @@ async def orchestrator_node(state: AgentState) -> dict:
                     buy_score  += wt * vote.confidence
                 elif vote.decision == "SELL":
                     sell_score += wt * vote.confidence
-            else:
-                hold_wt += wt
+            else:  # HOLD
+                hold_wt      += wt
+                hold_conf_wt += wt * vote.confidence
 
         total_wt = active_wt + 0.25 * hold_wt
 
@@ -202,28 +206,41 @@ async def orchestrator_node(state: AgentState) -> dict:
             buy_score  /= total_wt
             sell_score /= total_wt
 
+        # Weighted average confidence of all HOLD-voting agents
+        hold_confidence = (hold_conf_wt / hold_wt) if hold_wt > 0 else 0.5
+
         disagreement = _calculate_disagreement(votes)
 
         # --------------------------------------------------------
         # FINAL DECISION
         # --------------------------------------------------------
 
-        # Threshold of 0.55: a signal must be reasonably strong
-        # before we act. Weak signals produce too many bad trades.
+        # Fetch adaptive decision threshold from Redis (updated by CalibrationAgent nightly)
+        # Defaults to 0.55 if not configured or on failure
+        threshold = 0.55
+        try:
+            raw_threshold = await redis_client.get("futureedge:decision_threshold")
+            if raw_threshold:
+                threshold = float(raw_threshold)
+        except Exception as e:
+            logger.warning(f"Could not read decision threshold from Redis: {e}")
 
-        if buy_score > 0.55 and buy_score > sell_score:
+        logger.info(f"Orchestrator: using consensus decision threshold = {threshold:.2f}")
+
+        if buy_score > threshold and buy_score > sell_score:
             direction  = "LONG"
             confidence = buy_score
             decision   = "BUY"
 
-        elif sell_score > 0.55 and sell_score > buy_score:
+        elif sell_score > threshold and sell_score > buy_score:
             direction  = "SHORT"
             confidence = sell_score
             decision   = "SELL"
 
         else:
             direction  = "NONE"
-            confidence = max(buy_score, sell_score)
+            # Use the actual HOLD consensus confidence, not 0.0 from BUY/SELL scores
+            confidence = hold_confidence if hold_wt > 0 else max(buy_score, sell_score)
             decision   = "HOLD"
 
         # --------------------------------------------------------

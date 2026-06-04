@@ -99,6 +99,8 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
   // Effect to parse success callback and poll status
   useEffect(() => {
+    if (isLoading) return;
+
     if (typeof window !== "undefined") {
       const params = new URLSearchParams(window.location.search);
       if (params.get("zerodha") === "success") {
@@ -121,7 +123,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
     }
     const interval = setInterval(checkZerodhaStatus, 30_000);
     return () => clearInterval(interval);
-  }, [setPaperTrade]);
+  }, [isLoading, setPaperTrade]);
 
   // Start WebSocket + sync kill switch state
   useWebSocket();

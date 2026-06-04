@@ -146,8 +146,9 @@ def _compute_indicators(candles: list[dict]) -> dict:
         return _empty_indicators(candles)
 
     # Extract closing prices as a pandas Series
-    # pandas makes rolling calculations easy
     closes = pd.Series([c["close"] for c in candles], dtype=float)
+    ema_9 = closes.ewm(span=9, adjust=False).mean()
+    ema_21 = closes.ewm(span=21, adjust=False).mean()
 
     return {
         "rsi":              _calc_rsi(closes),
@@ -157,6 +158,9 @@ def _compute_indicators(candles: list[dict]) -> dict:
         "bollinger_upper":  _calc_bollinger(closes)[0],
         "bollinger_middle": _calc_bollinger(closes)[1],
         "bollinger_lower":  _calc_bollinger(closes)[2],
+        "ema_9":            round(float(ema_9.iloc[-1]), 2),
+        "ema_21":           round(float(ema_21.iloc[-1]), 2),
+        "vwap":             _calc_vwap(candles),
         "current_price":    float(closes.iloc[-1]),
     }
 
@@ -174,8 +178,46 @@ def _empty_indicators(candles: list[dict]) -> dict:
         "bollinger_upper":  last_price * 1.02,
         "bollinger_middle": last_price,
         "bollinger_lower":  last_price * 0.98,
+        "ema_9":            last_price,
+        "ema_21":           last_price,
+        "vwap":             last_price,
         "current_price":    last_price,
     }
+
+
+def _calc_vwap(candles: list[dict]) -> float:
+    """
+    Calculate VWAP from the candles.
+    Cumulative since start of day if multiple days exist.
+    """
+    if not candles:
+        return 0.0
+        
+    try:
+        df = pd.DataFrame(candles)
+        for col in ["high", "low", "close", "volume"]:
+            df[col] = df[col].astype(float)
+            
+        # Extract date part of timestamp to partition sessions
+        df['date'] = df['timestamp'].apply(lambda x: x.split('T')[0] if isinstance(x, str) and 'T' in x else (x.split(' ')[0] if isinstance(x, str) else str(x)))
+        last_date = df['date'].iloc[-1]
+        today_df = df[df['date'] == last_date].copy()
+        
+        if not today_df.empty and today_df['volume'].sum() > 0:
+            tp = (today_df['high'] + today_df['low'] + today_df['close']) / 3.0
+            vwap = (tp * today_df['volume']).sum() / today_df['volume'].sum()
+        else:
+            tp = (df['high'] + df['low'] + df['close']) / 3.0
+            rolling_tp_vol = (tp * df['volume']).rolling(window=min(60, len(df))).sum()
+            rolling_vol = df['volume'].rolling(window=min(60, len(df))).sum()
+            rolling_vol = rolling_vol.replace(0, 1.0)
+            vwap = (rolling_tp_vol / rolling_vol).iloc[-1]
+            
+        return round(float(vwap), 2)
+    except Exception as e:
+        logger.error(f"Error calculating VWAP: {e}")
+        return float(candles[-1]["close"]) if candles else 0.0
+
 
 
 # --------------------------------------------------------

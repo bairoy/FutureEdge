@@ -83,10 +83,10 @@ export function HITLModal() {
 
       // Update the global runResult state so the dashboard updates
       if (runResult && runResult.thread_id === threadId) {
-        const updatedSummary = data.executed_trade ? {
+        const updatedSummary = (data.executed_trade && runResult.execution_summary) ? {
           ...runResult.execution_summary,
-          shares_requested: data.executed_trade.quantity,
-          position_rupees: data.executed_trade.fill_price * data.executed_trade.quantity,
+          shares_requested: data.executed_trade.quantity as number,
+          position_rupees: (data.executed_trade.fill_price * data.executed_trade.quantity) as number,
         } : runResult.execution_summary;
 
         setRunResult({

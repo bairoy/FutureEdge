@@ -75,6 +75,7 @@ from app.api.routes.zerodha_router import router as zerodha_router
 from app.api.routes.trades_router       import router as trades_router
 from app.api.routes.backtest_router import router as backtest_router
 from app.api.routes.instruments_router import router as instruments_router
+from app.api.routes.telegram_router import router as telegram_router
 from app.core.logging import setup_logging
 
 # Initialize structured logging
@@ -146,6 +147,7 @@ app.include_router(zerodha_router)
 app.include_router(trades_router)       # /api/v1/trades
 app.include_router(backtest_router)
 app.include_router(instruments_router)  # /api/v1/instruments/search
+app.include_router(telegram_router)
 
 
 

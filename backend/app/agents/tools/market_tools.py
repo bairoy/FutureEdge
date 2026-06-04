@@ -119,3 +119,52 @@ async def get_instrument_details(symbol: str) -> dict:
         "token": token or "MOCK_TOKEN",
         "lot_size": 1,
     }
+
+
+async def get_india_vix() -> float:
+    """
+    Fetch the latest India VIX (fear index) from yfinance.
+    """
+    try:
+        import asyncio
+        loop = asyncio.get_running_loop()
+        import yfinance as yf
+        ticker = yf.Ticker("^INDIAVIX")
+        price = await loop.run_in_executor(None, lambda: ticker.fast_info.last_price)
+        logger.info(f"Tool: get_india_vix = {price}")
+        return round(float(price), 2)
+    except Exception as e:
+        logger.error(f"Failed to fetch India VIX: {e} — defaulting to 15.0")
+        return 15.0
+
+
+async def get_usd_inr() -> dict:
+    """
+    Fetch USD/INR rate and daily percent change.
+    """
+    try:
+        import asyncio
+        loop = asyncio.get_running_loop()
+        import yfinance as yf
+        ticker = yf.Ticker("USDINR=X")
+        
+        def _fetch_usd():
+            info = ticker.fast_info
+            price = info.last_price
+            prev_close = info.previous_close
+            change_pct = ((price - prev_close) / prev_close) * 100.0 if prev_close else 0.0
+            return price, change_pct
+            
+        price, change_pct = await loop.run_in_executor(None, _fetch_usd)
+        logger.info(f"Tool: get_usd_inr = {price} ({change_pct:+.2f}%)")
+        return {
+            "rate": round(float(price), 4),
+            "change_pct": round(float(change_pct), 2)
+        }
+    except Exception as e:
+        logger.error(f"Failed to fetch USD/INR: {e} — defaulting to neutral")
+        return {
+            "rate": 83.50,
+            "change_pct": 0.0
+        }
+
