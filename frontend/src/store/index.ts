@@ -17,7 +17,7 @@
 
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
-import type { UserProfile, AgentVote, EpisodicMemory, KillSwitchStatus } from "@/types";
+import type { UserProfile, AgentVote, EpisodicMemory, KillSwitchStatus, WorkflowRunResponse } from "@/types";
 
 // ─── TYPES ───────────────────────────────────────────────────
 
@@ -95,7 +95,7 @@ interface TradingState {
   hitlPending: HITLPending | null;
   killSwitch: KillSwitchStatus;
   currentSymbol: string;
-  paperTrade: boolean;
+  runResult: WorkflowRunResponse | null;
 
   addTick: (tick: TickPoint) => void;
   setTicks: (ticks: TickPoint[]) => void;
@@ -105,6 +105,7 @@ interface TradingState {
   setKillSwitch: (s: KillSwitchStatus) => void;
   setCurrentSymbol: (s: string) => void;
   setPaperTrade: (val: boolean) => void;
+  setRunResult: (res: WorkflowRunResponse | null) => void;
 }
 
 export const useTradingStore = create<TradingState>((set) => ({
@@ -117,6 +118,7 @@ export const useTradingStore = create<TradingState>((set) => ({
   killSwitch: { halted: false, status: "ACTIVE" },
   currentSymbol: "NIFTY 50",
   paperTrade: true, // Default to true
+  runResult: null,
 
   // Keep only last 500 ticks so memory stays bounded
   addTick: (tick) =>
@@ -133,4 +135,5 @@ export const useTradingStore = create<TradingState>((set) => ({
   setKillSwitch: (killSwitch) => set({ killSwitch }),
   setCurrentSymbol: (currentSymbol) => set({ currentSymbol }),
   setPaperTrade: (paperTrade) => set({ paperTrade }),
+  setRunResult: (runResult) => set({ runResult }),
 }));

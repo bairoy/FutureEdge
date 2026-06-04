@@ -41,14 +41,14 @@ export default function DashboardPage() {
   const {
     ticks, latestVotes, latestDirection,
     latestRiskScore, llmRationale, killSwitch, currentSymbol,
-    setAgentResult, setHITLPending
+    setAgentResult, setHITLPending, runResult, setRunResult
   } = useTradingStore();
 
   const { canTrade } = useAuthStore();
 
   const [running, setRunning] = useState(false);
-  const [runResult, setRunResult] = useState<WorkflowRunResponse | null>(null);
-  const [useMockPortfolio, setUseMockPortfolio] = useState(false);
+
+
   const paperTrade = useTradingStore((s) => s.paperTrade);
   const [tradeConfig, setTradeConfig] = useState<{
     quantity: number | null;
@@ -77,7 +77,7 @@ export default function DashboardPage() {
   }, [currentSymbol, setTicks]);
 
   // Trade history for the PnL chart — refreshes every 30 seconds
-  const { data: trades } = useSWR<Trade[]>(
+  const { data: trades, mutate: mutateTrades } = useSWR<Trade[]>(
     "/api/v1/trades",
     fetcher,
     { refreshInterval: 30_000 }
@@ -94,6 +94,7 @@ export default function DashboardPage() {
       unrealized_pnl: number;
     };
     positions: Array<{
+      trade_id?: string;
       symbol: string;
       quantity: number;
       avg_price: number;
@@ -103,11 +104,27 @@ export default function DashboardPage() {
   }
 
   // Fetch broker portfolio details — refreshes every 10 seconds
-  const { data: portfolio } = useSWR<BrokerPortfolio>(
-    `/api/v1/broker/portfolio?paper=${paperTrade}${useMockPortfolio ? "&mock=true" : ""}`,
+  const { data: portfolio, mutate: mutatePortfolio } = useSWR<BrokerPortfolio>(
+    `/api/v1/broker/portfolio?paper=${paperTrade}`,
     fetcher,
     { refreshInterval: 10_000 }
   );
+
+  const [exitingTradeIds, setExitingTradeIds] = useState<string[]>([]);
+
+  async function handleExitPosition(tradeId: string) {
+    setExitingTradeIds((prev) => [...prev, tradeId]);
+    try {
+      await api.post(`/api/v1/trades/${tradeId}/close`);
+      showToast("Position exited successfully", "success");
+      mutateTrades();
+      mutatePortfolio();
+    } catch (err: any) {
+      showToast(err?.response?.data?.detail ?? "Failed to exit position", "error");
+    } finally {
+      setExitingTradeIds((prev) => prev.filter((id) => id !== tradeId));
+    }
+  }
 
   // ── Run a new agent cycle ──────────────────────────────────
   async function handleRun() {
@@ -117,7 +134,7 @@ export default function DashboardPage() {
     try {
       const { data } = await api.post<WorkflowRunResponse>("/api/v1/workflow/run", {
         symbol: currentSymbol,
-        use_live_data: !useMockPortfolio,
+        use_live_data: true,
         quantity: tradeConfig.quantity,
         position_rupees: tradeConfig.positionRupees,
         override_kelly: tradeConfig.overrideKelly,
@@ -203,12 +220,13 @@ export default function DashboardPage() {
         )}
       </div>
 
-      {/* ── Run result banner ───────────────────────────────── */}
       {runResult && (
         <div className={`p-4 rounded-2xl border text-sm animate-slide-up flex flex-col gap-3
           ${runResult.hitl_status === "PENDING"
             ? "bg-amber-500/10 border-amber-500/30 text-amber-300"
-            : "bg-green-500/10 border-green-500/30 text-green-300"
+            : runResult.hitl_status === "REJECTED"
+              ? "bg-red-500/10 border-red-500/30 text-red-400"
+              : "bg-green-500/10 border-green-500/30 text-green-300"
           }`}>
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-2.5 font-medium">
@@ -216,7 +234,9 @@ export default function DashboardPage() {
               <div>
                 {runResult.hitl_status === "PENDING"
                   ? "⏸ Paused — awaiting HITL approval"
-                  : `✓ ${runResult.direction} | Risk Score: ${runResult.risk_score?.toFixed(2)}`
+                  : runResult.hitl_status === "REJECTED"
+                    ? "✗ Trade Rejected by Risk Manager"
+                    : `✓ ${runResult.direction} | Approved & Executed | Risk Score: ${runResult.risk_score?.toFixed(2)}`
                 }
                 <p className="text-[10px] opacity-60 mt-0.5 uppercase tracking-wider">thread: {runResult.thread_id}</p>
               </div>
@@ -357,17 +377,7 @@ export default function DashboardPage() {
                   </span>
                 )}
               </div>
-              <button
-                onClick={() => setUseMockPortfolio(!useMockPortfolio)}
-                className={`text-[10px] px-2 py-0.5 rounded font-medium transition-all border ${
-                  useMockPortfolio 
-                    ? "bg-blue-600/15 border-blue-500/30 text-blue-400 hover:bg-blue-600/25" 
-                    : "bg-gray-800/40 border-gray-700/60 text-gray-400 hover:bg-gray-800"
-                }`}
-                title="Toggle between real broker data and simulated mock data"
-              >
-                {useMockPortfolio ? "Real Broker" : "Test Mock"}
-              </button>
+
             </div>
             {portfolio ? (
               <div className="space-y-3.5">
@@ -430,6 +440,7 @@ export default function DashboardPage() {
                     <th className="py-2 font-medium">Quantity</th>
                     <th className="py-2 font-medium">Avg Price</th>
                     <th className="py-2 font-medium text-right">P&L</th>
+                    <th className="py-2 font-medium text-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-800/40">
@@ -446,6 +457,19 @@ export default function DashboardPage() {
                         <td className="py-2.5 text-gray-300">₹{pos.avg_price.toLocaleString("en-IN", { maximumFractionDigits: 2 })}</td>
                         <td className={`py-2.5 text-right font-bold ${pos.pnl >= 0 ? "text-green-400" : "text-red-400"}`}>
                           {pos.pnl >= 0 ? "+" : ""}₹{pos.pnl.toLocaleString("en-IN", { maximumFractionDigits: 2 })}
+                        </td>
+                        <td className="py-2.5 text-right">
+                          {pos.trade_id ? (
+                            <button
+                              onClick={() => handleExitPosition(pos.trade_id!)}
+                              disabled={exitingTradeIds.includes(pos.trade_id)}
+                              className="px-2.5 py-1 text-xs font-semibold text-red-400 hover:text-red-300 bg-red-500/10 hover:bg-red-500/20 rounded-md border border-red-500/20 hover:border-red-500/30 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                              {exitingTradeIds.includes(pos.trade_id) ? "Exiting..." : "Exit"}
+                            </button>
+                          ) : (
+                            <span className="text-gray-600">—</span>
+                          )}
                         </td>
                       </tr>
                     );

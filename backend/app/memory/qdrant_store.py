@@ -254,9 +254,9 @@ async def retrieve_similar_memories(
         # when we are trading NIFTY 50)
         from qdrant_client.models import Filter, FieldCondition, MatchValue
 
-        results = client.search(
+        results = client.query_points(
             collection_name = settings.QDRANT_COLLECTION,
-            query_vector    = vector,
+            query           = vector,
             query_filter    = Filter(
                 must=[
                     FieldCondition(
@@ -270,7 +270,7 @@ async def retrieve_similar_memories(
         )
 
         memories = []
-        for hit in results:
+        for hit in results.points:
             payload = hit.payload or {}
             memories.append({
                 "symbol":      payload.get("symbol", ""),

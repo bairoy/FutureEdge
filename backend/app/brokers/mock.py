@@ -65,10 +65,10 @@ class MockBroker(BrokerBase):
         return [
             {
                 "symbol":    "RELIANCE",
-                "quantity":  50,
+                "quantity":  5,
                 "avg_price": 2450.0,
-                "pnl":       3500.0,
-                "notional":  122500.0,
+                "pnl":       350.0,
+                "notional":  12250.0,
             },
             {
                 "symbol":    "INFY",
@@ -125,6 +125,27 @@ class MockBroker(BrokerBase):
         return True
 
     async def get_ltp(self, symbol: str) -> float:
-        # Return a fake price
-        logger.debug(f"🤖 MockBroker | LTP requested for {symbol} → 100.0")
+        # Try to get live price from Redis stream or yfinance fallback
+        try:
+            from app.data.feed import get_latest_tick
+            tick = await get_latest_tick(symbol)
+            if tick and tick.get("ltp", 0.0) > 0:
+                logger.debug(f"🤖 MockBroker | LTP for {symbol} from Redis → {tick['ltp']}")
+                return float(tick["ltp"])
+        except Exception:
+            pass
+
+        try:
+            from app.data.feed import get_current_price_yfinance
+            import asyncio
+            loop = asyncio.get_running_loop()
+            price = await loop.run_in_executor(None, get_current_price_yfinance, symbol)
+            if price > 0:
+                logger.debug(f"🤖 MockBroker | LTP for {symbol} from yfinance → {price}")
+                return float(price)
+        except Exception as e:
+            logger.warning(f"MockBroker failed to fetch yfinance price for {symbol}: {e}")
+
+        # Final fallback
+        logger.debug(f"🤖 MockBroker | LTP fallback for {symbol} → 100.0")
         return 100.0

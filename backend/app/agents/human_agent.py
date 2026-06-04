@@ -168,13 +168,14 @@ async def human_review_node(state: AgentState) -> dict:
     decision: str = human_response.get("decision", "REJECT").upper()
     notes:    str = human_response.get("notes", "")
     quantity: int | None = human_response.get("quantity")
+    position_rupees: float | None = human_response.get("position_rupees")
 
     # --------------------------------------------------------
     # APPLY DECISION
     # --------------------------------------------------------
 
     if decision == "APPROVE":
-        return _approve(proposal, run_id, notes, quantity)
+        return _approve(proposal, run_id, notes, quantity, position_rupees)
 
     return await _reject(proposal, run_id, user_id, reason=notes or "Rejected by human")
 
@@ -188,12 +189,13 @@ def _approve(
     run_id:   str,
     notes:    str,
     quantity: int | None = None,
+    position_rupees: float | None = None,
 ) -> dict:
 
     proposal.human_approved = True
     proposal.human_notes    = notes
 
-    logger.info(f"✅ HUMAN APPROVED     | run_id={run_id} | quantity={quantity}")
+    logger.info(f"✅ HUMAN APPROVED     | run_id={run_id} | quantity={quantity} | rupees={position_rupees}")
 
     res = {
         "consensus":       proposal,
@@ -206,6 +208,9 @@ def _approve(
     if quantity is not None:
         res["user_override_quantity"] = quantity
         res["logs"].append(f"User selected trade quantity: {quantity} shares")
+    if position_rupees is not None:
+        res["user_override_rupees"] = position_rupees
+        res["logs"].append(f"User selected position rupees: ₹{position_rupees}")
     return res
 
 

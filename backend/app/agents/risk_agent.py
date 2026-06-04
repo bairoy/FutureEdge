@@ -181,22 +181,26 @@ async def risk_agent_node(state: AgentState) -> dict:
         is_open = is_market_open()
         metadata["market_open"] = is_open
 
-        if settings.ACTIVE_BROKER.lower() != "mock" and not is_open:
-            decision = "VETO"
-            confidence = 1.0
-            reasons.append("Market is closed (NSE hours: 9:15 AM - 3:30 PM IST)")
-        
-        if is_open:
-            now_ist = datetime.now(pytz.timezone("Asia/Kolkata"))
-            if now_ist.hour == 15:  # 3:00 PM - 3:59 PM IST
-                reasons.append("Late-day time risk: trading close to market end (3:00 PM+)")
-                if now_ist.minute >= 15:  # 3:15 PM onwards
-                    decision = "VETO"
-                    confidence = 0.95
-                    reasons.append("Veto: late-day trading prohibited after 3:15 PM IST")
-                else:
-                    if decision == "HOLD":
-                        confidence = min(confidence, 0.5)
+        is_paper = state.get("paper_trade", True)
+
+        # In paper trading, everything should be mock (unrestricted by live NSE hours/time limits)
+        if not is_paper:
+            if settings.ACTIVE_BROKER.lower() != "mock" and not is_open:
+                decision = "VETO"
+                confidence = 1.0
+                reasons.append("Market is closed (NSE hours: 9:15 AM - 3:30 PM IST)")
+            
+            if is_open:
+                now_ist = datetime.now(pytz.timezone("Asia/Kolkata"))
+                if now_ist.hour == 15:  # 3:00 PM - 3:59 PM IST
+                    reasons.append("Late-day time risk: trading close to market end (3:00 PM+)")
+                    if now_ist.minute >= 15:  # 3:15 PM onwards
+                        decision = "VETO"
+                        confidence = 0.95
+                        reasons.append("Veto: late-day trading prohibited after 3:15 PM IST")
+                    else:
+                        if decision == "HOLD":
+                            confidence = min(confidence, 0.5)
 
         # --------------------------------------------------------
         # KELLY CRITERION  (real calculation from trade history)

@@ -61,7 +61,7 @@ class HITLResumeRequest(BaseModel):
 
 @router.post(
     "/workflow/run",
-    dependencies=[Depends(rate_limit(limit=1, window_seconds=30))],
+    dependencies=[Depends(rate_limit(limit=5, window_seconds=30))],
     summary="Start a new agent workflow cycle",
 )
 async def run_workflow(
@@ -109,7 +109,22 @@ async def run_workflow(
 
     # Fetch portfolio from broker dynamically
     portfolio = None
-    if request.use_live_data:
+    if request.paper_trade:
+        try:
+            from app.brokers.paper import calculate_paper_portfolio_data
+            paper_data = await calculate_paper_portfolio_data(db, current_user.id)
+            acc = paper_data.get("account", {})
+            portfolio = PortfolioSnapshot(
+                total_equity     = float(acc.get("total_equity", 1000000.0)),
+                margin_used      = float(acc.get("margin_used", 0.0)),
+                margin_available = float(acc.get("margin_available", 1000000.0)),
+                unrealized_pnl   = float(acc.get("unrealized_pnl", 0.0)),
+                open_positions   = paper_data.get("positions", []),
+            )
+            logger.info(f"Loaded paper portfolio: equity={portfolio.total_equity}, available={portfolio.margin_available}")
+        except Exception as pe:
+            logger.warning(f"Failed to fetch paper portfolio details: {pe}")
+    elif request.use_live_data:
         try:
             from app.brokers.base import get_broker
             broker = get_broker()
@@ -142,10 +157,10 @@ async def run_workflow(
             open_positions   = [
                 {
                     "symbol":    "RELIANCE",
-                    "quantity":  50,
+                    "quantity":  5,
                     "avg_price": 2450.0,
-                    "pnl":       3500.0,
-                    "notional":  122500.0,
+                    "pnl":       350.0,
+                    "notional":  12250.0,
                 },
                 {
                     "symbol":    "INFY",

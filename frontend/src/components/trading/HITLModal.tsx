@@ -43,7 +43,7 @@ import api from "@/lib/api";
 import type { AgentVote, EpisodicMemory } from "@/types";
 
 export function HITLModal() {
-  const { hitlPending, setHITLPending } = useTradingStore();
+  const { hitlPending, setHITLPending, runResult, setRunResult } = useTradingStore();
   const { canApproveHITL, canTrade } = useAuthStore();
 
   const [notes, setNotes] = useState("");
@@ -74,12 +74,29 @@ export function HITLModal() {
     setSubmitting(true);
 
     try {
-      await api.post("/api/v1/workflow/resume", {
+      const { data } = await api.post("/api/v1/workflow/resume", {
         thread_id: threadId,
         decision,
         notes,
         quantity: decision === "APPROVE" ? Number(quantity) : undefined,
       });
+
+      // Update the global runResult state so the dashboard updates
+      if (runResult && runResult.thread_id === threadId) {
+        const updatedSummary = data.executed_trade ? {
+          ...runResult.execution_summary,
+          shares_requested: data.executed_trade.quantity,
+          position_rupees: data.executed_trade.fill_price * data.executed_trade.quantity,
+        } : runResult.execution_summary;
+
+        setRunResult({
+          ...runResult,
+          hitl_status: decision === "APPROVE" ? "APPROVED" : "REJECTED",
+          execution_error: data.execution_error,
+          execution_summary: updatedSummary,
+        });
+      }
+
       showToast(
         decision === "APPROVE" 
           ? (isRisky ? "Trade approved — executing order" : "Trade submitted — executing order")

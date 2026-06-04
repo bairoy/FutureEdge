@@ -270,6 +270,13 @@ def _load_historical_candles_from_yfinance(
         ticker = yf.Ticker(yf_symbol)
         df = ticker.history(period=period, interval=interval)
 
+        # Retry with a 5d period if the shorter period returns empty (often happens due to rate limiting or session boundaries)
+        if df.empty and period != "5d":
+            logger.warning(f"yfinance returned no data for {yf_symbol} with period={period}. Retrying with period=5d...")
+            import time
+            time.sleep(1.0)
+            df = ticker.history(period="5d", interval=interval)
+
         if df.empty:
             logger.warning(f"yfinance returned no data for {yf_symbol}")
             return []

@@ -261,17 +261,8 @@ async def orchestrator_node(state: AgentState) -> dict:
         hitl_reasons  = []
 
         if direction != "NONE":
-            if risk_score > 0.70:
-                hitl_required = True
-                hitl_reasons.append(f"High risk score: {risk_score:.2f}")
-
-            if disagreement > 0.40:
-                hitl_required = True
-                hitl_reasons.append(f"High agent disagreement: {disagreement:.2f}")
-
-            if position_rupees > (portfolio.total_equity * 0.05):
-                hitl_required = True
-                hitl_reasons.append(f"Large position: ₹{position_rupees:.2f}")
+            hitl_required = True
+            hitl_reasons.append(f"Human-in-the-Loop verification required for {direction} proposal.")
 
         # --------------------------------------------------------
         # EPISODIC MEMORY: RETRIEVE SIMILAR PAST TRADES (Phase 2 — new)

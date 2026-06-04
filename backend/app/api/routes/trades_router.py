@@ -101,6 +101,119 @@ async def get_trade(
 
 
 # ============================================================
+# CLOSE/EXIT TRADE
+# ============================================================
+
+@router.post("/trades/{trade_id}/close", summary="Manually exit/close an open trade")
+async def close_trade_endpoint(
+    trade_id:     str,
+    current_user: User = Depends(require_viewer),
+    db:           AsyncSession = Depends(get_db),
+):
+    """
+    Manually close an open position/trade.
+    Fetches the current LTP, places a counter-order via the broker,
+    and updates the trade record to CLOSED.
+    """
+    # 1. Fetch the trade
+    result = await db.execute(select(Trade).where(Trade.id == trade_id))
+    trade  = result.scalar_one_or_none()
+
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    if current_user.role != "admin" and trade.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    if trade.status != "OPEN":
+        raise HTTPException(status_code=400, detail="Only OPEN trades can be closed")
+
+    # 2. Get current price
+    from app.brokers.base import get_broker
+    if trade.broker == "paper":
+        from app.brokers.mock import MockBroker
+        broker = MockBroker()
+    else:
+        broker = get_broker()
+
+    try:
+        current_price = await broker.get_ltp(trade.symbol)
+    except Exception:
+        try:
+            from app.data.feed import get_current_price_yfinance
+            import asyncio
+            loop = asyncio.get_running_loop()
+            current_price = await loop.run_in_executor(
+                None, get_current_price_yfinance, trade.symbol
+            )
+        except Exception:
+            current_price = trade.entry_price
+
+    if current_price <= 0:
+        current_price = trade.entry_price
+
+    # 3. Place counter-order via broker (opposite direction)
+    actual_exit = current_price
+    if trade.quantity > 0:
+        try:
+            exit_direction = "SHORT" if trade.direction == "LONG" else "LONG"
+            price_buffer = current_price * 0.0005
+            limit_price = round(current_price - price_buffer if exit_direction == "SHORT" else current_price + price_buffer, 2)
+
+            order_result = await broker.place_order(
+                symbol=trade.symbol,
+                direction=exit_direction,
+                quantity=float(trade.quantity),
+                order_type="LIMIT",
+                price=limit_price,
+            )
+            if order_result.success:
+                actual_exit = order_result.fill_price or current_price
+        except Exception as e:
+            from loguru import logger
+            logger.error(f"Manual exit broker order failed for trade {trade.id}: {e}")
+
+    # 4. Close trade in database
+    from app.db.repos.trade_repo import TradeRepo
+    closed_trade = await TradeRepo.close_trade(
+        session=db,
+        trade_id=trade.id,
+        user_id=trade.user_id,
+        exit_price=actual_exit,
+    )
+
+    if not closed_trade:
+        raise HTTPException(status_code=500, detail="Failed to close trade record")
+
+    # 5. Publish Redis event
+    from app.db.redis import redis_client, CHANNEL_TRADE_EXECUTED
+    import json
+    try:
+        await redis_client.publish(
+            CHANNEL_TRADE_EXECUTED,
+            json.dumps({
+                "event":     "TRADE_CLOSED",
+                "reason":    "MANUAL_EXIT",
+                "trade_id":  trade.id,
+                "user_id":   trade.user_id,
+                "symbol":    trade.symbol,
+                "direction": trade.direction,
+                "entry":     trade.entry_price,
+                "exit":      actual_exit,
+                "pnl":       closed_trade.realized_pnl,
+                "pnl_pct":   closed_trade.pnl_pct,
+            }),
+        )
+    except Exception:
+        pass
+
+    return {
+        "success": True,
+        "trade": _serialize(closed_trade)
+    }
+
+
+# ============================================================
 # SERIALIZER
 # ============================================================
 

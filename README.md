@@ -88,7 +88,8 @@ futureedge/                          ← project root
 
 ## 📚 Architectural & Quantitative Concepts
 
-To understand the core design choices, mathematics, database mappings, and patterns of this system, refer to the [CONCEPTS.md](file:///Users/baijuyadav/Desktop/futureedge/docs/CONCEPTS.md) guide.
+* **System Design & Core Math**: Refer to the [CONCEPTS.md](file:///Users/baijuyadav/Desktop/futureedge/docs/CONCEPTS.md) guide for details on design choices, database schemas, and math formulations.
+* **Practice Challenges**: Want to implement these patterns yourself? Check out [CHALLENGES.md](file:///Users/baijuyadav/Desktop/futureedge/docs/CHALLENGES.md) for coding challenges, templates, and senior engineer interview questions.
 
 ---
 
