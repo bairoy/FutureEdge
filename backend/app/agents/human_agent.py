@@ -50,6 +50,10 @@ def should_human_review(state: AgentState) -> str:
     if not proposal or proposal.direction == "NONE":
         return "execute"
 
+    # For exits, always require human review as requested by the user
+    if proposal.direction == "CLOSE":
+        return "human_review"
+
     # If the trade is flagged as risky (hitl_required is True), it must go to human review
     if state.get("hitl_required"):
         return "human_review"
@@ -175,6 +179,22 @@ async def human_review_node(state: AgentState) -> dict:
     notes:    str = human_response.get("notes", "")
     quantity: int | None = human_response.get("quantity")
     position_rupees: float | None = human_response.get("position_rupees")
+
+    # Clear the frontend HITL pending modal and update status
+    from app.db.redis import redis_client, CHANNEL_HITL_PENDING
+    import json
+    try:
+        await redis_client.publish(
+            CHANNEL_HITL_PENDING,
+            json.dumps({
+                "status": "RESOLVED",
+                "run_id": run_id,
+                "decision": decision,
+                "hitl_status": "APPROVED" if decision == "APPROVE" else "REJECTED",
+            }),
+        )
+    except Exception as e:
+        logger.warning(f"Failed to publish HITL resolution event: {e}")
 
     # --------------------------------------------------------
     # APPLY DECISION

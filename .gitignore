@@ -13,6 +13,8 @@
 .env.staging
 *.secret
 secrets/
+broker_token.json
+**/broker_token.json
 
 # Dependencies & Build Output (Failsafe)
 node_modules/

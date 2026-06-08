@@ -261,6 +261,146 @@ async def zerodha_callback(request: Request):
         return HTMLResponse(content=fail_html, status_code=500)
 
 
+class BrokerPositionExitRequest(BaseModel):
+    symbol: str
+
+
+@router.post("/api/v1/broker/positions/exit", summary="Exit/close an active position directly on the broker")
+async def exit_broker_position(
+    req: BrokerPositionExitRequest,
+    current_user: User = Depends(require_viewer),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Exits/closes a position directly at the broker level.
+    Determines the current position direction and quantity,
+    places a counter-order, and closes any corresponding DB trade records.
+    """
+    import json
+    from sqlalchemy import select
+    symbol = req.symbol.upper()
+    
+    # 1. Fetch current positions from the active broker to determine direction and quantity
+    from app.brokers.base import get_broker
+    broker = get_broker()
+    
+    try:
+        is_connected = await broker.is_connected()
+        if not is_connected:
+            await broker.connect()
+            
+        positions = await broker.get_positions()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch active positions from broker: {e}")
+        
+    # Find position for the target symbol
+    target_pos = None
+    for pos in positions:
+        if pos.get("symbol", "").upper() == symbol:
+            target_pos = pos
+            break
+            
+    if not target_pos or target_pos.get("quantity", 0) == 0:
+        # Check if there's an open trade in the DB we should close anyway
+        from app.db.repos.trade_repo import TradeRepo
+        from app.db.models.trade import Trade
+        
+        result = await db.execute(
+            select(Trade).where(
+                Trade.user_id == current_user.id,
+                Trade.symbol == symbol,
+                Trade.status == "OPEN",
+                Trade.broker == settings.ACTIVE_BROKER
+            )
+        )
+        open_trades = result.scalars().all()
+        for t in open_trades:
+            await TradeRepo.close_trade(db, t.id, current_user.id, t.entry_price)
+            
+        return {"success": True, "message": f"No active position on broker for {symbol}. Closed open database records."}
+        
+    qty = abs(target_pos["quantity"])
+    direction = "LONG" if target_pos["quantity"] > 0 else "SHORT"
+    exit_direction = "SHORT" if direction == "LONG" else "LONG"
+    
+    # Get current price
+    try:
+        current_price = await broker.get_ltp(symbol)
+    except Exception:
+        current_price = target_pos.get("avg_price", 0.0)
+        
+    if current_price <= 0:
+        current_price = target_pos.get("avg_price", 0.0)
+        
+    # Place exit order (opposite of current direction)
+    actual_exit = current_price
+    try:
+        price_buffer = current_price * 0.0005
+        limit_price = round(current_price - price_buffer if exit_direction == "SHORT" else current_price + price_buffer, 2)
+        
+        order_result = await broker.place_order(
+            symbol=symbol,
+            direction=exit_direction,
+            quantity=float(qty),
+            order_type="LIMIT",
+            price=limit_price,
+        )
+        if order_result.success:
+            actual_exit = order_result.fill_price or current_price
+        else:
+            raise Exception(order_result.error_message)
+    except Exception as e:
+        logger.error(f"Manual broker-level exit failed for {symbol}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to place exit order on broker: {e}")
+        
+    # Close any corresponding trade records in DB
+    from app.db.repos.trade_repo import TradeRepo
+    from app.db.models.trade import Trade
+    
+    result = await db.execute(
+        select(Trade).where(
+            Trade.user_id == current_user.id,
+            Trade.symbol == symbol,
+            Trade.status == "OPEN",
+            Trade.broker == settings.ACTIVE_BROKER
+        )
+    )
+    open_trades = result.scalars().all()
+    closed_trades = []
+    
+    for t in open_trades:
+        closed = await TradeRepo.close_trade(db, t.id, current_user.id, actual_exit)
+        if closed:
+            closed_trades.append(closed.id)
+            
+            # Publish to Redis
+            from app.db.redis import redis_client, CHANNEL_TRADE_EXECUTED
+            try:
+                await redis_client.publish(
+                    CHANNEL_TRADE_EXECUTED,
+                    json.dumps({
+                        "event":     "TRADE_CLOSED",
+                        "reason":    "MANUAL_EXIT",
+                        "trade_id":  t.id,
+                        "user_id":   t.user_id,
+                        "symbol":    t.symbol,
+                        "direction": t.direction,
+                        "entry":     t.entry_price,
+                        "exit":      actual_exit,
+                        "pnl":       closed.realized_pnl,
+                        "pnl_pct":   closed.pnl_pct,
+                    }),
+                )
+            except Exception:
+                pass
+                
+    return {
+        "success": True,
+        "message": f"Exited {direction} position of {qty} shares for {symbol} @ ₹{actual_exit:.2f}",
+        "closed_trade_ids": closed_trades
+    }
+
+
 @router.get("/api/v1/broker/portfolio")
 async def get_broker_portfolio(
     mock: bool = False,
@@ -276,6 +416,7 @@ async def get_broker_portfolio(
     """
     from app.brokers.base import get_broker
     from app.brokers.mock import MockBroker
+    from sqlalchemy import select
 
     if paper:
         from app.brokers.paper import calculate_paper_portfolio_data
@@ -286,6 +427,24 @@ async def get_broker_portfolio(
             mock_broker = MockBroker()
             account = await mock_broker.get_account()
             positions = await mock_broker.get_positions()
+            
+            # Enrich mock positions with trade_id
+            from app.db.models.trade import Trade
+            result = await db.execute(
+                select(Trade).where(
+                    Trade.user_id == current_user.id,
+                    Trade.status == "OPEN",
+                    Trade.broker == "mock"
+                )
+            )
+            open_db_trades = result.scalars().all()
+            symbol_to_trade = {t.symbol.upper(): t for t in open_db_trades}
+            for pos in positions:
+                sym = pos.get("symbol", "").upper()
+                trade = symbol_to_trade.get(sym)
+                if trade:
+                    pos["trade_id"] = trade.id
+
             return {
                 "connected": False,
                 "mock_data": True,
@@ -313,6 +472,26 @@ async def get_broker_portfolio(
         positions = await broker.get_positions()
         
         is_mock = settings.ACTIVE_BROKER.lower() == "mock"
+        
+        # Enrich positions with trade_id from database
+        from app.db.models.trade import Trade
+        active_broker_name = "mock" if is_mock else settings.ACTIVE_BROKER.lower()
+        result = await db.execute(
+            select(Trade).where(
+                Trade.user_id == current_user.id,
+                Trade.status == "OPEN",
+                Trade.broker == active_broker_name
+            )
+        )
+        open_db_trades = result.scalars().all()
+        symbol_to_trade = {t.symbol.upper(): t for t in open_db_trades}
+        
+        for pos in positions:
+            sym = pos.get("symbol", "").upper()
+            trade = symbol_to_trade.get(sym)
+            if trade:
+                pos["trade_id"] = trade.id
+
         return {
             "connected": not is_mock,
             "mock_data": is_mock,

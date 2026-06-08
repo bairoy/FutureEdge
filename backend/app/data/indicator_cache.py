@@ -150,17 +150,27 @@ def _compute_indicators(candles: list[dict]) -> dict:
     ema_9 = closes.ewm(span=9, adjust=False).mean()
     ema_21 = closes.ewm(span=21, adjust=False).mean()
 
+    # Compute MACD once — avoids triple redundant EMA computation
+    _macd, _macd_signal, _macd_hist = _calc_macd(closes)
+    _bb_upper, _bb_middle, _bb_lower = _calc_bollinger(closes)
+
+    # Compute ATR — used for SL/TP in orchestrator (replaces volatility proxy)
+    _atr = _calc_atr(candles)
+
     return {
         "rsi":              _calc_rsi(closes),
-        "macd":             _calc_macd(closes)[0],
-        "macd_signal":      _calc_macd(closes)[1],
-        "macd_hist":        _calc_macd(closes)[2],
-        "bollinger_upper":  _calc_bollinger(closes)[0],
-        "bollinger_middle": _calc_bollinger(closes)[1],
-        "bollinger_lower":  _calc_bollinger(closes)[2],
+        "macd":             _macd,
+        "macd_signal":      _macd_signal,
+        "macd_hist":        _macd_hist,
+        "bollinger_upper":  _bb_upper,
+        "bollinger_middle": _bb_middle,
+        "bollinger_lower":  _bb_lower,
         "ema_9":            round(float(ema_9.iloc[-1]), 2),
         "ema_21":           round(float(ema_21.iloc[-1]), 2),
+        "ema_9_prev":       round(float(ema_9.iloc[-2]), 2) if len(ema_9) >= 2 else round(float(ema_9.iloc[-1]), 2),
+        "ema_21_prev":      round(float(ema_21.iloc[-2]), 2) if len(ema_21) >= 2 else round(float(ema_21.iloc[-1]), 2),
         "vwap":             _calc_vwap(candles),
+        "atr":              _atr,
         "current_price":    float(closes.iloc[-1]),
     }
 
@@ -180,9 +190,44 @@ def _empty_indicators(candles: list[dict]) -> dict:
         "bollinger_lower":  last_price * 0.98,
         "ema_9":            last_price,
         "ema_21":           last_price,
+        "ema_9_prev":       last_price,
+        "ema_21_prev":      last_price,
         "vwap":             last_price,
+        "atr":              last_price * 0.002,  # 0.2% of price as safe ATR fallback
         "current_price":    last_price,
     }
+
+def _calc_atr(candles: list[dict], period: int = 14) -> float:
+    """
+    Calculate real Average True Range (Wilder smoothing).
+
+    ATR = smoothed average of True Range over `period` bars.
+    True Range = max(High-Low, |High-PrevClose|, |Low-PrevClose|)
+
+    Returns the ATR value in price units (e.g. ₹30 for NIFTY 1m bar).
+    This is what should be used for SL/TP calculations, NOT volatility*price.
+    """
+    if len(candles) < period + 1:
+        # Not enough data — use 0.2% of last price as safe floor
+        return float(candles[-1]["close"]) * 0.002 if candles else 1.0
+
+    try:
+        df = pd.DataFrame(candles)
+        df["high"]  = df["high"].astype(float)
+        df["low"]   = df["low"].astype(float)
+        df["close"] = df["close"].astype(float)
+
+        tr1 = df["high"] - df["low"]
+        tr2 = (df["high"] - df["close"].shift(1)).abs()
+        tr3 = (df["low"]  - df["close"].shift(1)).abs()
+        tr  = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+        # Welles Wilder smoothing (alpha = 1/period)
+        atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+        return round(float(atr.iloc[-1]), 4)
+    except Exception as e:
+        logger.warning(f"ATR calculation failed: {e}")
+        return float(candles[-1]["close"]) * 0.002 if candles else 1.0
 
 
 def _calc_vwap(candles: list[dict]) -> float:

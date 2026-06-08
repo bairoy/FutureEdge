@@ -55,6 +55,7 @@ async def execution_node(state: AgentState) -> dict:
     user_id:  str           = state.get("user_id", "anonymous")
 
     try:
+        logs_accumulated = []
 
         # ====================================================
         # LAYER 0: NSE MARKET HOURS CHECK
@@ -112,7 +113,6 @@ async def execution_node(state: AgentState) -> dict:
         # ====================================================
         # If the orchestrator flagged this trade for human review,
         # the human_approved flag MUST be True before we proceed.
-        # This is a second safety check independent of the HITL node.
 
         if state.get("hitl_required") and not proposal.human_approved:
             logger.error(
@@ -157,17 +157,8 @@ async def execution_node(state: AgentState) -> dict:
             shares = int(user_rupees / price) if price > 0 else 0
             logger.info(f"Using user override rupees: ₹{user_rupees} -> {shares} shares")
         else:
-            logger.warning(
-                f"Execution blocked — no user override quantity specified | run_id={run_id}"
-            )
-            return {
-                "executed_trade":  None,
-                "execution_error": "QUANTITY_REQUIRED",
-                "completed_nodes": ["execution"],
-                "logs": [
-                    "Execution blocked — Quantity must be specified by the user."
-                ],
-            }
+            shares = int(proposal.size / price) if price > 0 else 0
+            logger.info(f"No user overrides. Using consensus proposal size: ₹{proposal.size} -> {shares} shares")
 
         if shares <= 0:
             logger.warning(
@@ -183,15 +174,399 @@ async def execution_node(state: AgentState) -> dict:
             }
 
         # ====================================================
-        # PLACE ORDER VIA BROKER
+        # LAYER 1.5: EXISTING POSITION CHECK (AUTO-EXITS & SCALE-INS)
         # ====================================================
-        # get_broker() reads settings.ACTIVE_BROKER:
-        #   "mock"    → MockBroker (simulates, no real money)
-        #   "zerodha" → ZerodhaBroker (real NSE orders)
-        #
-        # Both implement the same BrokerBase interface,
-        # so this code never needs to change when switching brokers.
+        # If we already have an open position in this symbol for this user:
+        # - Same direction -> scale-in (pyramiding/averaging price)
+        # - Opposite direction -> close the position (reversal exit) and continue to new entry.
+        from sqlalchemy import select, and_
+        from app.db.models.trade import Trade
+        from datetime import timezone, datetime
+        
+        is_paper = state.get("paper_trade", True)
+        broker_name = "paper" if is_paper else settings.ACTIVE_BROKER.lower()
+        
+        existing_trade = None
+        try:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(Trade).where(
+                        and_(
+                            Trade.user_id == user_id,
+                            Trade.symbol == proposal.symbol,
+                            Trade.status == "OPEN",
+                            Trade.broker == broker_name
+                        )
+                    )
+                )
+                existing_trade = result.scalar_one_or_none()
+        except Exception as db_err:
+            logger.error(f"Error checking for existing open trades: {db_err}")
 
+        if proposal.direction == "CLOSE":
+            if not existing_trade:
+                logger.warning(f"Consensus exit proposal received for {proposal.symbol}, but no open position found.")
+                return {
+                    "executed_trade":  None,
+                    "completed_nodes": ["execution"],
+                    "logs":            [f"No active position found to close for {proposal.symbol}."],
+                }
+
+            logger.warning(
+                f"🎯 CONSENSUS EXIT | Agent analysis exit signal received for "
+                f"open trade {existing_trade.id} ({existing_trade.direction}) on {proposal.symbol}"
+            )
+            
+            if is_paper:
+                from app.brokers.mock import MockBroker
+                broker = MockBroker()
+            else:
+                broker = get_broker()
+                
+            if not await broker.is_connected():
+                await broker.connect()
+                
+            exit_direction = "SHORT" if existing_trade.direction == "LONG" else "LONG"
+            qty = existing_trade.quantity
+            
+            # SEBI compliance: use LIMIT order with buffer
+            price_buffer = price * 0.0005
+            limit_price = round(price - price_buffer if exit_direction == "SHORT" else price + price_buffer, 2)
+            
+            try:
+                order_result = await broker.place_order(
+                    symbol     = proposal.symbol,
+                    direction  = exit_direction,
+                    quantity   = float(qty),
+                    order_type = "LIMIT",
+                    price      = limit_price,
+                )
+            except Exception as e:
+                logger.error(f"Consensus exit broker order failed: {e}")
+                order_result = None
+                
+            if not order_result or not order_result.success:
+                err_msg = order_result.error_message if order_result else "Broker order exception"
+                logger.error(f"Consensus exit order failed for trade {existing_trade.id}: {err_msg}")
+                return {
+                    "executed_trade":  None,
+                    "execution_error": f"CONSENSUS_EXIT_FAILED: {err_msg}",
+                    "completed_nodes": ["execution"],
+                    "logs":            [f"Consensus exit order failed: {err_msg}"],
+                }
+                
+            actual_exit = order_result.fill_price or price
+            
+            # Close trade in database
+            async with AsyncSessionLocal() as session:
+                closed_trade = await TradeRepo.close_trade(
+                    session=session,
+                    trade_id=existing_trade.id,
+                    user_id=user_id,
+                    exit_price=actual_exit,
+                )
+                
+            pnl = 0.0
+            if closed_trade:
+                pnl = closed_trade.realized_pnl or 0.0
+                try:
+                    await redis_client.publish(
+                        CHANNEL_TRADE_EXECUTED,
+                        json.dumps({
+                            "event":     "TRADE_CLOSED",
+                            "reason":    "CONSENSUS_EXIT",
+                            "trade_id":  existing_trade.id,
+                            "user_id":   user_id,
+                            "symbol":    proposal.symbol,
+                            "direction": existing_trade.direction,
+                            "entry":     existing_trade.entry_price,
+                            "exit":      actual_exit,
+                            "pnl":       pnl,
+                            "pnl_pct":   closed_trade.pnl_pct,
+                        }),
+                    )
+                except Exception as pub_err:
+                    logger.warning(f"Redis publish failed on consensus exit: {pub_err}")
+                    
+                # Trigger episodic memory outcome update in Qdrant
+                try:
+                    from app.memory.qdrant_store import update_trade_outcome
+                    outcome_str = "WIN" if pnl > 0.0 else ("LOSS" if pnl < 0.0 else "NEUTRAL")
+                    pnl_pct_val = closed_trade.pnl_pct or 0.0
+                    await update_trade_outcome(
+                        run_id=existing_trade.run_id,
+                        outcome=outcome_str,
+                        pnl_pct=pnl_pct_val,
+                    )
+                except Exception as q_err:
+                    logger.warning(f"Failed to update consensus exit outcome in Qdrant: {q_err}")
+                    
+            return {
+                "executed_trade":  {
+                    "id":                existing_trade.id,
+                    "user_id":           user_id,
+                    "symbol":            proposal.symbol,
+                    "direction":         existing_trade.direction,
+                    "status":            "CLOSED",
+                    "exit_price":        actual_exit,
+                    "realized_pnl":      pnl,
+                    "pnl_pct":           closed_trade.pnl_pct if closed_trade else 0.0,
+                },
+                "execution_error": None,
+                "completed_nodes": ["execution"],
+                "logs":            [f"Closed active {existing_trade.direction} position on consensus exit proposal"],
+            }
+
+        if existing_trade:
+            if proposal.direction == existing_trade.direction:
+                logger.info(f"Already in {existing_trade.direction} position for {proposal.symbol}. Attempting scale-in.")
+                
+                # Risk Guard 1: Limit max scale-in entries
+                agent_consensus = existing_trade.agent_consensus or []
+                scale_ins = [item for item in agent_consensus if isinstance(item, dict) and item.get("type") == "scale_in"]
+                if len(scale_ins) >= settings.MAX_PYRAMID_ENTRIES:
+                    logger.info(f"Max scale-in limit reached ({len(scale_ins)}/{settings.MAX_PYRAMID_ENTRIES}) for {proposal.symbol}.")
+                    return {
+                        "executed_trade":  None,
+                        "completed_nodes": ["execution"],
+                        "logs":            [f"Already in {existing_trade.direction} position, max scale-in limit reached ({settings.MAX_PYRAMID_ENTRIES}). Holding."],
+                    }
+                
+                # Risk Guard 2: Total symbol exposure cap
+                new_qty = existing_trade.quantity + shares
+                new_exposure = price * new_qty
+                if new_exposure >= settings.MAX_SYMBOL_EXPOSURE:
+                    logger.info(f"Max exposure limit reached (₹{new_exposure:.2f} >= ₹{settings.MAX_SYMBOL_EXPOSURE:.2f}) for {proposal.symbol}.")
+                    return {
+                        "executed_trade":  None,
+                        "completed_nodes": ["execution"],
+                        "logs":            [f"Already in {existing_trade.direction} position, max exposure limit reached. Holding."],
+                    }
+
+                if is_paper:
+                    from app.brokers.mock import MockBroker
+                    broker = MockBroker()
+                else:
+                    broker = get_broker()
+                    
+                if not await broker.is_connected():
+                    await broker.connect()
+
+                # SEBI compliance: use LIMIT order with buffer
+                price_buffer = price * 0.0005
+                limit_price = round(price + price_buffer if proposal.direction == "LONG" else price - price_buffer, 2)
+
+                try:
+                    order_result = await broker.place_order(
+                        symbol     = proposal.symbol,
+                        direction  = proposal.direction,
+                        quantity   = float(shares),
+                        order_type = "LIMIT",
+                        price      = limit_price,
+                    )
+                except Exception as e:
+                    logger.error(f"Scale-in broker order failed: {e}")
+                    order_result = None
+
+                if not order_result or not order_result.success:
+                    err_msg = order_result.error_message if order_result else "Broker order exception"
+                    logger.error(f"Scale-in order failed for trade {existing_trade.id}: {err_msg}")
+                    return {
+                        "executed_trade":  None,
+                        "execution_error": f"SCALE_IN_FAILED: {err_msg}",
+                        "completed_nodes": ["execution"],
+                        "logs":            [f"Scale-in order failed: {err_msg}"],
+                    }
+
+                actual_fill = order_result.fill_price or price
+                new_entry_price = round(((existing_trade.entry_price * existing_trade.quantity) + (actual_fill * shares)) / new_qty, 4)
+
+                # Recalculate Stop Loss and Take Profit targets relative to the new average entry price
+                ctx = state.get("market_context")
+                if ctx and hasattr(ctx, "volatility_24h"):
+                    atr_proxy = max(ctx.volatility_24h * new_entry_price, new_entry_price * 0.005)
+                else:
+                    atr_proxy = new_entry_price * 0.02
+
+                if existing_trade.direction == "LONG":
+                    new_sl = round(new_entry_price - (1.5 * atr_proxy), 2)
+                    new_tp = round(new_entry_price + (3.0 * atr_proxy), 2)
+                else:
+                    new_sl = round(new_entry_price + (1.5 * atr_proxy), 2)
+                    new_tp = round(new_entry_price - (3.0 * atr_proxy), 2)
+
+                updated_trade_record = None
+                try:
+                    async with AsyncSessionLocal() as session:
+                        db_trade = await session.get(Trade, existing_trade.id)
+                        if db_trade:
+                            db_trade.quantity = new_qty
+                            db_trade.entry_price = new_entry_price
+                            db_trade.size = round(new_qty * new_entry_price, 2)
+                            db_trade.stop_loss = new_sl
+                            db_trade.take_profit = new_tp
+                            
+                            scale_in_event = {
+                                "type": "scale_in",
+                                "added_quantity": shares,
+                                "fill_price": actual_fill,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "order_id": order_result.order_id,
+                                "run_id": run_id,
+                            }
+                            db_trade.agent_consensus = (db_trade.agent_consensus or []) + [scale_in_event]
+                            
+                            await session.commit()
+                            await session.refresh(db_trade)
+                            
+                            updated_trade_record = {
+                                "id":                db_trade.id,
+                                "user_id":           user_id,
+                                "symbol":            proposal.symbol,
+                                "direction":         db_trade.direction,
+                                "status":            db_trade.status,
+                                "quantity":          db_trade.quantity,
+                                "entry_price":       db_trade.entry_price,
+                                "size":              db_trade.size,
+                                "stop_loss":         db_trade.stop_loss,
+                                "take_profit":       db_trade.take_profit,
+                                "agent_consensus":   db_trade.agent_consensus,
+                            }
+                except Exception as db_err:
+                    logger.error(f"Failed to save scaled-in trade updates to DB: {db_err}")
+
+                try:
+                    await redis_client.publish(
+                        CHANNEL_TRADE_EXECUTED,
+                        json.dumps({
+                            "event":           "TRADE_SCALED",
+                            "run_id":          run_id,
+                            "user_id":         user_id,
+                            "symbol":          proposal.symbol,
+                            "direction":       existing_trade.direction,
+                            "added_shares":    shares,
+                            "new_shares":      new_qty,
+                            "fill_price":      actual_fill,
+                            "new_entry_price": new_entry_price,
+                            "status":          order_result.status,
+                            "success":         order_result.success,
+                        }),
+                    )
+                except Exception as pub_err:
+                    logger.warning(f"Redis publish failed on scale-in: {pub_err}")
+
+                return {
+                    "executed_trade":  updated_trade_record or {
+                        "id":                existing_trade.id,
+                        "user_id":           user_id,
+                        "symbol":            proposal.symbol,
+                        "direction":         existing_trade.direction,
+                        "status":            existing_trade.status,
+                        "quantity":          new_qty,
+                        "entry_price":       new_entry_price,
+                        "size":              round(new_qty * new_entry_price, 2),
+                    },
+                    "execution_error": None,
+                    "completed_nodes": ["execution"],
+                    "logs":            [f"Scaled in {proposal.direction} position for {proposal.symbol}: added {shares} shares @ ₹{actual_fill:.2f}, new avg price ₹{new_entry_price:.2f}"],
+                }
+
+            elif proposal.direction not in ("NONE", ""):
+                # Reversal exit!
+                logger.warning(
+                    f"🔄 REVERSAL EXIT | Opposite signal {proposal.direction} "
+                    f"received while holding {existing_trade.direction} for {proposal.symbol} | "
+                    f"trade={existing_trade.id}"
+                )
+                
+                if is_paper:
+                    from app.brokers.mock import MockBroker
+                    broker = MockBroker()
+                else:
+                    broker = get_broker()
+                    
+                if not await broker.is_connected():
+                    await broker.connect()
+                    
+                exit_direction = "SHORT" if existing_trade.direction == "LONG" else "LONG"
+                qty = existing_trade.quantity
+                
+                # SEBI compliance: use LIMIT order with buffer
+                price_buffer = price * 0.0005
+                limit_price = round(price - price_buffer if exit_direction == "SHORT" else price + price_buffer, 2)
+                
+                try:
+                    order_result = await broker.place_order(
+                        symbol     = proposal.symbol,
+                        direction  = exit_direction,
+                        quantity   = float(qty),
+                        order_type = "LIMIT",
+                        price      = limit_price,
+                    )
+                except Exception as e:
+                    logger.error(f"Reversal exit broker order failed: {e}")
+                    order_result = None
+                    
+                if not order_result or not order_result.success:
+                    err_msg = order_result.error_message if order_result else "Broker order exception"
+                    logger.error(f"Reversal exit order failed for trade {existing_trade.id}: {err_msg}")
+                    return {
+                        "executed_trade":  None,
+                        "execution_error": f"REVERSAL_EXIT_FAILED: {err_msg}",
+                        "completed_nodes": ["execution"],
+                        "logs":            [f"Reversal exit order failed: {err_msg}"],
+                    }
+                    
+                actual_exit = order_result.fill_price or price
+                
+                # Close trade in database
+                async with AsyncSessionLocal() as session:
+                    closed_trade = await TradeRepo.close_trade(
+                        session=session,
+                        trade_id=existing_trade.id,
+                        user_id=user_id,
+                        exit_price=actual_exit,
+                    )
+                    
+                if closed_trade:
+                    pnl = closed_trade.realized_pnl or 0.0
+                    try:
+                        await redis_client.publish(
+                            CHANNEL_TRADE_EXECUTED,
+                            json.dumps({
+                                "event":     "TRADE_CLOSED",
+                                "reason":    "REVERSAL_EXIT",
+                                "trade_id":  existing_trade.id,
+                                "user_id":   user_id,
+                                "symbol":    proposal.symbol,
+                                "direction": existing_trade.direction,
+                                "entry":     existing_trade.entry_price,
+                                "exit":      actual_exit,
+                                "pnl":       pnl,
+                                "pnl_pct":   closed_trade.pnl_pct,
+                            }),
+                        )
+                    except Exception as pub_err:
+                        logger.warning(f"Redis publish failed on reversal exit: {pub_err}")
+                        
+                    # Trigger episodic memory outcome update in Qdrant
+                    try:
+                        from app.memory.qdrant_store import update_trade_outcome
+                        outcome_str = "WIN" if pnl > 0.0 else ("LOSS" if pnl < 0.0 else "NEUTRAL")
+                        pnl_pct_val = closed_trade.pnl_pct or 0.0
+                        await update_trade_outcome(
+                            run_id=existing_trade.run_id,
+                            outcome=outcome_str,
+                            pnl_pct=pnl_pct_val,
+                        )
+                    except Exception as q_err:
+                        logger.warning(f"Failed to update reversal exit outcome in Qdrant: {q_err}")
+                        
+                logs_accumulated.append(f"Closed existing {existing_trade.direction} position due to opposite signal ({proposal.direction})")
+
+        # ====================================================
+        # PLACE ORDER VIA BROKER (Normal / Reversal Entry)
+        # ====================================================
         is_paper = state.get("paper_trade", True)
 
         if is_paper:
@@ -365,7 +740,7 @@ async def execution_node(state: AgentState) -> dict:
                 "executed_trade":  trade_record,
                 "execution_error": None,
                 "completed_nodes": ["execution"],
-                "logs": [
+                "logs": logs_accumulated + [
                     f"Executed {proposal.direction} {shares} "
                     f"{proposal.symbol} @ ₹{order_result.fill_price:.2f}"
                 ],
@@ -375,7 +750,7 @@ async def execution_node(state: AgentState) -> dict:
                 "executed_trade":  None,
                 "execution_error": order_result.error_message,
                 "completed_nodes": ["execution"],
-                "logs": [
+                "logs": logs_accumulated + [
                     f"Order failed: {order_result.error_message}"
                 ],
             }

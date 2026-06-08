@@ -119,19 +119,30 @@ export function useWebSocket() {
 
       case "hitl_pending": {
         const d = msg.data;
+        if (!d || d.status === "RESOLVED") {
+          setHITLPending(null);
+          const store = useTradingStore.getState();
+          if (store.runResult && store.runResult.thread_id === d?.run_id) {
+            store.setRunResult({
+              ...store.runResult,
+              hitl_status: d.hitl_status,
+            });
+          }
+          break;
+        }
         const pending: HITLPending = {
           threadId: (d as any).proposal?.run_id ?? "",
           symbol: d.symbol,
-          direction: d.proposal.direction,
-          size: d.proposal.size,
-          entryPrice: d.proposal.entry_price,
-          riskScore: d.proposal.risk_score,
-          stopLoss: d.proposal.stop_loss,
-          takeProfit: d.proposal.take_profit,
+          direction: d.proposal?.direction ?? "NONE",
+          size: d.proposal?.size ?? 0,
+          entryPrice: d.proposal?.entry_price ?? 0,
+          riskScore: d.proposal?.risk_score ?? 0,
+          stopLoss: d.proposal?.stop_loss,
+          takeProfit: d.proposal?.take_profit,
           llmRationale: d.llm_rationale,
           reasons: d.reasons,
           memories: d.memories ?? [],
-          votes: d.proposal.votes,
+          votes: d.proposal?.votes ?? [],
           hitlRequired: (d as any).proposal?.hitl_required,
         };
         setHITLPending(pending);

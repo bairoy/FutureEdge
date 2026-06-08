@@ -25,6 +25,7 @@ and portfolio_agent (all four start at the same time).
 """
 
 from loguru import logger
+import pandas as pd
 
 from app.graph.state import AgentState, AgentVote
 from app.data.indicator_cache import get_indicators
@@ -83,7 +84,10 @@ async def signal_agent_node(state: AgentState) -> dict:
         bollinger_lower = ind["bollinger_lower"]
         ema_9           = ind.get("ema_9", price)
         ema_21          = ind.get("ema_21", price)
+        ema_9_prev      = ind.get("ema_9_prev", ema_9)   # Previous bar EMA — from cache, no recompute
+        ema_21_prev     = ind.get("ema_21_prev", ema_21)  # Previous bar EMA — from cache, no recompute
         vwap            = ind.get("vwap", price)
+        atr             = ind.get("atr", price * 0.002)   # Real ATR — for SL/TP in orchestrator
         from_cache      = ind["from_cache"]
 
         # --------------------------------------------------------
@@ -155,17 +159,13 @@ async def signal_agent_node(state: AgentState) -> dict:
         elif price > bollinger_upper:
             bb_score = -0.2
 
-        # --- 4. EMA 9/21 Crossover (Fast trend detector) ---
-        import pandas as pd
-        closes = pd.Series([c["close"] for c in ctx.ohlcv_1m], dtype=float)
-        ema_9_series = closes.ewm(span=9, adjust=False).mean()
-        ema_21_series = closes.ewm(span=21, adjust=False).mean()
-        
-        ema_9_curr = ema_9_series.iloc[-1]
-        ema_21_curr = ema_21_series.iloc[-1]
-        ema_9_prev = ema_9_series.iloc[-2] if len(ema_9_series) >= 2 else ema_9_curr
-        ema_21_prev = ema_21_series.iloc[-2] if len(ema_21_series) >= 2 else ema_21_curr
-        
+        # --- 4. EMA 9/21 Crossover (from cache — no recomputation needed) ---
+        # ema_9, ema_21, ema_9_prev, ema_21_prev are read directly from the
+        # indicator cache, which already computed them once. No raw candle
+        # processing needed here.
+        ema_9_curr  = ema_9
+        ema_21_curr = ema_21
+
         crossover_score = 0.0
         if ema_9_curr > ema_21_curr:
             crossover_score = 0.2
@@ -296,6 +296,26 @@ async def signal_agent_node(state: AgentState) -> dict:
             decision   = "HOLD"
             confidence = 0.5 + abs(score)
 
+        # Check if there is an active open position in the portfolio for this symbol
+        portfolio = state.get("portfolio")
+        open_positions = portfolio.open_positions if portfolio and hasattr(portfolio, "open_positions") else []
+        active_position = None
+        for pos in open_positions:
+            if pos.get("symbol") == symbol:
+                active_position = pos
+                break
+
+        if active_position and decision == "HOLD":
+            qty = active_position.get("quantity", 0)
+            if qty > 0:  # We are LONG
+                if ema_9_curr < ema_21_curr or hist < 0 or score <= 0.0:
+                    decision = "CLOSE"
+                    reasons.append("SignalAgent: Trend weakened for LONG position - recommending CLOSE")
+            elif qty < 0:  # We are SHORT
+                if ema_9_curr > ema_21_curr or hist > 0 or score >= 0.0:
+                    decision = "CLOSE"
+                    reasons.append("SignalAgent: Trend weakened for SHORT position - recommending CLOSE")
+
         reasoning = " | ".join(reasons) if reasons else "No strong signals detected"
 
         # --------------------------------------------------------
@@ -317,6 +337,7 @@ async def signal_agent_node(state: AgentState) -> dict:
                 "ema_9":            ema_9,
                 "ema_21":           ema_21,
                 "vwap":             vwap,
+                "atr":              atr,
                 "final_score":      round(score, 4),
                 "volatility_24h":   ctx.volatility_24h,
                 "indicators_cached": from_cache,

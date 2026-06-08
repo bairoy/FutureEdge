@@ -184,18 +184,21 @@ async def orchestrator_node(state: AgentState) -> dict:
 
         buy_score      = 0.0
         sell_score     = 0.0
+        close_score    = 0.0
         hold_conf_wt   = 0.0   # weighted sum of HOLD agent confidences
         active_wt      = 0.0
         hold_wt        = 0.0
 
         for vote in votes:
             wt = agent_weights.get(vote.agent, 0.2)
-            if vote.decision in ("BUY", "SELL"):
+            if vote.decision in ("BUY", "SELL", "CLOSE"):
                 active_wt += wt
                 if vote.decision == "BUY":
                     buy_score  += wt * vote.confidence
                 elif vote.decision == "SELL":
                     sell_score += wt * vote.confidence
+                elif vote.decision == "CLOSE":
+                    close_score += wt * vote.confidence
             else:  # HOLD
                 hold_wt      += wt
                 hold_conf_wt += wt * vote.confidence
@@ -203,8 +206,9 @@ async def orchestrator_node(state: AgentState) -> dict:
         total_wt = active_wt + 0.25 * hold_wt
 
         if total_wt > 0:
-            buy_score  /= total_wt
-            sell_score /= total_wt
+            buy_score   /= total_wt
+            sell_score  /= total_wt
+            close_score /= total_wt
 
         # Weighted average confidence of all HOLD-voting agents
         hold_confidence = (hold_conf_wt / hold_wt) if hold_wt > 0 else 0.5
@@ -227,20 +231,25 @@ async def orchestrator_node(state: AgentState) -> dict:
 
         logger.info(f"Orchestrator: using consensus decision threshold = {threshold:.2f}")
 
-        if buy_score > threshold and buy_score > sell_score:
+        if buy_score > threshold and buy_score > sell_score and buy_score > close_score:
             direction  = "LONG"
             confidence = buy_score
             decision   = "BUY"
 
-        elif sell_score > threshold and sell_score > buy_score:
+        elif sell_score > threshold and sell_score > buy_score and sell_score > close_score:
             direction  = "SHORT"
             confidence = sell_score
             decision   = "SELL"
 
+        elif close_score > threshold and close_score > buy_score and close_score > sell_score:
+            direction  = "CLOSE"
+            confidence = close_score
+            decision   = "CLOSE"
+
         else:
             direction  = "NONE"
             # Use the actual HOLD consensus confidence, not 0.0 from BUY/SELL scores
-            confidence = hold_confidence if hold_wt > 0 else max(buy_score, sell_score)
+            confidence = hold_confidence if hold_wt > 0 else max(buy_score, sell_score, close_score)
             decision   = "HOLD"
 
         # --------------------------------------------------------
@@ -264,7 +273,7 @@ async def orchestrator_node(state: AgentState) -> dict:
         if risk_vote and risk_vote.metadata:
             kelly_fraction = risk_vote.metadata.get("kelly_fraction", 0.02)
 
-        if decision != "HOLD":
+        if decision in ("BUY", "SELL"):
             # Position size in Rupees
             position_rupees = portfolio.total_equity * kelly_fraction
         else:
@@ -373,14 +382,26 @@ async def orchestrator_node(state: AgentState) -> dict:
         #   TP = 3.0 × ATR (2:1 reward-to-risk ratio)
 
         if direction != "NONE" and price > 0:
-            atr_proxy = max(ctx.volatility_24h * price, price * 0.005)  # floor at 0.5%
+            # ── Real ATR from indicator cache (passed via signal_vote metadata) ──
+            # The old proxy (volatility_24h × price) was 8-22× too wide for 1m bars,
+            # causing SL/TP to never be reached. Now we use the Wilder-smoothed ATR.
+            signal_vote = state.get("signal_vote")
+            real_atr = None
+            if signal_vote and signal_vote.metadata:
+                real_atr = signal_vote.metadata.get("atr")
+
+            if not real_atr or real_atr <= 0:
+                # Fallback: 0.2% of price as a sensible floor
+                real_atr = max(price * 0.002, price * 0.001)
+
+            logger.debug(f"Orchestrator | ATR={real_atr:.4f} | price={price:.2f} | ratio={real_atr/price*100:.3f}%")
 
             if direction == "LONG":
-                proposal.stop_loss   = round(price - (1.5 * atr_proxy), 2)
-                proposal.take_profit = round(price + (3.0 * atr_proxy), 2)
+                proposal.stop_loss   = round(price - (1.5 * real_atr), 2)
+                proposal.take_profit = round(price + (3.0 * real_atr), 2)
             elif direction == "SHORT":
-                proposal.stop_loss   = round(price + (1.5 * atr_proxy), 2)
-                proposal.take_profit = round(price - (3.0 * atr_proxy), 2)
+                proposal.stop_loss   = round(price + (1.5 * real_atr), 2)
+                proposal.take_profit = round(price - (3.0 * real_atr), 2)
 
         # --------------------------------------------------------
         # PUBLISH TO REDIS  (frontend WebSocket picks this up)

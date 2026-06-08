@@ -92,6 +92,9 @@ async def test_paper_trade_execution_routing(mock_trade_repo, mock_db_session, m
 
     # Set up mock DB session context manager
     mock_db = AsyncMock()
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = None
+    mock_db.execute.return_value = mock_result
     mock_db_session.return_value.__aenter__.return_value = mock_db
 
     # Execute node
@@ -106,6 +109,178 @@ async def test_paper_trade_execution_routing(mock_trade_repo, mock_db_session, m
     mock_trade_repo.save_trade.assert_called_once()
     saved_kwargs = mock_trade_repo.save_trade.call_args[1]
     assert saved_kwargs["broker"] == "paper"
+
+
+@pytest.mark.asyncio
+@patch("app.brokers.symbol_mapper.is_market_open", return_value=True)
+@patch("app.agents.execution_agent.redis_client")
+@patch("app.agents.execution_agent.AsyncSessionLocal")
+@patch("app.agents.execution_agent.TradeRepo")
+async def test_paper_trade_reversal_exit(mock_trade_repo, mock_db_session, mock_redis, mock_market_open):
+    """Confirm that execution_node triggers a reversal exit when the proposal has an opposite direction."""
+    existing_trade = MagicMock()
+    existing_trade.id = "trade_1"
+    existing_trade.direction = "LONG"
+    existing_trade.quantity = 10
+    existing_trade.symbol = "RELIANCE"
+    existing_trade.entry_price = 2500.0
+    existing_trade.run_id = "test_run_001"
+    existing_trade.broker = "paper"
+
+    state = _make_execution_state(direction="SHORT", paper_trade=True)
+
+    mock_db = AsyncMock()
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = existing_trade
+    mock_db.execute.return_value = mock_result
+    mock_db.get.return_value = existing_trade
+    mock_db_session.return_value.__aenter__.return_value = mock_db
+
+    closed_trade = MagicMock()
+    closed_trade.realized_pnl = -10.0
+    closed_trade.pnl_pct = -0.04
+    mock_trade_repo.close_trade = AsyncMock(return_value=closed_trade)
+
+    with patch("app.brokers.mock.MockBroker") as MockBrokerClass:
+        mock_broker = MagicMock()
+        mock_broker.is_connected = AsyncMock(return_value=True)
+        mock_broker.connect = AsyncMock()
+        
+        order_res = MagicMock()
+        order_res.success = True
+        order_res.fill_price = 2499.0
+        order_res.order_id = "ORDER_EXIT_123"
+        mock_broker.place_order = AsyncMock(return_value=order_res)
+        MockBrokerClass.return_value = mock_broker
+
+        result = await execution_node(state)
+
+        assert result["execution_error"] is None
+        assert "completed_nodes" in result
+        
+        mock_trade_repo.save_trade.assert_called_once()
+        mock_trade_repo.close_trade.assert_called_once()
+        assert mock_broker.place_order.call_count == 2
+
+
+@pytest.mark.asyncio
+@patch("app.brokers.symbol_mapper.is_market_open", return_value=True)
+@patch("app.agents.execution_agent.redis_client")
+@patch("app.agents.execution_agent.AsyncSessionLocal")
+@patch("app.agents.execution_agent.TradeRepo")
+async def test_paper_trade_same_direction_scale_in(mock_trade_repo, mock_db_session, mock_redis, mock_market_open):
+    """Confirm that execution_node executes a scale-in order when signal is in the same direction."""
+    existing_trade = MagicMock()
+    existing_trade.id = "trade_1"
+    existing_trade.direction = "LONG"
+    existing_trade.quantity = 10
+    existing_trade.symbol = "RELIANCE"
+    existing_trade.entry_price = 2500.0
+    existing_trade.broker = "paper"
+    existing_trade.agent_consensus = []
+
+    state = _make_execution_state(direction="LONG", user_override_quantity=5, paper_trade=True)
+
+    mock_db = AsyncMock()
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = existing_trade
+    mock_db.execute.return_value = mock_result
+    mock_db.get.return_value = existing_trade
+    mock_db_session.return_value.__aenter__.return_value = mock_db
+
+    with patch("app.brokers.mock.MockBroker") as MockBrokerClass:
+        mock_broker = MagicMock()
+        mock_broker.is_connected = AsyncMock(return_value=True)
+        mock_broker.connect = AsyncMock()
+        
+        order_res = MagicMock()
+        order_res.success = True
+        order_res.fill_price = 2510.0
+        order_res.order_id = "ORDER_SCALE_123"
+        mock_broker.place_order = AsyncMock(return_value=order_res)
+        MockBrokerClass.return_value = mock_broker
+
+        result = await execution_node(state)
+
+        assert result["execution_error"] is None
+        assert result["executed_trade"] is not None
+        assert "Scaled in LONG position" in result["logs"][0]
+        
+        # New weighted entry price: ((2500 * 10) + (2510 * 5)) / 15 = 2503.3333
+        assert existing_trade.quantity == 15
+        assert existing_trade.entry_price == 2503.3333
+        assert len(existing_trade.agent_consensus) == 1
+        assert existing_trade.agent_consensus[0]["type"] == "scale_in"
+        assert existing_trade.agent_consensus[0]["added_quantity"] == 5
+        assert existing_trade.agent_consensus[0]["fill_price"] == 2510.0
+
+
+@pytest.mark.asyncio
+@patch("app.brokers.symbol_mapper.is_market_open", return_value=True)
+@patch("app.agents.execution_agent.redis_client")
+@patch("app.agents.execution_agent.AsyncSessionLocal")
+@patch("app.agents.execution_agent.TradeRepo")
+async def test_paper_trade_scale_in_max_limit_blocked(mock_trade_repo, mock_db_session, mock_redis, mock_market_open):
+    """Confirm that execution_node bypasses execution when max scale-in entries limit is reached."""
+    existing_trade = MagicMock()
+    existing_trade.id = "trade_1"
+    existing_trade.direction = "LONG"
+    existing_trade.quantity = 10
+    existing_trade.symbol = "RELIANCE"
+    existing_trade.entry_price = 2500.0
+    existing_trade.broker = "paper"
+    # 3 scale-in events inside agent_consensus (MAX_PYRAMID_ENTRIES = 3)
+    existing_trade.agent_consensus = [
+        {"type": "scale_in"},
+        {"type": "scale_in"},
+        {"type": "scale_in"}
+    ]
+
+    state = _make_execution_state(direction="LONG", user_override_quantity=5, paper_trade=True)
+
+    mock_db = AsyncMock()
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = existing_trade
+    mock_db.execute.return_value = mock_result
+    mock_db_session.return_value.__aenter__.return_value = mock_db
+
+    result = await execution_node(state)
+
+    assert result["executed_trade"] is None
+    assert "max scale-in limit reached" in result["logs"][0]
+    mock_trade_repo.save_trade.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("app.brokers.symbol_mapper.is_market_open", return_value=True)
+@patch("app.agents.execution_agent.redis_client")
+@patch("app.agents.execution_agent.AsyncSessionLocal")
+@patch("app.agents.execution_agent.TradeRepo")
+async def test_paper_trade_scale_in_exposure_limit_blocked(mock_trade_repo, mock_db_session, mock_redis, mock_market_open):
+    """Confirm that execution_node bypasses execution when max symbol exposure cap is reached."""
+    existing_trade = MagicMock()
+    existing_trade.id = "trade_1"
+    existing_trade.direction = "LONG"
+    existing_trade.quantity = 15
+    existing_trade.symbol = "RELIANCE"
+    existing_trade.entry_price = 2500.0
+    existing_trade.broker = "paper"
+    existing_trade.agent_consensus = []
+
+    # Try to add 10 shares at 2500.0 -> total 25 shares. Total exposure = 62500.0. Limit is MAX_SYMBOL_EXPOSURE = 50000.0
+    state = _make_execution_state(direction="LONG", user_override_quantity=10, paper_trade=True)
+
+    mock_db = AsyncMock()
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = existing_trade
+    mock_db.execute.return_value = mock_result
+    mock_db_session.return_value.__aenter__.return_value = mock_db
+
+    result = await execution_node(state)
+
+    assert result["executed_trade"] is None
+    assert "max exposure limit reached" in result["logs"][0]
+    mock_trade_repo.save_trade.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -150,3 +325,61 @@ async def test_paper_trade_exit_monitoring(mock_redis, mock_trade_repo, mock_db_
         
         # Verify real get_broker was NOT called for ordering
         mock_get_broker.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("app.brokers.symbol_mapper.is_market_open", return_value=True)
+@patch("app.agents.execution_agent.redis_client")
+@patch("app.agents.execution_agent.AsyncSessionLocal")
+@patch("app.agents.execution_agent.TradeRepo")
+async def test_paper_trade_consensus_exit(mock_trade_repo, mock_db_session, mock_redis, mock_market_open):
+    """Confirm that execution_node triggers a consensus exit when proposal direction is CLOSE."""
+    existing_trade = MagicMock()
+    existing_trade.id = "trade_1"
+    existing_trade.direction = "LONG"
+    existing_trade.quantity = 10
+    existing_trade.symbol = "RELIANCE"
+    existing_trade.entry_price = 2500.0
+    existing_trade.broker = "paper"
+    existing_trade.agent_consensus = []
+
+    state = _make_execution_state(direction="CLOSE", paper_trade=True)
+
+    mock_db = AsyncMock()
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = existing_trade
+    mock_db.execute.return_value = mock_result
+    mock_db.get.return_value = existing_trade
+    mock_db_session.return_value.__aenter__.return_value = mock_db
+
+    closed_trade = MagicMock()
+    closed_trade.realized_pnl = 100.0
+    closed_trade.pnl_pct = 4.0
+    mock_trade_repo.close_trade = AsyncMock(return_value=closed_trade)
+
+    with patch("app.brokers.mock.MockBroker") as MockBrokerClass:
+        mock_broker = MagicMock()
+        mock_broker.is_connected = AsyncMock(return_value=True)
+        mock_broker.connect = AsyncMock()
+        
+        order_res = MagicMock()
+        order_res.success = True
+        order_res.fill_price = 2510.0
+        order_res.order_id = "ORDER_EXIT_123"
+        mock_broker.place_order = AsyncMock(return_value=order_res)
+        MockBrokerClass.return_value = mock_broker
+
+        result = await execution_node(state)
+
+        assert result["execution_error"] is None
+        assert result["executed_trade"] is not None
+        assert result["executed_trade"]["status"] == "CLOSED"
+        assert "Closed active LONG position" in result["logs"][0]
+        
+        mock_trade_repo.close_trade.assert_called_once_with(
+            session=mock_db,
+            trade_id=existing_trade.id,
+            user_id="test_user_1",
+            exit_price=2510.0,
+        )
+        mock_trade_repo.save_trade.assert_not_called()

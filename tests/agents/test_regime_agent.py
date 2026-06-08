@@ -43,12 +43,15 @@ async def test_regime_agent_insufficient_candles():
 async def test_regime_agent_volatility_scaling():
     # Test with 50 candles where returns have a constant std dev
     # Create alternating changes to yield a known return standard deviation
+    from datetime import datetime, timedelta
+    base_time = datetime.now()
     candles = []
     # Base price changes to give exact log returns
     # e.g., prices alternating between 100.0 and 100.1
     for i in range(50):
         price = 100.0 if i % 2 == 0 else 100.1
         candles.append({
+            "timestamp": (base_time + timedelta(minutes=i)).isoformat(),
             "open": price,
             "high": price + 0.1,
             "low": price - 0.1,
@@ -72,10 +75,13 @@ async def test_regime_agent_volatility_scaling():
 async def test_regime_agent_wilder_smoothing_trending():
     # Let's simulate a strong uptrend to trigger TRENDING_UP classification
     # Price rises smoothly
+    from datetime import datetime, timedelta
+    base_time = datetime.now()
     candles = []
     for i in range(50):
         price = 100.0 + i * 0.5
         candles.append({
+            "timestamp": (base_time + timedelta(minutes=i)).isoformat(),
             "open": price - 0.1,
             "high": price + 0.4,
             "low": price - 0.2,

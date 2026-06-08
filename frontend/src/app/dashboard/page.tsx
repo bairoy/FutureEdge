@@ -111,18 +111,33 @@ export default function DashboardPage() {
   );
 
   const [exitingTradeIds, setExitingTradeIds] = useState<string[]>([]);
+  const [exitingSymbols, setExitingSymbols] = useState<string[]>([]);
 
-  async function handleExitPosition(tradeId: string) {
-    setExitingTradeIds((prev) => [...prev, tradeId]);
-    try {
-      await api.post(`/api/v1/trades/${tradeId}/close`);
-      showToast("Position exited successfully", "success");
-      mutateTrades();
-      mutatePortfolio();
-    } catch (err: any) {
-      showToast(err?.response?.data?.detail ?? "Failed to exit position", "error");
-    } finally {
-      setExitingTradeIds((prev) => prev.filter((id) => id !== tradeId));
+  async function handleExitPosition(tradeId: string | undefined, symbol: string) {
+    if (tradeId) {
+      setExitingTradeIds((prev) => [...prev, tradeId]);
+      try {
+        await api.post(`/api/v1/trades/${tradeId}/close`);
+        showToast("Position exited successfully", "success");
+        mutateTrades();
+        mutatePortfolio();
+      } catch (err: any) {
+        showToast(err?.response?.data?.detail ?? "Failed to exit position", "error");
+      } finally {
+        setExitingTradeIds((prev) => prev.filter((id) => id !== tradeId));
+      }
+    } else {
+      setExitingSymbols((prev) => [...prev, symbol]);
+      try {
+        await api.post(`/api/v1/broker/positions/exit`, { symbol });
+        showToast("Broker position exited successfully", "success");
+        mutateTrades();
+        mutatePortfolio();
+      } catch (err: any) {
+        showToast(err?.response?.data?.detail ?? "Failed to exit broker position", "error");
+      } finally {
+        setExitingSymbols((prev) => prev.filter((sym) => sym !== symbol));
+      }
     }
   }
 
@@ -459,17 +474,19 @@ export default function DashboardPage() {
                           {pos.pnl >= 0 ? "+" : ""}₹{pos.pnl.toLocaleString("en-IN", { maximumFractionDigits: 2 })}
                         </td>
                         <td className="py-2.5 text-right">
-                          {pos.trade_id ? (
-                            <button
-                              onClick={() => handleExitPosition(pos.trade_id!)}
-                              disabled={exitingTradeIds.includes(pos.trade_id)}
-                              className="px-2.5 py-1 text-xs font-semibold text-red-400 hover:text-red-300 bg-red-500/10 hover:bg-red-500/20 rounded-md border border-red-500/20 hover:border-red-500/30 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-                            >
-                              {exitingTradeIds.includes(pos.trade_id) ? "Exiting..." : "Exit"}
-                            </button>
-                          ) : (
-                            <span className="text-gray-600">—</span>
-                          )}
+                          <button
+                            onClick={() => handleExitPosition(pos.trade_id, pos.symbol)}
+                            disabled={
+                              (pos.trade_id ? exitingTradeIds.includes(pos.trade_id) : false) ||
+                              exitingSymbols.includes(pos.symbol)
+                            }
+                            className="px-2.5 py-1 text-xs font-semibold text-red-400 hover:text-red-300 bg-red-500/10 hover:bg-red-500/20 rounded-md border border-red-500/20 hover:border-red-500/30 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                          >
+                            {(pos.trade_id ? exitingTradeIds.includes(pos.trade_id) : false) ||
+                            exitingSymbols.includes(pos.symbol)
+                              ? "Exiting..."
+                              : "Exit"}
+                          </button>
                         </td>
                       </tr>
                     );

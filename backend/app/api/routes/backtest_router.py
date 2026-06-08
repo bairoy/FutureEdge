@@ -17,6 +17,7 @@ class BacktestRequest(BaseModel):
     stop_loss_pct: float = 1.5
     take_profit_pct: float = 3.0
     size_pct: float = 10.0
+    slippage_pct: float = 0.05   # 0.05% realistic slippage for NSE liquid stocks
 
 
 @router.post("/backtest", summary="Run a historical backtest for a specific symbol")
@@ -42,6 +43,7 @@ async def execute_backtest(
             stop_loss_pct=request.stop_loss_pct,
             take_profit_pct=request.take_profit_pct,
             size_pct=request.size_pct,
+            slippage_pct=request.slippage_pct,
         )
         return result
     except Exception as e:

@@ -137,6 +137,18 @@ def precompute_indicators_and_regimes(df: pd.DataFrame) -> pd.DataFrame:
             else:
                 regimes.append("RANGEBOUND")
 
+    # 5. EMA 9/21 (for crossover score matching live SignalAgent)
+    ema9  = df["close"].ewm(span=9,  adjust=False).mean()
+    ema21 = df["close"].ewm(span=21, adjust=False).mean()
+    df["ema_9"]       = ema9
+    df["ema_21"]      = ema21
+    df["ema_9_prev"]  = ema9.shift(1)
+    df["ema_21_prev"] = ema21.shift(1)
+
+    # 6. ATR (Wilder smoothing, same as indicator_cache._calc_atr)
+    atr_raw = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["atr"] = atr_raw.ewm(alpha=1.0/period, adjust=False).mean().fillna(df["close"] * 0.002)
+
     df["regime"] = regimes
     return df
 
@@ -187,10 +199,11 @@ async def run_backtest(
 
     # 2. State setup
     cash = initial_capital
-    position = 0  # Number of shares (positive for LONG, negative for SHORT)
-    entry_price = 0.0  # entry price with slippage applied
+    position = 0          # Number of shares (positive for LONG, negative for SHORT)
+    entry_price = 0.0     # entry price with slippage applied
     entry_time = None
-    direction = "NONE"  # "LONG" | "SHORT" | "NONE"
+    entry_regime = "RANGEBOUND"   # regime at trade entry — tracked for research
+    direction = "NONE"    # "LONG" | "SHORT" | "NONE"
     trades = []
     equity_curve = []
 
@@ -214,11 +227,14 @@ async def run_backtest(
         regime = row_prev["regime"]
         vol = row_prev["vol"]
 
-        # Replicate SignalAgent scoring math
+        # Replicate SignalAgent scoring math (regime-adaptive)
+        rsi_oversold  = 40.0 if regime == "TRENDING_UP" else 30.0
+        rsi_overbought = 60.0 if regime == "TRENDING_DOWN" else 70.0
+
         rsi_score = 0.0
-        if rsi < 30:
+        if rsi < rsi_oversold:
             rsi_score = 0.3
-        elif rsi > 70:
+        elif rsi > rsi_overbought:
             rsi_score = -0.3
 
         macd_score = 0.0
@@ -233,22 +249,34 @@ async def run_backtest(
         elif open_price > bollinger_upper:
             bb_score = -0.2
 
-        # DYNAMIC REGIME WEIGHTING
+        # EMA 9/21 crossover (matches live SignalAgent logic)
+        ema9_curr  = float(row_prev["ema_9"])
+        ema21_curr = float(row_prev["ema_21"])
+        ema9_prev  = float(row_prev["ema_9_prev"]) if not pd.isna(row_prev["ema_9_prev"]) else ema9_curr
+        ema21_prev = float(row_prev["ema_21_prev"]) if not pd.isna(row_prev["ema_21_prev"]) else ema21_curr
+
+        crossover_score = 0.0
+        if ema9_curr > ema21_curr:
+            crossover_score = 0.2 + (0.1 if ema9_prev <= ema21_prev else 0.0)   # +0.1 for fresh cross
+        elif ema9_curr < ema21_curr:
+            crossover_score = -0.2 - (0.1 if ema9_prev >= ema21_prev else 0.0)  # -0.1 for fresh cross
+
+        # DYNAMIC REGIME WEIGHTING (mirrors live SignalAgent exactly)
         score = 0.0
         if regime == "RANGEBOUND":
             score = (rsi_score * 1.5) + (bb_score * 1.5) + (macd_score * 0.2)
         elif regime in ("TRENDING_UP", "TRENDING_DOWN"):
-            score = macd_score * 1.8
+            score = (macd_score * 1.2) + (crossover_score * 1.5)
             if regime == "TRENDING_UP" and rsi_score > 0:
                 score += rsi_score * 0.5
             elif regime == "TRENDING_DOWN" and rsi_score < 0:
                 score += rsi_score * 0.5
         elif regime == "HIGH_VOLATILITY":
-            score = ((rsi_score * 0.5) + (macd_score * 0.5) + (bb_score * 0.5)) * 0.5
+            score = ((rsi_score * 0.4) + (macd_score * 0.4) + (bb_score * 0.4)) * 0.5
         else:
-            score = rsi_score + macd_score + bb_score
+            score = rsi_score + macd_score + bb_score + crossover_score
 
-        # Volatility filter
+        # Volatility filter (match live SignalAgent threshold)
         if vol > 0.05:
             score *= 0.7
 
@@ -259,14 +287,23 @@ async def run_backtest(
         elif score < -0.2:
             decision = "SELL"
 
+        # --- ATR-based dynamic SL/TP (uses real ATR, not fixed %) ---
+        atr_val = float(row_prev["atr"]) if "atr" in row_prev and not pd.isna(row_prev["atr"]) else 0.0
+        if atr_val > 0:
+            dynamic_sl_pct = (1.5 * atr_val / open_price) * 100.0  # 1.5×ATR as %
+            dynamic_tp_pct = (3.0 * atr_val / open_price) * 100.0  # 3.0×ATR as %
+        else:
+            dynamic_sl_pct = stop_loss_pct
+            dynamic_tp_pct = take_profit_pct
+
         # --- Check exit conditions (Stop-Loss and Take-Profit) ---
         exit_triggered = False
         exit_price = 0.0
         exit_reason = ""
 
         if position > 0:  # LONG
-            sl_price = entry_price * (1.0 - stop_loss_pct / 100.0)
-            tp_price = entry_price * (1.0 + take_profit_pct / 100.0)
+            sl_price = entry_price * (1.0 - dynamic_sl_pct / 100.0)
+            tp_price = entry_price * (1.0 + dynamic_tp_pct / 100.0)
 
             # Check Stop Loss first (conservative)
             if current_candle["low"] <= sl_price:
@@ -279,8 +316,8 @@ async def run_backtest(
                 exit_reason = "TAKE_PROFIT"
 
         elif position < 0:  # SHORT
-            sl_price = entry_price * (1.0 + stop_loss_pct / 100.0)
-            tp_price = entry_price * (1.0 - take_profit_pct / 100.0)
+            sl_price = entry_price * (1.0 + dynamic_sl_pct / 100.0)
+            tp_price = entry_price * (1.0 - dynamic_tp_pct / 100.0)
 
             if current_candle["high"] >= sl_price:
                 exit_triggered = True
@@ -309,16 +346,17 @@ async def run_backtest(
             pnl_pct = (trade_pnl / (shares_qty * entry_price)) * 100.0 if entry_price > 0 else 0.0
 
             trades.append({
-                "symbol": symbol,
-                "direction": "LONG" if position > 0 else "SHORT",
-                "entry_time": entry_time,
-                "exit_time": timestamp,
+                "symbol":      symbol,
+                "direction":   "LONG" if position > 0 else "SHORT",
+                "entry_time":  entry_time,
+                "exit_time":   timestamp,
                 "entry_price": round(entry_price, 2),
-                "exit_price": round(exit_price_with_slippage, 2),
-                "shares": shares_qty,
-                "pnl": round(trade_pnl, 2),
-                "pnl_pct": round(pnl_pct, 2),
+                "exit_price":  round(exit_price_with_slippage, 2),
+                "shares":      shares_qty,
+                "pnl":         round(trade_pnl, 2),
+                "pnl_pct":     round(pnl_pct, 2),
                 "exit_reason": exit_reason,
+                "regime":      entry_regime,  # regime at entry for research analysis
             })
 
             position = 0
@@ -341,6 +379,7 @@ async def run_backtest(
                     position = shares
                     entry_price = entry_price_with_slippage
                     entry_time = timestamp
+                    entry_regime = regime          # track regime at entry
                     direction = "LONG"
 
             elif decision == "SELL":
@@ -357,6 +396,7 @@ async def run_backtest(
                     position = -shares
                     entry_price = entry_price_with_slippage
                     entry_time = timestamp
+                    entry_regime = regime          # track regime at entry
                     direction = "SHORT"
 
         else:  # Active position exists, check for reversal
@@ -475,30 +515,37 @@ async def run_backtest(
         pnl_pct = (trade_pnl / (shares_qty * entry_price)) * 100.0 if entry_price > 0 else 0.0
 
         trades.append({
-            "symbol": symbol,
-            "direction": "LONG" if position > 0 else "SHORT",
-            "entry_time": entry_time,
-            "exit_time": last_candle["timestamp"],
+            "symbol":      symbol,
+            "direction":   "LONG" if position > 0 else "SHORT",
+            "entry_time":  entry_time,
+            "exit_time":   last_candle["timestamp"],
             "entry_price": round(entry_price, 2),
-            "exit_price": round(exit_price_with_slippage, 2),
-            "shares": shares_qty,
-            "pnl": round(trade_pnl, 2),
-            "pnl_pct": round(pnl_pct, 2),
+            "exit_price":  round(exit_price_with_slippage, 2),
+            "shares":      shares_qty,
+            "pnl":         round(trade_pnl, 2),
+            "pnl_pct":     round(pnl_pct, 2),
             "exit_reason": "END_OF_DATA",
+            "regime":      entry_regime,
         })
         equity_curve[-1]["equity"] = round(cash, 2)
 
     # 4. Compute Metrics
     total_trades = len(trades)
     winning_trades = [t for t in trades if t["pnl"] > 0]
-    losing_trades = [t for t in trades if t["pnl"] < 0]
+    losing_trades  = [t for t in trades if t["pnl"] < 0]
 
-    win_rate = (len(winning_trades) / total_trades * 100.0) if total_trades > 0 else 0.0
-    total_pnl = cash - initial_capital
+    win_rate    = (len(winning_trades) / total_trades * 100.0) if total_trades > 0 else 0.0
+    total_pnl   = cash - initial_capital
+    return_pct  = (total_pnl / initial_capital) * 100.0
 
     gross_profits = sum([t["pnl"] for t in winning_trades])
-    gross_losses = sum([abs(t["pnl"]) for t in losing_trades])
+    gross_losses  = sum([abs(t["pnl"]) for t in losing_trades])
     profit_factor = round(gross_profits / gross_losses, 2) if gross_losses > 0 else (round(gross_profits, 2) if gross_profits > 0 else 1.0)
+
+    # Average win / loss per trade
+    avg_win_pct  = round(sum(t["pnl_pct"] for t in winning_trades) / len(winning_trades), 2) if winning_trades else 0.0
+    avg_loss_pct = round(sum(abs(t["pnl_pct"]) for t in losing_trades) / len(losing_trades), 2) if losing_trades else 0.0
+    win_loss_ratio = round(avg_win_pct / avg_loss_pct, 2) if avg_loss_pct > 0 else 0.0
 
     # Max Drawdown
     max_dd = 0.0
@@ -511,48 +558,71 @@ async def run_backtest(
         if dd > max_dd:
             max_dd = dd
 
-    # Time-Series Sharpe Ratio
-    daily_equities = {}
+    # ── Time-Series Sharpe Ratio (annualized) ──────────────────────────────
+    daily_equities: dict = {}
     for pt in equity_curve:
-        # Group by YYYY-MM-DD
-        date_str = pt["time"][:10]
+        date_str = pt["time"][:10]          # Group by YYYY-MM-DD
         daily_equities[date_str] = pt["equity"]
 
-    sorted_dates = sorted(daily_equities.keys())
-    daily_equity_list = [daily_equities[d] for d in sorted_dates]
+    sorted_dates     = sorted(daily_equities.keys())
+    daily_equity_lst = [daily_equities[d] for d in sorted_dates]
 
     daily_returns = []
-    for i in range(1, len(daily_equity_list)):
-        prev = daily_equity_list[i - 1]
-        curr = daily_equity_list[i]
+    for i in range(1, len(daily_equity_lst)):
+        prev = daily_equity_lst[i - 1]
+        curr = daily_equity_lst[i]
         if prev > 0:
             daily_returns.append((curr - prev) / prev)
 
     if len(daily_returns) > 1:
         mean_ret = sum(daily_returns) / len(daily_returns)
         variance = sum([(r - mean_ret) ** 2 for r in daily_returns]) / (len(daily_returns) - 1)
-        std_ret = math.sqrt(variance)
-        if std_ret > 0:
-            sharpe = (mean_ret / std_ret) * math.sqrt(252)  # annualized
-        else:
-            sharpe = 0.0
+        std_ret  = math.sqrt(variance)
+        sharpe   = (mean_ret / std_ret) * math.sqrt(252) if std_ret > 0 else 0.0
     else:
         sharpe = 0.0
 
+    # ── Calmar Ratio = CAGR / Max Drawdown ────────────────────────────────
+    # For short backtests we approximate CAGR from return_pct
+    calmar = round(return_pct / max_dd, 2) if max_dd > 0 else 0.0
+
+    # ── Per-Regime Breakdown (key research metric) ─────────────────────────
+    regimes_seen = {t.get("regime", "UNKNOWN") for t in trades}
+    regime_breakdown: dict = {}
+    for reg in regimes_seen:
+        reg_trades = [t for t in trades if t.get("regime") == reg]
+        reg_wins   = [t for t in reg_trades if t["pnl"] > 0]
+        regime_breakdown[reg] = {
+            "total_trades": len(reg_trades),
+            "wins":         len(reg_wins),
+            "win_rate_pct": round(len(reg_wins) / len(reg_trades) * 100, 2) if reg_trades else 0.0,
+            "total_pnl":    round(sum(t["pnl"] for t in reg_trades), 2),
+        }
+
     return {
-        "symbol": symbol,
-        "period": period,
+        "symbol":   symbol,
+        "period":   period,
         "interval": interval,
         "metrics": {
-            "total_trades": total_trades,
-            "win_rate": round(win_rate, 2),
-            "total_pnl": round(total_pnl, 2),
-            "profit_factor": profit_factor,
-            "max_drawdown_pct": round(max_dd, 2),
-            "sharpe_ratio": round(sharpe, 2),
-            "initial_capital": initial_capital,
-            "final_capital": round(cash, 2),
+            # ── Core ──────────────────────────────────────────────────────
+            "total_trades":       total_trades,
+            "win_rate":           round(win_rate, 2),
+            "total_pnl":          round(total_pnl, 2),
+            "return_pct":         round(return_pct, 2),
+            "profit_factor":      profit_factor,
+            # ── Risk-adjusted performance ──────────────────────────────────
+            "max_drawdown_pct":   round(max_dd, 2),
+            "sharpe_ratio":       round(sharpe, 2),
+            "calmar_ratio":       calmar,
+            # ── Trade quality ─────────────────────────────────────────────
+            "avg_win_pct":        avg_win_pct,
+            "avg_loss_pct":       avg_loss_pct,
+            "win_loss_ratio":     win_loss_ratio,
+            # ── Capital ──────────────────────────────────────────────────
+            "initial_capital":    initial_capital,
+            "final_capital":      round(cash, 2),
         },
-        "trades": trades,
-        "equity_curve": equity_curve,
+        "regime_breakdown": regime_breakdown,   # per-regime win rates for research paper
+        "trades":           trades,
+        "equity_curve":     equity_curve,
     }

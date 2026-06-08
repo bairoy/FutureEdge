@@ -135,6 +135,10 @@ class Settings(BaseSettings):
     TRAILING_STOP_TRIGGER_PCT: float = 2.0
     TRAILING_STOP_DISTANCE_PCT: float = 1.5
 
+    # Position Pyramiding / Scaling-in limits
+    MAX_PYRAMID_ENTRIES: int = 3
+    MAX_SYMBOL_EXPOSURE: float = 50000.0
+
     # Watchlist
     WATCHLIST_SYMBOLS: str = "NIFTY 50,BANKNIFTY"
 

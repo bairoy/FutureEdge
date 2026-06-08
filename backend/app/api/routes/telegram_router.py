@@ -35,7 +35,103 @@ async def telegram_webhook(request: Request, db: AsyncSession = Depends(get_db))
 
     callback_query = payload.get("callback_query")
     if not callback_query:
-        # Ignore non-callback messages (e.g. general text updates)
+        message_obj = payload.get("message")
+        if message_obj:
+            text = message_obj.get("text", "").strip()
+            chat_id = message_obj.get("chat", {}).get("id")
+            
+            # Security verification
+            if not settings.TELEGRAM_CHAT_ID or str(chat_id) != str(settings.TELEGRAM_CHAT_ID):
+                logger.warning(f"Unauthorized Telegram chat_id received: {chat_id}")
+                return {"status": "unauthorized"}
+                
+            # Handle start / help
+            if text.startswith(("/start", "/help")):
+                from app.services.telegram_service import send_telegram_message
+                login_url = f"https://kite.trade/connect/login?v=3&api_key={settings.ZERODHA_API_KEY}"
+                help_text = (
+                    "<b>🤖 FutureEdge Trading Assistant</b>\n\n"
+                    "To refresh your daily Zerodha session:\n"
+                    f"1. Click this link: <a href='{login_url}'>🔑 Login to Zerodha</a>\n"
+                    "2. Log in with your credentials.\n"
+                    "3. Copy the redirect URL from your browser address bar and paste it directly into this chat.\n\n"
+                    "Alternatively, use: <code>/refresh &lt;request_token&gt;</code>"
+                )
+                await send_telegram_message(help_text)
+                return {"status": "help_sent"}
+                
+            # Extract request_token
+            request_token = None
+            if "request_token=" in text:
+                import urllib.parse
+                try:
+                    parsed = urllib.parse.urlparse(text)
+                    params = urllib.parse.parse_qs(parsed.query)
+                    if "request_token" in params:
+                        request_token = params["request_token"][0]
+                except Exception as pe:
+                    logger.error(f"Failed to parse URL in telegram message: {pe}")
+            elif text.startswith(("/refresh ", "/refresh_token ", "/token ")):
+                parts = text.split(None, 1)
+                if len(parts) > 1:
+                    request_token = parts[1].strip()
+                    
+            if request_token:
+                from app.services.telegram_service import send_telegram_message
+                await send_telegram_message("🔄 Exchanging request_token for Zerodha access_token...")
+                
+                try:
+                    from kiteconnect import KiteConnect
+                    from app.db.redis import redis_client, KEY_ZERODHA_ACCESS_TOKEN
+                    import json
+                    import asyncio
+                    
+                    # 1. Exchange request_token for access_token
+                    kite = KiteConnect(api_key=settings.ZERODHA_API_KEY)
+                    loop = asyncio.get_running_loop()
+                    data = await loop.run_in_executor(
+                        None,
+                        lambda: kite.generate_session(request_token, api_secret=settings.ZERODHA_API_SECRET)
+                    )
+                    access_token = data["access_token"]
+                    
+                    # 2. Save access token to Redis
+                    await redis_client.set(KEY_ZERODHA_ACCESS_TOKEN, access_token)
+                    
+                    # 3. Save to local JSON config
+                    try:
+                        with open("broker_token.json", "w") as f:
+                            json.dump({"ZERODHA_ACCESS_TOKEN": access_token}, f)
+                        logger.info("Saved Zerodha token to broker_token.json via Telegram command")
+                    except Exception as je:
+                        logger.warning(f"Failed to save Zerodha token to broker_token.json: {je}")
+                    
+                    # 4. Reconnect broker
+                    from app.brokers.base import get_broker
+                    broker = get_broker()
+                    await broker.disconnect()
+                    await broker.connect()
+                    
+                    # 5. Reconnect live tick publisher
+                    from app.data.feed import tick_publisher
+                    try:
+                        tick_publisher.stop()
+                        tick_publisher.start()
+                        logger.info("Live tick publisher restarted via Telegram command")
+                    except Exception as fe:
+                        logger.warning(f"Failed to restart live tick publisher: {fe}")
+                        
+                    await send_telegram_message(
+                        f"✅ <b>Authentication Successful!</b>\n\n"
+                        f"Zerodha access token has been updated and active broker/feed reconnected."
+                    )
+                    return {"status": "token_refreshed"}
+                    
+                except Exception as e:
+                    logger.exception(f"Failed to refresh Zerodha token via Telegram: {e}")
+                    await send_telegram_message(f"❌ <b>Authentication Failed</b>\n\n<code>{str(e)}</code>")
+                    return {"status": "token_refresh_failed", "error": str(e)}
+
         return {"status": "ignored"}
 
     query_id = callback_query.get("id")

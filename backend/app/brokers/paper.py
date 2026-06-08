@@ -49,21 +49,33 @@ async def calculate_paper_portfolio_data(db: AsyncSession, user_id: str) -> dict
         margin_used = 0.0
         
         broker = get_broker()
-        for t in open_trades:
+        
+        async def fetch_price(t):
             try:
                 is_connected = await broker.is_connected()
                 if not is_connected:
                     await broker.connect()
-                current_price = await broker.get_ltp(t.symbol)
+                price = await broker.get_ltp(t.symbol)
+                if price > 0:
+                    return price
+                raise ValueError("Price is 0 or negative")
             except Exception:
                 try:
                     loop = asyncio.get_running_loop()
-                    current_price = await loop.run_in_executor(
+                    price = await loop.run_in_executor(
                         None, get_current_price_yfinance, t.symbol
                     )
+                    if price > 0:
+                        return price
+                    raise ValueError("Yahoo Finance price is 0 or negative")
                 except Exception:
-                    current_price = t.entry_price
-            
+                    return t.entry_price
+
+        # Fetch all prices in parallel
+        tasks = [fetch_price(t) for t in open_trades]
+        prices = await asyncio.gather(*tasks) if tasks else []
+        
+        for t, current_price in zip(open_trades, prices):
             # Calculate P&L
             if t.direction == "LONG":
                 pos_qty = t.quantity

@@ -429,7 +429,20 @@ class NSETickPublisher:
         if token:
             token = token.decode() if isinstance(token, bytes) else token
         else:
-            token = settings.ZERODHA_ACCESS_TOKEN
+            # Try JSON file fallback
+            import os
+            import json
+            if os.path.exists("broker_token.json"):
+                try:
+                    with open("broker_token.json", "r") as f:
+                        token_data = json.load(f)
+                        token = token_data.get("ZERODHA_ACCESS_TOKEN")
+                    logger.info("Loaded Zerodha access token for KiteTicker from broker_token.json")
+                except Exception as fe:
+                    logger.warning(f"Could not load token for KiteTicker from broker_token.json: {fe}")
+            
+            if not token:
+                token = settings.ZERODHA_ACCESS_TOKEN
 
         if not settings.ZERODHA_API_KEY or not token:
             logger.warning(

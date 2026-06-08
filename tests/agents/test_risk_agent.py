@@ -186,6 +186,7 @@ async def test_risk_agent_market_closed():
     from app.core.config import settings
 
     state = _make_state()
+    state["paper_trade"] = False
 
     with patch("app.agents.risk_agent.is_market_open", return_value=False), \
          patch.object(settings, "ACTIVE_BROKER", "zerodha"):
