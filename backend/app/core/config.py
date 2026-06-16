@@ -139,6 +139,50 @@ class Settings(BaseSettings):
     MAX_PYRAMID_ENTRIES: int = 3
     MAX_SYMBOL_EXPOSURE: float = 50000.0
 
+    # --------------------------------------------------------
+    # HITL SMART GATING (Risk-score-based auto-approval)
+    #
+    # HITL_AUTO_APPROVE_ENABLED:
+    #   true  → Only trigger HITL for HIGH RISK trades (recommended)
+    #   false → HITL on every trade (old behaviour, kills intraday)
+    #
+    # HITL_RISK_SCORE_THRESHOLD:
+    #   HITL required if risk_score > this value (0.0–1.0)
+    #
+    # HITL_CONFIDENCE_THRESHOLD:
+    #   HITL required if confidence < this value
+    #
+    # HITL_POSITION_SIZE_THRESHOLD_PCT:
+    #   HITL required if position > X% of equity
+    #
+    # HITL_VIX_THRESHOLD:
+    #   HITL required if India VIX > this value
+    # --------------------------------------------------------
+    HITL_AUTO_APPROVE_ENABLED: bool = True
+    HITL_RISK_SCORE_THRESHOLD: float = 0.6
+    HITL_CONFIDENCE_THRESHOLD: float = 0.65
+    HITL_POSITION_SIZE_THRESHOLD_PCT: float = 15.0
+    HITL_VIX_THRESHOLD: float = 18.0
+
+    # --------------------------------------------------------
+    # VIX SPIKE DETECTION
+    #
+    # VIX_EXTREME_THRESHOLD: Absolute VIX level that always triggers VETO
+    # VIX_SPIKE_PCT: % rise from 5-day avg that triggers VETO (e.g. 30%)
+    # VIX_CAUTION_THRESHOLD: VIX above this = sell bias, not full VETO
+    # --------------------------------------------------------
+    VIX_EXTREME_THRESHOLD: float = 30.0
+    VIX_SPIKE_PCT: float = 30.0
+    VIX_CAUTION_THRESHOLD: float = 22.0
+
+    # --------------------------------------------------------
+    # DAILY P&L TELEGRAM REPORT
+    # Sends an end-of-day summary via Telegram at 15:45 IST
+    # --------------------------------------------------------
+    DAILY_REPORT_ENABLED: bool = True
+    DAILY_REPORT_HOUR_IST: int = 15
+    DAILY_REPORT_MINUTE_IST: int = 45
+
     # Watchlist
     WATCHLIST_SYMBOLS: str = "NIFTY 50,BANKNIFTY"
 

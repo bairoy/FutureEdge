@@ -21,17 +21,50 @@ REDIS_KEY_CALIBRATION = "futureedge:calibration:stats"
 REDIS_KEY_WEIGHTS = "futureedge:agent_weights"
 REDIS_KEY_THRESHOLD = "futureedge:decision_threshold"
 
-# Default Baseline Weights
-DEFAULT_WEIGHTS = {
-    "SignalAgent":    0.25,
-    "SentimentAgent": 0.15,
-    "RiskAgent":      0.20,
-    "PortfolioAgent": 0.20,
-    "MacroAgent":     0.20,
+DEFAULT_WEIGHTS_BY_REGIME = {
+    "TRENDING_UP": {
+        "SignalAgent":    0.40,
+        "SentimentAgent": 0.05,
+        "RiskAgent":      0.15,
+        "PortfolioAgent": 0.20,
+        "MacroAgent":     0.20,
+    },
+    "TRENDING_DOWN": {
+        "SignalAgent":    0.35,
+        "SentimentAgent": 0.05,
+        "RiskAgent":      0.20,
+        "PortfolioAgent": 0.20,
+        "MacroAgent":     0.20,
+    },
+    "RANGEBOUND": {
+        "SignalAgent":    0.30,
+        "SentimentAgent": 0.05,
+        "RiskAgent":      0.20,
+        "PortfolioAgent": 0.25,
+        "MacroAgent":     0.20,
+    },
+    "HIGH_VOLATILITY": {
+        "SignalAgent":    0.20,
+        "SentimentAgent": 0.05,
+        "RiskAgent":      0.35,
+        "PortfolioAgent": 0.20,
+        "MacroAgent":     0.20,
+    },
+    "UNKNOWN": {
+        "SignalAgent":    0.35,
+        "SentimentAgent": 0.05,
+        "RiskAgent":      0.20,
+        "PortfolioAgent": 0.20,
+        "MacroAgent":     0.20,
+    }
 }
 
-MIN_WEIGHT = 0.10
-MAX_WEIGHT = 0.50
+# Default Baseline Weights
+DEFAULT_WEIGHTS = DEFAULT_WEIGHTS_BY_REGIME["UNKNOWN"]
+
+MIN_WEIGHT = 0.05
+MAX_WEIGHT = 0.60
+
 
 
 async def run_calibration() -> dict:
@@ -148,44 +181,36 @@ async def run_calibration() -> dict:
         logger.info(f"✅ CalibrationAgent report stored: {report}")
 
         # --------------------------------------------------------
-        # 2. UPDATE SYSTEM CONSENSUS WEIGHTS
+        # 2. UPDATE SYSTEM CONSENSUS WEIGHTS (REGIME-SPECIFIC)
         # --------------------------------------------------------
-        new_weights = {}
-        active_accuracies = {agent: info["accuracy"] for agent, info in report.items() if info["total_active_votes"] >= 5}
-        inactive_agents = {agent for agent, info in report.items() if info["total_active_votes"] < 5}
+        # Group trades by regime
+        trades_by_regime = {}
+        for t in trades:
+            reg = "UNKNOWN"
+            consensus = t.agent_consensus or []
+            for vote_data in consensus:
+                if isinstance(vote_data, dict) and "regime" in vote_data:
+                    reg = vote_data["regime"].upper()
+                    break
+            if reg not in DEFAULT_WEIGHTS_BY_REGIME:
+                reg = "UNKNOWN"
+            trades_by_regime.setdefault(reg, []).append(t)
 
-        if active_accuracies:
-            total_acc = sum(active_accuracies.values())
-            if total_acc > 0:
-                active_pool = 0.60  # 60% of weight pool distributed dynamically
-                inactive_pool = 0.40  # 40% reserved for inactive or baseline agents
-                
-                active_shares = {
-                    agent: (acc / total_acc) * active_pool
-                    for agent, acc in active_accuracies.items()
-                }
-                inactive_share = inactive_pool / max(len(inactive_agents), 1)
-
-                for agent in DEFAULT_WEIGHTS:
-                    if agent in active_shares:
-                        w = active_shares[agent]
-                    else:
-                        w = inactive_share
-                    
-                    # Clip weights to limits
-                    new_weights[agent] = round(max(MIN_WEIGHT, min(MAX_WEIGHT, w)), 4)
+        calibrated_weights = {}
+        for reg in DEFAULT_WEIGHTS_BY_REGIME:
+            reg_trades = trades_by_regime.get(reg, [])
+            # Only update if we have at least 5 trades in this specific regime
+            if len(reg_trades) >= 5:
+                reg_weights = _calibrate_weights_for_regime(reg_trades, reg)
+                # Store regime-specific weights: f"futureedge:agent_weights:{reg}"
+                await redis_client.set(f"{REDIS_KEY_WEIGHTS}:{reg}", json.dumps(reg_weights))
+                calibrated_weights[reg] = reg_weights
+                logger.info(f"✅ CalibrationAgent: agent weights updated for regime {reg}: {reg_weights}")
+                if reg == "UNKNOWN":
+                    # Also write to global key
+                    await redis_client.set(REDIS_KEY_WEIGHTS, json.dumps(reg_weights))
             else:
-                new_weights = DEFAULT_WEIGHTS.copy()
-        else:
-            new_weights = DEFAULT_WEIGHTS.copy()
-
-        # Renormalize to sum to exactly 1.0
-        total_wt = sum(new_weights.values())
-        if total_wt > 0:
-            new_weights = {agent: round(w / total_wt, 4) for agent, w in new_weights.items()}
-
-        await redis_client.set(REDIS_KEY_WEIGHTS, json.dumps(new_weights))
-        logger.info(f"✅ CalibrationAgent: agent weights updated: {new_weights}")
+                logger.info(f"CalibrationAgent: skipped weight update for regime {reg} due to insufficient trades ({len(reg_trades)} < 5)")
 
         # --------------------------------------------------------
         # 3. UPDATE ADAPTIVE CONSENSUS DECISION THRESHOLD
@@ -198,15 +223,15 @@ async def run_calibration() -> dict:
         win_rate = wins / total_pnl_trades if total_pnl_trades > 0 else 0.5
         
         # Adaptive Threshold Formula:
-        # - High win rate (>60%) -> lower threshold to 0.50 (capitalize on streak)
-        # - Low win rate (<45%) -> raise threshold to 0.62 (filter entries strictly)
-        # - Otherwise -> default 0.55
+        # - High win rate (>=60%) -> lower threshold to 0.35 (capitalize on streak)
+        # - Low win rate (<=45%) -> raise threshold to 0.48 (filter entries strictly)
+        # - Otherwise -> default 0.40
         if win_rate >= 0.60:
-            threshold = 0.50
+            threshold = 0.35
         elif win_rate <= 0.45:
-            threshold = 0.62
+            threshold = 0.48
         else:
-            threshold = 0.55
+            threshold = 0.40
 
         await redis_client.set(REDIS_KEY_THRESHOLD, str(threshold))
         logger.info(f"✅ CalibrationAgent: adaptive decision threshold set to {threshold:.2f} (win_rate={win_rate*100:.1f}%)")
@@ -214,7 +239,7 @@ async def run_calibration() -> dict:
         return {
             "status": "success",
             "report": report,
-            "weights": new_weights,
+            "weights": calibrated_weights,
             "threshold": threshold,
             "win_rate_20": win_rate
         }
@@ -224,10 +249,94 @@ async def run_calibration() -> dict:
         return {"status": "error", "error": str(e)}
 
 
+def _calibrate_weights_for_regime(reg_trades: list, regime: str) -> dict:
+    """Helper to calibrate weights for a specific regime's trades."""
+    regime = regime.upper()
+    baseline_weights = DEFAULT_WEIGHTS_BY_REGIME.get(regime, DEFAULT_WEIGHTS)
+    
+    agent_stats = {
+        agent: {"correct": 0, "total_active": 0}
+        for agent in baseline_weights
+    }
+
+    for trade in reg_trades:
+        if trade.realized_pnl is None:
+            continue
+
+        trade_won = trade.realized_pnl > 0
+        trade_long = trade.direction == "LONG"
+        trade_short = trade.direction == "SHORT"
+        
+        votes = trade.agent_consensus or []
+        for v in votes:
+            if not isinstance(v, dict):
+                continue
+            agent = v.get("agent")
+            decision = v.get("decision")
+
+            if agent not in agent_stats or decision not in ("BUY", "SELL"):
+                continue
+
+            stats = agent_stats[agent]
+            stats["total_active"] += 1
+
+            is_correct = False
+            if trade_long:
+                is_correct = (decision == "BUY" and trade_won) or (decision == "SELL" and not trade_won)
+            elif trade_short:
+                is_correct = (decision == "SELL" and trade_won) or (decision == "BUY" and not trade_won)
+
+            if is_correct:
+                stats["correct"] += 1
+
+    report = {}
+    for agent, stats in agent_stats.items():
+        tot = stats["total_active"]
+        accuracy = stats["correct"] / tot if tot > 0 else 0.5
+        report[agent] = {"accuracy": accuracy, "total_active_votes": tot}
+
+    new_weights = {}
+    active_accuracies = {agent: info["accuracy"] for agent, info in report.items() if info["total_active_votes"] >= 5}
+    inactive_agents = {agent for agent, info in report.items() if info["total_active_votes"] < 5}
+
+    if active_accuracies:
+        total_acc = sum(active_accuracies.values())
+        if total_acc > 0:
+            active_pool = 0.60
+            inactive_pool = 0.40
+            
+            active_shares = {
+                agent: (acc / total_acc) * active_pool
+                for agent, acc in active_accuracies.items()
+            }
+            inactive_share = inactive_pool / max(len(inactive_agents), 1)
+
+            for agent in baseline_weights:
+                if agent in active_shares:
+                    w = active_shares[agent]
+                else:
+                    w = inactive_share
+                
+                new_weights[agent] = round(max(MIN_WEIGHT, min(MAX_WEIGHT, w)), 4)
+        else:
+            new_weights = baseline_weights.copy()
+    else:
+        new_weights = baseline_weights.copy()
+
+    total_wt = sum(new_weights.values())
+    if total_wt > 0:
+        new_weights = {agent: round(w / total_wt, 4) for agent, w in new_weights.items()}
+
+    return new_weights
+
+
 async def _set_default_redis_values():
     """Write standard default weights and thresholds to Redis."""
     try:
         await redis_client.set(REDIS_KEY_WEIGHTS, json.dumps(DEFAULT_WEIGHTS))
-        await redis_client.set(REDIS_KEY_THRESHOLD, "0.55")
+        await redis_client.set(REDIS_KEY_THRESHOLD, "0.40")
+        for reg, w in DEFAULT_WEIGHTS_BY_REGIME.items():
+            await redis_client.set(f"{REDIS_KEY_WEIGHTS}:{reg}", json.dumps(w))
     except Exception as e:
         logger.error(f"Failed to set default redis values: {e}")
+

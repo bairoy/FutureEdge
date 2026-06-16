@@ -57,6 +57,8 @@ class TradeProposal(BaseModel):
     human_approved:  Optional[bool]  = None
     human_notes:     Optional[str]   = None
     llm_rationale:   Optional[str]   = None  # Phase 2: LLM explanation
+    regime:          Optional[str]   = "UNKNOWN"
+
 
 
 class PortfolioSnapshot(BaseModel):

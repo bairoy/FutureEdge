@@ -232,35 +232,52 @@ async def signal_agent_node(state: AgentState) -> dict:
             reasons.append("Regime: Unknown (Baseline indicator scoring applied)")
 
         # --- 6. Multi-timeframe trend confirmation ---
+        # ISSUE 1 fix: MTF is now a VETO condition, not a score multiplier.
+        # Old code: score *= 0.6 — this crushed signals that barely crossed
+        # the 0.2 threshold, making them HOLD even when all indicators agreed.
+        # New code: only veto if BOTH higher timeframes clearly disagree.
+        # Single TF disagreement = warning only (logged but doesn't kill the score).
         try:
             df_1m = pd.DataFrame(ctx.ohlcv_1m)
             df_1m["timestamp"] = pd.to_datetime(df_1m["timestamp"])
             df_1m.set_index("timestamp", inplace=True)
-            
+
             df_5m = df_1m.resample("5Min").agg({"close": "last"}).dropna()
             df_15m = df_1m.resample("15Min").agg({"close": "last"}).dropna()
-            
+
             trend_5m = 0
             trend_15m = 0
-            
+
             if len(df_5m) >= 21:
                 ema9_5m = df_5m["close"].ewm(span=9, adjust=False).mean().iloc[-1]
                 ema21_5m = df_5m["close"].ewm(span=21, adjust=False).mean().iloc[-1]
                 trend_5m = 1 if ema9_5m > ema21_5m else -1
-                
+
             if len(df_15m) >= 21:
                 ema9_15m = df_15m["close"].ewm(span=9, adjust=False).mean().iloc[-1]
                 ema21_15m = df_15m["close"].ewm(span=21, adjust=False).mean().iloc[-1]
                 trend_15m = 1 if ema9_15m > ema21_15m else -1
-                
+
+            # VETO only when BOTH timeframes clearly contradict the 1m signal
             if score > 0.1:
-                if trend_5m == -1 or trend_15m == -1:
-                    score *= 0.6
-                    reasons.append("MTF warning: 5m or 15m trend is Bearish")
+                if trend_5m == -1 and trend_15m == -1:
+                    # Both 5m and 15m are bearish while 1m says BUY → real conflict
+                    decision = "HOLD"
+                    reasons.append("MTF VETO: both 5m and 15m bearish while 1m BUY signal")
+                    score = 0.0
+                elif trend_5m == -1 or trend_15m == -1:
+                    # Only one TF disagrees → gentle warning, reduce score slightly
+                    score *= 0.85
+                    reasons.append("MTF warning: one higher TF bearish (score -15%)")
             elif score < -0.1:
-                if trend_5m == 1 or trend_15m == 1:
-                    score *= 0.6
-                    reasons.append("MTF warning: 5m or 15m trend is Bullish")
+                if trend_5m == 1 and trend_15m == 1:
+                    # Both 5m and 15m are bullish while 1m says SELL → real conflict
+                    decision = "HOLD"
+                    reasons.append("MTF VETO: both 5m and 15m bullish while 1m SELL signal")
+                    score = 0.0
+                elif trend_5m == 1 or trend_15m == 1:
+                    score *= 0.85
+                    reasons.append("MTF warning: one higher TF bullish (score -15%)")
         except Exception as mtf_err:
             logger.warning(f"Failed to calculate MTF confirmation: {mtf_err}")
 

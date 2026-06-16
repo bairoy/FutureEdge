@@ -72,58 +72,117 @@ from app.db.redis import redis_client
 
 WEIGHTS_KEY = "futureedge:agent_weights"
 
-# Default weights (Phase 1 hardcoded values)
-DEFAULT_WEIGHTS = {
-    "SignalAgent":    0.30,
-    "SentimentAgent": 0.20,
-    "RiskAgent":      0.25,
-    "PortfolioAgent": 0.25,
+# Default weights by regime (Phase 2 regime-specific weights)
+# Issue 5: SentimentAgent weight is reduced to 0.05 (from 0.15/0.20) as it is noise, not signal.
+DEFAULT_WEIGHTS_BY_REGIME = {
+    "TRENDING_UP": {
+        "SignalAgent":    0.40,
+        "SentimentAgent": 0.05,
+        "RiskAgent":      0.15,
+        "PortfolioAgent": 0.20,
+        "MacroAgent":     0.20,
+    },
+    "TRENDING_DOWN": {
+        "SignalAgent":    0.35,
+        "SentimentAgent": 0.05,
+        "RiskAgent":      0.20,
+        "PortfolioAgent": 0.20,
+        "MacroAgent":     0.20,
+    },
+    "RANGEBOUND": {
+        "SignalAgent":    0.30,
+        "SentimentAgent": 0.05,
+        "RiskAgent":      0.20,
+        "PortfolioAgent": 0.25,
+        "MacroAgent":     0.20,
+    },
+    "HIGH_VOLATILITY": {
+        "SignalAgent":    0.20,
+        "SentimentAgent": 0.05,
+        "RiskAgent":      0.35,
+        "PortfolioAgent": 0.20,
+        "MacroAgent":     0.20,
+    },
+    "UNKNOWN": {
+        "SignalAgent":    0.35,
+        "SentimentAgent": 0.05,
+        "RiskAgent":      0.20,
+        "PortfolioAgent": 0.20,
+        "MacroAgent":     0.20,
+    }
 }
 
+DEFAULT_WEIGHTS = DEFAULT_WEIGHTS_BY_REGIME["UNKNOWN"]
+
 # Minimum weight any agent can have (prevents zeroing out an agent)
-MIN_WEIGHT = 0.10
+MIN_WEIGHT = 0.05
 
 # Maximum weight any agent can have (prevents one agent dominating)
-MAX_WEIGHT = 0.50
+MAX_WEIGHT = 0.60
 
 
 # ============================================================
 # GET CURRENT WEIGHTS  (called by orchestrator each cycle)
 # ============================================================
 
-async def get_agent_weights() -> dict:
+async def get_agent_weights(regime: str = "UNKNOWN") -> dict:
     """
-    Return current agent weights from Redis.
+    Return current agent weights from Redis for the given regime.
 
     The orchestrator calls this at the start of each cycle
     to get the most up-to-date weights.
 
     If no weights are stored yet (first run, or Redis cleared),
-    returns the DEFAULT_WEIGHTS from Phase 1.
+    returns the DEFAULT_WEIGHTS_BY_REGIME for that regime.
 
     Returns:
     --------
     {
         "SignalAgent":    0.32,
-        "SentimentAgent": 0.28,
-        "RiskAgent":      0.22,
-        "PortfolioAgent": 0.18,
+        "SentimentAgent": 0.05,
+        "RiskAgent":      0.20,
+        "PortfolioAgent": 0.23,
+        "MacroAgent":     0.20,
     }
     """
+    regime = (regime or "UNKNOWN").upper()
+    if regime not in DEFAULT_WEIGHTS_BY_REGIME:
+        regime = "UNKNOWN"
 
     try:
-        raw = await redis_client.get(WEIGHTS_KEY)
-
+        # Try regime-specific weights first
+        raw = await redis_client.get(f"{WEIGHTS_KEY}:{regime}")
         if raw:
             weights = json.loads(raw)
-            logger.debug(f"Agent weights from Redis: {weights}")
+            logger.debug(f"Agent weights for regime {regime} from Redis: {weights}")
+            return weights
+
+        # Fallback to global/unknown weights
+        raw_global = await redis_client.get(WEIGHTS_KEY)
+        if raw_global:
+            weights = json.loads(raw_global)
+            logger.debug(f"Global agent weights from Redis (fallback for {regime}): {weights}")
             return weights
 
     except Exception as e:
         logger.warning(f"Could not read agent weights from Redis: {e}")
 
-    logger.debug("Using default agent weights")
-    return DEFAULT_WEIGHTS.copy()
+    logger.debug(f"Using default agent weights for regime {regime}")
+    return DEFAULT_WEIGHTS_BY_REGIME[regime].copy()
+
+
+
+# ============================================================
+# HELPER: GET REGIME FROM TRADE METADATA
+# ============================================================
+
+def _get_trade_regime(trade) -> str:
+    """Extract regime from the agent_consensus metadata list."""
+    agent_consensus = trade.agent_consensus or []
+    for vote_data in agent_consensus:
+        if isinstance(vote_data, dict) and "regime" in vote_data:
+            return vote_data["regime"]
+    return "UNKNOWN"
 
 
 # ============================================================
@@ -171,26 +230,40 @@ async def maybe_update_weights(user_id: str, symbol: str) -> None:
         if total % settings.WEIGHT_UPDATE_INTERVAL_TRADES != 0:
             return
 
-        # --------------------------------------------------------
-        # CALCULATE ACCURACY PER AGENT
-        # --------------------------------------------------------
+        # Group trades by regime
+        trades_by_regime = {}
+        for trade in trades:
+            reg = _get_trade_regime(trade).upper()
+            if reg not in DEFAULT_WEIGHTS_BY_REGIME:
+                reg = "UNKNOWN"
+            trades_by_regime.setdefault(reg, []).append(trade)
 
-        new_weights = _calculate_new_weights(trades)
+        # Update weights for each regime that has active trades
+        for reg, reg_trades in trades_by_regime.items():
+            # Only update weights if we have enough trades in this specific regime
+            if len(reg_trades) < 5:
+                continue
 
-        # --------------------------------------------------------
-        # STORE IN REDIS
-        # --------------------------------------------------------
+            new_weights = _calculate_new_weights(reg_trades, regime=reg)
 
-        await redis_client.set(
-            WEIGHTS_KEY,
-            json.dumps(new_weights),
-        )
+            # Store in Redis: f"{WEIGHTS_KEY}:{reg}"
+            await redis_client.set(
+                f"{WEIGHTS_KEY}:{reg}",
+                json.dumps(new_weights),
+            )
 
-        logger.info(
-            f"Agent weights updated | user={user_id} | "
-            f"symbol={symbol} | based_on={total} trades | "
-            f"weights={new_weights}"
-        )
+            # Keep global weights updated if calibrating UNKNOWN regime
+            if reg == "UNKNOWN":
+                await redis_client.set(
+                    WEIGHTS_KEY,
+                    json.dumps(new_weights),
+                )
+
+            logger.info(
+                f"Agent weights updated for regime {reg} | user={user_id} | "
+                f"symbol={symbol} | based_on={len(reg_trades)} trades | "
+                f"weights={new_weights}"
+            )
 
     except Exception as e:
         logger.warning(f"Weight update failed (non-fatal): {e}")
@@ -200,9 +273,9 @@ async def maybe_update_weights(user_id: str, symbol: str) -> None:
 # WEIGHT CALCULATION LOGIC
 # ============================================================
 
-def _calculate_new_weights(trades: list) -> dict:
+def _calculate_new_weights(trades: list, regime: str = "UNKNOWN") -> dict:
     """
-    Calculate new weights based on each agent's historical accuracy.
+    Calculate new weights based on each agent's historical accuracy in a given regime.
 
     For each agent:
       1. Filter trades where agent made an active vote (BUY or SELL)
@@ -218,17 +291,24 @@ def _calculate_new_weights(trades: list) -> dict:
     Parameters:
     -----------
     trades : list of closed Trade ORM objects
+    regime : the market regime we are calculating weights for
 
     Returns:
     --------
     Updated weights dict
     """
+    regime = regime.upper()
+    if regime not in DEFAULT_WEIGHTS_BY_REGIME:
+        regime = "UNKNOWN"
+
+    baseline_weights = DEFAULT_WEIGHTS_BY_REGIME[regime]
 
     agent_stats = {
         "SignalAgent":    {"correct": 0, "total": 0},
         "SentimentAgent": {"correct": 0, "total": 0},
         "RiskAgent":      {"correct": 0, "total": 0},
         "PortfolioAgent": {"correct": 0, "total": 0},
+        "MacroAgent":     {"correct": 0, "total": 0},
     }
 
     for trade in trades:
@@ -304,7 +384,7 @@ def _calculate_new_weights(trades: list) -> dict:
 
             inactive_share = inactive_weight_pool / max(len(inactive_agents), 1)
 
-            for agent in DEFAULT_WEIGHTS:
+            for agent in baseline_weights:
                 if agent in active_share:
                     weight = active_share[agent]
                 else:
@@ -316,9 +396,9 @@ def _calculate_new_weights(trades: list) -> dict:
                     4
                 )
         else:
-            new_weights = DEFAULT_WEIGHTS.copy()
+            new_weights = baseline_weights.copy()
     else:
-        new_weights = DEFAULT_WEIGHTS.copy()
+        new_weights = baseline_weights.copy()
 
     # Renormalise so weights sum to 1.0
     total = sum(new_weights.values())

@@ -51,9 +51,13 @@ def _make_state(
     portfolio.realized_pnl_today = 0.0
     portfolio.open_positions = [{"symbol": "RELIANCE", "notional": total_equity * exposure_ratio}]
 
-    signal_vote = MagicMock(spec=AgentVote)
-    signal_vote.decision = "BUY"
-    signal_vote.confidence = signal_confidence
+    signal_vote = AgentVote(
+        agent="SignalAgent",
+        decision="BUY",
+        confidence=signal_confidence,
+        reasoning="Test signal",
+        metadata={"atr": 5.0}
+    )
 
     state = {
         "user_id": "test_user_1",

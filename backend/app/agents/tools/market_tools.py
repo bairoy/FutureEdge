@@ -138,7 +138,27 @@ async def get_india_vix() -> float:
         return 15.0
 
 
+async def get_india_vix_history(period: str = "5d") -> list[float]:
+    """
+    Fetch recent historical India VIX prices from yfinance.
+    """
+    try:
+        import asyncio
+        loop = asyncio.get_running_loop()
+        import yfinance as yf
+        ticker = yf.Ticker("^INDIAVIX")
+        hist = await loop.run_in_executor(None, lambda: ticker.history(period=period))
+        if not hist.empty:
+            prices = hist["Close"].dropna().tolist()
+            logger.info(f"Tool: get_india_vix_history ({period}) = {prices}")
+            return prices
+    except Exception as e:
+        logger.error(f"Failed to fetch India VIX history: {e}")
+    return []
+
+
 async def get_usd_inr() -> dict:
+
     """
     Fetch USD/INR rate and daily percent change.
     """

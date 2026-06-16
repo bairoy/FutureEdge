@@ -87,7 +87,10 @@ class PositionReconciler:
             from app.db.models.trade import Trade
 
             result = await session.execute(
-                select(Trade).where(Trade.status == "OPEN")
+                select(Trade).where(
+                    Trade.status == "OPEN",
+                    Trade.broker == settings.ACTIVE_BROKER.lower(),
+                )
             )
             open_trades = result.scalars().all()
 

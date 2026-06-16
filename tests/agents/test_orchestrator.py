@@ -108,8 +108,8 @@ async def test_consensus_calculation(use_mock_llm):
 @pytest.mark.asyncio
 async def test_consensus_calculation_hold_dilution():
     """Test that weak buy votes get diluted by HOLD votes and result in HOLD/NONE consensus."""
-    sig_vote = AgentVote(agent="SignalAgent", decision="BUY", confidence=0.6, reasoning="Weak signal")
-    sent_vote = AgentVote(agent="SentimentAgent", decision="BUY", confidence=0.5, reasoning="Neutral tweets")
+    sig_vote = AgentVote(agent="SignalAgent", decision="BUY", confidence=0.4, reasoning="Weak signal")
+    sent_vote = AgentVote(agent="SentimentAgent", decision="BUY", confidence=0.3, reasoning="Neutral tweets")
     risk_vote = AgentVote(agent="RiskAgent", decision="HOLD", confidence=0.5, reasoning="Volatile")
     port_vote = AgentVote(agent="PortfolioAgent", decision="HOLD", confidence=0.7, reasoning="Near limit")
 

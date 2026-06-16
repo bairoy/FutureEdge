@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.db.redis import redis_client, KEY_ZERODHA_ACCESS_TOKEN
-from app.auth.dependencies import get_db, require_viewer
+from app.auth.dependencies import get_db, require_viewer, require_risk_manager
 from app.db.models.user import User
 
 router = APIRouter()
@@ -101,7 +101,7 @@ class BrokerSelectRequest(BaseModel):
 @router.post("/auth/broker/select", summary="Set the active broker dynamically")
 async def select_broker(
     req: BrokerSelectRequest,
-    current_user: User = Depends(require_viewer),
+    current_user: User = Depends(require_risk_manager),
 ):
     broker_name = req.broker.lower()
     if broker_name not in ["mock", "zerodha"]:
@@ -165,7 +165,7 @@ async def zerodha_callback(request: Request):
             </body>
         </html>
         """
-        return HTMLResponse(content=error_html, status_code=400)
+        return HTMLResponse(content=error_html.replace("http://localhost:3000", settings.FRONTEND_URL), status_code=400)
 
     try:
         from kiteconnect import KiteConnect
@@ -230,7 +230,7 @@ async def zerodha_callback(request: Request):
             </body>
         </html>
         """
-        return HTMLResponse(content=success_html)
+        return HTMLResponse(content=success_html.replace("http://localhost:3000", settings.FRONTEND_URL))
 
     except Exception as e:
         logger.exception(f"Failed to generate Zerodha access token: {e}")
@@ -253,7 +253,7 @@ async def zerodha_callback(request: Request):
                     <p>An error occurred while exchanging the request token.</p>
                     <p class="error">{str(e)}</p>
                     <br/>
-                    <a href="http://localhost:3000/dashboard" class="btn">Back to Dashboard</a>
+                    <a href="{settings.FRONTEND_URL}/dashboard" class="btn">Back to Dashboard</a>
                 </div>
             </body>
         </html>

@@ -22,23 +22,41 @@ async def macro_agent_node(state: AgentState) -> dict:
         confidence = 0.5
         metadata = {}
         
-        # 1. Fetch India VIX (Market Volatility/Fear)
+        # 1. Fetch India VIX (Market Volatility/Fear) and history
+        from app.agents.tools.market_tools import get_india_vix_history
         vix = await get_india_vix()
         metadata["india_vix"] = vix
-        
+
+        vix_history = await get_india_vix_history(period="5d")
+        if vix_history:
+            vix_5day_avg = sum(vix_history) / len(vix_history)
+        else:
+            vix_5day_avg = vix
+        metadata["vix_5day_avg"] = round(vix_5day_avg, 2)
+
         # 2. Fetch USD/INR change
         usd_inr_data = await get_usd_inr()
         usd_inr_rate = usd_inr_data["rate"]
         usd_inr_change = usd_inr_data["change_pct"]
         metadata["usd_inr_rate"] = usd_inr_rate
         metadata["usd_inr_change_pct"] = usd_inr_change
-        
-        # 3. Decision Logic
-        # VETO if VIX > 25 (extreme market fear/panic)
-        if vix > 25.0:
+
+        # 3. Decision Logic using settings
+        from app.core.config import settings
+
+        # VIX trend calculations
+        vix_rising_fast = vix > vix_5day_avg * (1 + settings.VIX_SPIKE_PCT / 100.0)
+        vix_extreme = vix > settings.VIX_EXTREME_THRESHOLD
+
+        # VETO if VIX is extreme or VIX is rising fast (spike)
+        if vix_extreme:
             decision = "VETO"
             confidence = 0.95
-            reasons.append(f"India VIX {vix:.2f} exceeds extreme fear threshold (25.0) — trading halted")
+            reasons.append(f"India VIX {vix:.2f} is extreme (> {settings.VIX_EXTREME_THRESHOLD}) — trading halted")
+        elif vix_rising_fast:
+            decision = "VETO"
+            confidence = 0.92
+            reasons.append(f"India VIX spiked to {vix:.2f} (+{(vix/vix_5day_avg - 1)*100:.1f}% vs 5-day avg {vix_5day_avg:.2f}) — trading halted")
         # VETO if INR weakening > 1.2% in a day (global risk-off / currency depreciation)
         elif usd_inr_change > 1.2:
             decision = "VETO"
@@ -47,14 +65,15 @@ async def macro_agent_node(state: AgentState) -> dict:
         else:
             # Macro environment dictates biases
             # Higher VIX dampens buy signals and pushes bias to SELL/HOLD
-            if vix > 20.0:
+            if vix > settings.VIX_CAUTION_THRESHOLD:
                 decision = "SELL"
                 confidence = 0.60
-                reasons.append(f"Elevated India VIX ({vix:.2f}) indicates market tension — sell bias")
+                reasons.append(f"Elevated India VIX ({vix:.2f} > caution {settings.VIX_CAUTION_THRESHOLD}) — caution/sell bias")
             elif vix < 13.0:
                 decision = "BUY"
                 confidence = 0.65
                 reasons.append(f"Low India VIX ({vix:.2f}) indicates market confidence — buy bias")
+
             
             # USD/INR direction
             if usd_inr_change > 0.5:

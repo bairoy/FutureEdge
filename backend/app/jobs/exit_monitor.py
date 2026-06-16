@@ -220,10 +220,13 @@ class ExitMonitor:
         sl_hit = False
         tp_hit = False
 
+        # ISSUE 6: Add a slippage buffer (0.05%) when checking SL/TP to model expected fill price
+        slippage_buffer = current_price * 0.0005
+
         if trade.stop_loss is not None:
-            if trade.direction == "LONG" and current_price <= trade.stop_loss:
+            if trade.direction == "LONG" and (current_price - slippage_buffer) <= trade.stop_loss:
                 sl_hit = True
-            elif trade.direction == "SHORT" and current_price >= trade.stop_loss:
+            elif trade.direction == "SHORT" and (current_price + slippage_buffer) >= trade.stop_loss:
                 sl_hit = True
 
         # --------------------------------------------------------
@@ -231,10 +234,11 @@ class ExitMonitor:
         # --------------------------------------------------------
 
         if trade.take_profit is not None:
-            if trade.direction == "LONG" and current_price >= trade.take_profit:
+            if trade.direction == "LONG" and (current_price - slippage_buffer) >= trade.take_profit:
                 tp_hit = True
-            elif trade.direction == "SHORT" and current_price <= trade.take_profit:
+            elif trade.direction == "SHORT" and (current_price + slippage_buffer) <= trade.take_profit:
                 tp_hit = True
+
 
         # --------------------------------------------------------
         # TRIGGER EXIT
@@ -266,7 +270,7 @@ class ExitMonitor:
         Place an exit order and close the trade in the database.
         """
 
-        if trade.broker == "paper":
+        if trade.broker in ("paper", "mock"):
             from app.brokers.mock import MockBroker
             broker = MockBroker()
         else:
@@ -323,14 +327,35 @@ class ExitMonitor:
 
         if closed_trade:
             pnl = closed_trade.realized_pnl or 0.0
-            if closed_trade.broker != "paper":
+            if closed_trade.broker not in ("paper", "mock"):
                 self._daily_pnl += pnl
 
             logger.info(
                 f"✅ Trade CLOSED | {reason} | "
                 f"trade={trade.id} | PnL=₹{pnl:.2f} | "
-                f"daily_pnl=₹{self._daily_pnl:.2f} (excluding paper)"
+                f"daily_pnl=₹{self._daily_pnl:.2f} (excluding paper/mock)"
             )
+
+            # Send Telegram notification for the exit
+            try:
+                from app.services.telegram_service import send_telegram_message
+                pnl_str = f"₹{pnl:.2f}"
+                pnl_prefix = "🟢 WIN" if pnl > 0 else ("🔴 LOSS" if pnl < 0 else "⚪ NEUTRAL")
+                mode_str = "PAPER" if closed_trade.broker in ("paper", "mock") else "LIVE"
+                msg = (
+                    f"<b>🏁 POSITION CLOSED ({reason} | {mode_str})</b>\n"
+                    f"-----------------------------------------\n"
+                    f"<b>Symbol:</b> {trade.symbol}\n"
+                    f"<b>Direction:</b> {trade.direction}\n"
+                    f"<b>Entry Price:</b> ₹{trade.entry_price:.2f}\n"
+                    f"<b>Exit Price:</b> ₹{actual_exit:.2f}\n"
+                    f"<b>Quantity:</b> {trade.quantity}\n"
+                    f"<b>PnL Outcome:</b> {pnl_prefix} ({pnl_str})\n"
+                    f"-----------------------------------------"
+                )
+                await send_telegram_message(msg)
+            except Exception as tg_err:
+                logger.warning(f"Failed to send Telegram exit notification: {tg_err}")
 
             # Update episodic memory outcome in Qdrant (Phase 2 — new)
             try:

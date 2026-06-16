@@ -127,6 +127,7 @@ async def test_same_candle_reentry_blocked(mock_load):
         take_profit_pct=3.0,
         size_pct=50.0,
         slippage_pct=0.0,
+        trailing_stop_enabled=False,
     )
 
     trades = result["trades"]

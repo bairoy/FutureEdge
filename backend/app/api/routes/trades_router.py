@@ -130,7 +130,7 @@ async def close_trade_endpoint(
 
     # 2. Get current price
     from app.brokers.base import get_broker
-    if trade.broker == "paper":
+    if trade.broker in ("paper", "mock"):
         from app.brokers.mock import MockBroker
         broker = MockBroker()
     else:

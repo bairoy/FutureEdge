@@ -162,6 +162,12 @@ async def run_backtest(
     take_profit_pct: float = 3.0,
     size_pct: float = 10.0,
     slippage_pct: float = 0.05,
+    execution_delay_candles: int = 0,
+    trailing_stop_enabled: bool = True,
+    trailing_stop_trigger_pct: float = 2.0,
+    trailing_stop_sl_pct: float = 1.5,
+    start_idx: int = None,
+    end_idx: int = None,
 ) -> dict:
     """
     Run a historical simulation on OHLCV candles.
@@ -185,6 +191,10 @@ async def run_backtest(
                 "profit_factor": 1.0,
                 "max_drawdown_pct": 0.0,
                 "sharpe_ratio": 0.0,
+                "max_consecutive_losses": 0,
+                "avg_winner_hold_minutes": 0.0,
+                "avg_loser_hold_minutes": 0.0,
+                "time_of_day_breakdown": {},
             },
             "trades": [],
             "equity_curve": [],
@@ -207,12 +217,72 @@ async def run_backtest(
     trades = []
     equity_curve = []
 
+    # Trailing Stop variables
+    peak_price = 0.0
+    valley_price = 0.0
+    sl_price = 0.0
+    tp_price = 0.0
+    initial_sl_price = 0.0
+
+    # Execution Delay variables
+    pending_entry = None  # None or dict
+
     # Prepare historical sliding window
     for t in range(30, len(candles)):
         current_candle = candles[t]
         timestamp = current_candle["timestamp"]
         open_price = current_candle["open"]
         exited_this_candle = False
+
+        # Restrict entries/evaluations to window if start_idx/end_idx are provided
+        is_in_trading_window = True
+        if start_idx is not None and t < start_idx:
+            is_in_trading_window = False
+        if end_idx is not None and t >= end_idx:
+            is_in_trading_window = False
+
+        # --- 0. Check pending entry orders (execution delay simulation) ---
+        if pending_entry is not None and t >= pending_entry["trigger_time_idx"]:
+            pe_dir = pending_entry["direction"]
+            pe_reg = pending_entry["regime"]
+            pe_sl_pct = pending_entry["dynamic_sl_pct"]
+            pe_tp_pct = pending_entry["dynamic_tp_pct"]
+
+            if position == 0 and not exited_this_candle:
+                trade_size_val = cash * (size_pct / 100.0)
+                if pe_dir == "BUY":
+                    entry_price_with_slippage = open_price * (1.0 + slippage_pct / 100.0)
+                    shares = int(trade_size_val / entry_price_with_slippage)
+                    if shares > 0:
+                        gross_value = shares * entry_price_with_slippage
+                        entry_cost = calculate_transaction_cost(gross_value, is_buy=True)
+                        cash -= (gross_value + entry_cost)
+                        position = shares
+                        entry_price = entry_price_with_slippage
+                        entry_time = timestamp
+                        entry_regime = pe_reg
+                        direction = "LONG"
+                        peak_price = open_price
+                        sl_price = entry_price * (1.0 - pe_sl_pct / 100.0)
+                        initial_sl_price = sl_price
+                        tp_price = entry_price * (1.0 + pe_tp_pct / 100.0)
+                elif pe_dir == "SELL":
+                    entry_price_with_slippage = open_price * (1.0 - slippage_pct / 100.0)
+                    shares = int(trade_size_val / entry_price_with_slippage)
+                    if shares > 0:
+                        gross_value = shares * entry_price_with_slippage
+                        entry_cost = calculate_transaction_cost(gross_value, is_buy=False)
+                        cash -= (gross_value + entry_cost)
+                        position = -shares
+                        entry_price = entry_price_with_slippage
+                        entry_time = timestamp
+                        entry_regime = pe_reg
+                        direction = "SHORT"
+                        valley_price = open_price
+                        sl_price = entry_price * (1.0 + pe_sl_pct / 100.0)
+                        initial_sl_price = sl_price
+                        tp_price = entry_price * (1.0 - pe_tp_pct / 100.0)
+            pending_entry = None
 
         # Slices indicators at t-1 to compute inputs before current candle open
         row_prev = df.iloc[t - 1]
@@ -296,37 +366,53 @@ async def run_backtest(
             dynamic_sl_pct = stop_loss_pct
             dynamic_tp_pct = take_profit_pct
 
+        # --- Trailing Stop Adjustment ---
+        if trailing_stop_enabled and position != 0:
+            if position > 0:  # LONG
+                if current_candle["high"] > peak_price:
+                    peak_price = current_candle["high"]
+                unrealized_gain = (peak_price - entry_price) / entry_price
+                if unrealized_gain >= (trailing_stop_trigger_pct / 100.0):
+                    new_sl_price = peak_price * (1.0 - (trailing_stop_sl_pct / 100.0))
+                    sl_price = max(sl_price, new_sl_price)
+            else:  # SHORT
+                if current_candle["low"] < valley_price:
+                    valley_price = current_candle["low"]
+                unrealized_gain = (entry_price - valley_price) / entry_price
+                if unrealized_gain >= (trailing_stop_trigger_pct / 100.0):
+                    new_sl_price = valley_price * (1.0 + (trailing_stop_sl_pct / 100.0))
+                    sl_price = min(sl_price, new_sl_price)
+
         # --- Check exit conditions (Stop-Loss and Take-Profit) ---
         exit_triggered = False
-        exit_price = 0.0
         exit_reason = ""
 
         if position > 0:  # LONG
-            sl_price = entry_price * (1.0 - dynamic_sl_pct / 100.0)
-            tp_price = entry_price * (1.0 + dynamic_tp_pct / 100.0)
-
             # Check Stop Loss first (conservative)
             if current_candle["low"] <= sl_price:
                 exit_triggered = True
                 exit_price = sl_price
-                exit_reason = "STOP_LOSS"
+                exit_reason = "TRAILING_STOP" if sl_price > initial_sl_price else "STOP_LOSS"
             elif current_candle["high"] >= tp_price:
                 exit_triggered = True
                 exit_price = tp_price
                 exit_reason = "TAKE_PROFIT"
 
         elif position < 0:  # SHORT
-            sl_price = entry_price * (1.0 + dynamic_sl_pct / 100.0)
-            tp_price = entry_price * (1.0 - dynamic_tp_pct / 100.0)
-
             if current_candle["high"] >= sl_price:
                 exit_triggered = True
                 exit_price = sl_price
-                exit_reason = "STOP_LOSS"
+                exit_reason = "TRAILING_STOP" if sl_price < initial_sl_price else "STOP_LOSS"
             elif current_candle["low"] <= tp_price:
                 exit_triggered = True
                 exit_price = tp_price
                 exit_reason = "TAKE_PROFIT"
+
+        # Force-exit if end of testing window reached
+        if position != 0 and end_idx is not None and t == end_idx - 1:
+            exit_triggered = True
+            exit_price = current_candle["close"]
+            exit_reason = "END_OF_TEST_WINDOW"
 
         if exit_triggered:
             # Apply slippage to exit price (selling LONG -> lower price, buying SHORT -> higher price)
@@ -365,124 +451,173 @@ async def run_backtest(
 
         # --- Check execution signals (BUY/SELL Reversals or New entries) ---
         if position == 0 and not exited_this_candle:
-            if decision == "BUY":
-                # Open LONG position
-                trade_size_val = cash * (size_pct / 100.0)
-                entry_price_with_slippage = open_price * (1.0 + slippage_pct / 100.0)
-                shares = int(trade_size_val / entry_price_with_slippage)
-
-                if shares > 0:
-                    gross_value = shares * entry_price_with_slippage
-                    entry_cost = calculate_transaction_cost(gross_value, is_buy=True)
-                    cash -= (gross_value + entry_cost)
-
-                    position = shares
-                    entry_price = entry_price_with_slippage
-                    entry_time = timestamp
-                    entry_regime = regime          # track regime at entry
-                    direction = "LONG"
-
-            elif decision == "SELL":
-                # Open SHORT position
-                trade_size_val = cash * (size_pct / 100.0)
-                entry_price_with_slippage = open_price * (1.0 - slippage_pct / 100.0)
-                shares = int(trade_size_val / entry_price_with_slippage)
-
-                if shares > 0:
-                    gross_value = shares * entry_price_with_slippage
-                    entry_cost = calculate_transaction_cost(gross_value, is_buy=False)
-                    cash -= (gross_value + entry_cost)
-
-                    position = -shares
-                    entry_price = entry_price_with_slippage
-                    entry_time = timestamp
-                    entry_regime = regime          # track regime at entry
-                    direction = "SHORT"
+            # Check if there is an active decision and we are in the trading window
+            if is_in_trading_window and decision in ("BUY", "SELL"):
+                if execution_delay_candles > 0:
+                    # Queue a pending entry
+                    pending_entry = {
+                        "direction": decision,
+                        "trigger_time_idx": t + execution_delay_candles,
+                        "dynamic_sl_pct": dynamic_sl_pct,
+                        "dynamic_tp_pct": dynamic_tp_pct,
+                        "regime": regime,
+                    }
+                else:
+                    # Execute immediately at current candle's open price
+                    trade_size_val = cash * (size_pct / 100.0)
+                    if decision == "BUY":
+                        entry_price_with_slippage = open_price * (1.0 + slippage_pct / 100.0)
+                        shares = int(trade_size_val / entry_price_with_slippage)
+                        if shares > 0:
+                            gross_value = shares * entry_price_with_slippage
+                            entry_cost = calculate_transaction_cost(gross_value, is_buy=True)
+                            cash -= (gross_value + entry_cost)
+                            position = shares
+                            entry_price = entry_price_with_slippage
+                            entry_time = timestamp
+                            entry_regime = regime
+                            direction = "LONG"
+                            peak_price = open_price
+                            sl_price = entry_price * (1.0 - dynamic_sl_pct / 100.0)
+                            initial_sl_price = sl_price
+                            tp_price = entry_price * (1.0 + dynamic_tp_pct / 100.0)
+                    elif decision == "SELL":
+                        entry_price_with_slippage = open_price * (1.0 - slippage_pct / 100.0)
+                        shares = int(trade_size_val / entry_price_with_slippage)
+                        if shares > 0:
+                            gross_value = shares * entry_price_with_slippage
+                            entry_cost = calculate_transaction_cost(gross_value, is_buy=False)
+                            cash -= (gross_value + entry_cost)
+                            position = -shares
+                            entry_price = entry_price_with_slippage
+                            entry_time = timestamp
+                            entry_regime = regime
+                            direction = "SHORT"
+                            valley_price = open_price
+                            sl_price = entry_price * (1.0 + dynamic_sl_pct / 100.0)
+                            initial_sl_price = sl_price
+                            tp_price = entry_price * (1.0 - dynamic_tp_pct / 100.0)
 
         else:  # Active position exists, check for reversal
-            if direction == "LONG" and decision == "SELL":
-                # Close LONG
-                exit_price_with_slippage = open_price * (1.0 - slippage_pct / 100.0)
-                shares_qty = position
-                gross_value = shares_qty * exit_price_with_slippage
-                exit_cost = calculate_transaction_cost(gross_value, is_buy=False)
+            # Reverse signals are only processed if we are in the trading window
+            if is_in_trading_window:
+                if direction == "LONG" and decision == "SELL":
+                    # Close LONG
+                    exit_price_with_slippage = open_price * (1.0 - slippage_pct / 100.0)
+                    shares_qty = position
+                    gross_value = shares_qty * exit_price_with_slippage
+                    exit_cost = calculate_transaction_cost(gross_value, is_buy=False)
 
-                cash += gross_value - exit_cost
-                trade_pnl = (exit_price_with_slippage * position) - (entry_price * position) - exit_cost
-                pnl_pct = (trade_pnl / (shares_qty * entry_price)) * 100.0
+                    cash += gross_value - exit_cost
+                    trade_pnl = (exit_price_with_slippage * position) - (entry_price * position) - exit_cost
+                    pnl_pct = (trade_pnl / (shares_qty * entry_price)) * 100.0
 
-                trades.append({
-                    "symbol": symbol,
-                    "direction": "LONG",
-                    "entry_time": entry_time,
-                    "exit_time": timestamp,
-                    "entry_price": round(entry_price, 2),
-                    "exit_price": round(exit_price_with_slippage, 2),
-                    "shares": position,
-                    "pnl": round(trade_pnl, 2),
-                    "pnl_pct": round(pnl_pct, 2),
-                    "exit_reason": "SIGNAL_REVERSAL",
-                })
+                    trades.append({
+                        "symbol": symbol,
+                        "direction": "LONG",
+                        "entry_time": entry_time,
+                        "exit_time": timestamp,
+                        "entry_price": round(entry_price, 2),
+                        "exit_price": round(exit_price_with_slippage, 2),
+                        "shares": position,
+                        "pnl": round(trade_pnl, 2),
+                        "pnl_pct": round(pnl_pct, 2),
+                        "exit_reason": "SIGNAL_REVERSAL",
+                        "regime": entry_regime,
+                    })
 
-                # Open SHORT
-                trade_size_val = cash * (size_pct / 100.0)
-                entry_price_with_slippage = open_price * (1.0 - slippage_pct / 100.0)
-                shares = int(trade_size_val / entry_price_with_slippage)
+                    # Open SHORT (if delayed, queue it; otherwise execute immediately)
+                    if execution_delay_candles > 0:
+                        pending_entry = {
+                            "direction": "SELL",
+                            "trigger_time_idx": t + execution_delay_candles,
+                            "dynamic_sl_pct": dynamic_sl_pct,
+                            "dynamic_tp_pct": dynamic_tp_pct,
+                            "regime": regime,
+                        }
+                        position = 0
+                        direction = "NONE"
+                    else:
+                        trade_size_val = cash * (size_pct / 100.0)
+                        entry_price_with_slippage = open_price * (1.0 - slippage_pct / 100.0)
+                        shares = int(trade_size_val / entry_price_with_slippage)
 
-                if shares > 0:
-                    gross_value = shares * entry_price_with_slippage
-                    entry_cost = calculate_transaction_cost(gross_value, is_buy=False)
-                    cash -= (gross_value + entry_cost)
+                        if shares > 0:
+                            gross_value = shares * entry_price_with_slippage
+                            entry_cost = calculate_transaction_cost(gross_value, is_buy=False)
+                            cash -= (gross_value + entry_cost)
 
-                    position = -shares
-                    entry_price = entry_price_with_slippage
-                    entry_time = timestamp
-                    direction = "SHORT"
-                else:
-                    position = 0
-                    direction = "NONE"
+                            position = -shares
+                            entry_price = entry_price_with_slippage
+                            entry_time = timestamp
+                            entry_regime = regime
+                            direction = "SHORT"
+                            valley_price = open_price
+                            sl_price = entry_price * (1.0 + dynamic_sl_pct / 100.0)
+                            initial_sl_price = sl_price
+                            tp_price = entry_price * (1.0 - dynamic_tp_pct / 100.0)
+                        else:
+                            position = 0
+                            direction = "NONE"
 
-            elif direction == "SHORT" and decision == "BUY":
-                # Close SHORT
-                exit_price_with_slippage = open_price * (1.0 + slippage_pct / 100.0)
-                shares_qty = abs(position)
-                gross_value = shares_qty * exit_price_with_slippage
-                exit_cost = calculate_transaction_cost(gross_value, is_buy=True)
+                elif direction == "SHORT" and decision == "BUY":
+                    # Close SHORT
+                    exit_price_with_slippage = open_price * (1.0 + slippage_pct / 100.0)
+                    shares_qty = abs(position)
+                    gross_value = shares_qty * exit_price_with_slippage
+                    exit_cost = calculate_transaction_cost(gross_value, is_buy=True)
 
-                cash += gross_value - exit_cost
-                trade_pnl = (exit_price_with_slippage * position) - (entry_price * position) - exit_cost
-                pnl_pct = (trade_pnl / (shares_qty * entry_price)) * 100.0
+                    cash += gross_value - exit_cost
+                    trade_pnl = (exit_price_with_slippage * position) - (entry_price * position) - exit_cost
+                    pnl_pct = (trade_pnl / (shares_qty * entry_price)) * 100.0
 
-                trades.append({
-                    "symbol": symbol,
-                    "direction": "SHORT",
-                    "entry_time": entry_time,
-                    "exit_time": timestamp,
-                    "entry_price": round(entry_price, 2),
-                    "exit_price": round(exit_price_with_slippage, 2),
-                    "shares": shares_qty,
-                    "pnl": round(trade_pnl, 2),
-                    "pnl_pct": round(pnl_pct, 2),
-                    "exit_reason": "SIGNAL_REVERSAL",
-                })
+                    trades.append({
+                        "symbol": symbol,
+                        "direction": "SHORT",
+                        "entry_time": entry_time,
+                        "exit_time": timestamp,
+                        "entry_price": round(entry_price, 2),
+                        "exit_price": round(exit_price_with_slippage, 2),
+                        "shares": shares_qty,
+                        "pnl": round(trade_pnl, 2),
+                        "pnl_pct": round(pnl_pct, 2),
+                        "exit_reason": "SIGNAL_REVERSAL",
+                        "regime": entry_regime,
+                    })
 
-                # Open LONG
-                trade_size_val = cash * (size_pct / 100.0)
-                entry_price_with_slippage = open_price * (1.0 + slippage_pct / 100.0)
-                shares = int(trade_size_val / entry_price_with_slippage)
+                    # Open LONG (if delayed, queue it; otherwise execute immediately)
+                    if execution_delay_candles > 0:
+                        pending_entry = {
+                            "direction": "BUY",
+                            "trigger_time_idx": t + execution_delay_candles,
+                            "dynamic_sl_pct": dynamic_sl_pct,
+                            "dynamic_tp_pct": dynamic_tp_pct,
+                            "regime": regime,
+                        }
+                        position = 0
+                        direction = "NONE"
+                    else:
+                        trade_size_val = cash * (size_pct / 100.0)
+                        entry_price_with_slippage = open_price * (1.0 + slippage_pct / 100.0)
+                        shares = int(trade_size_val / entry_price_with_slippage)
 
-                if shares > 0:
-                    gross_value = shares * entry_price_with_slippage
-                    entry_cost = calculate_transaction_cost(gross_value, is_buy=True)
-                    cash -= (gross_value + entry_cost)
+                        if shares > 0:
+                            gross_value = shares * entry_price_with_slippage
+                            entry_cost = calculate_transaction_cost(gross_value, is_buy=True)
+                            cash -= (gross_value + entry_cost)
 
-                    position = shares
-                    entry_price = entry_price_with_slippage
-                    entry_time = timestamp
-                    direction = "LONG"
-                else:
-                    position = 0
-                    direction = "NONE"
+                            position = shares
+                            entry_price = entry_price_with_slippage
+                            entry_time = timestamp
+                            entry_regime = regime
+                            direction = "LONG"
+                            peak_price = open_price
+                            sl_price = entry_price * (1.0 - dynamic_sl_pct / 100.0)
+                            initial_sl_price = sl_price
+                            tp_price = entry_price * (1.0 + dynamic_tp_pct / 100.0)
+                        else:
+                            position = 0
+                            direction = "NONE"
 
         # --- Track Equity Curve ---
         current_candle_close = current_candle["close"]
@@ -490,7 +625,6 @@ async def run_backtest(
         if position > 0:
             position_value = position * current_candle_close
         elif position < 0:
-            # Short position value: entry value + (entry_price - close_price)*qty
             position_value = abs(position) * entry_price + (entry_price - current_candle_close) * abs(position)
 
         current_equity = cash + position_value
@@ -499,7 +633,7 @@ async def run_backtest(
             "equity": round(current_equity, 2),
         })
 
-    # Close any remaining position at end
+    # Close any remaining position at end of backtest data range
     if position != 0:
         last_candle = candles[-1]
         close_price = last_candle["close"]
@@ -527,7 +661,8 @@ async def run_backtest(
             "exit_reason": "END_OF_DATA",
             "regime":      entry_regime,
         })
-        equity_curve[-1]["equity"] = round(cash, 2)
+        if equity_curve:
+            equity_curve[-1]["equity"] = round(cash, 2)
 
     # 4. Compute Metrics
     total_trades = len(trades)
@@ -558,6 +693,54 @@ async def run_backtest(
         if dd > max_dd:
             max_dd = dd
 
+    # GAP 1: Max consecutive losses (losing streak)
+    max_consecutive_losses = 0
+    current_streak = 0
+    for trade in trades:
+        if trade["pnl"] < 0:
+            current_streak += 1
+            max_consecutive_losses = max(max_consecutive_losses, current_streak)
+        else:
+            current_streak = 0
+
+    # GAP 2: Holding period analysis
+    winning_hold_times = []
+    losing_hold_times = []
+    for trade in trades:
+        try:
+            entry_dt = pd.to_datetime(trade["entry_time"])
+            exit_dt = pd.to_datetime(trade["exit_time"])
+            hold_minutes = (exit_dt - entry_dt).total_seconds() / 60.0
+            trade["hold_minutes"] = round(hold_minutes, 1)
+            if trade["pnl"] > 0:
+                winning_hold_times.append(hold_minutes)
+            elif trade["pnl"] < 0:
+                losing_hold_times.append(hold_minutes)
+        except Exception:
+            trade["hold_minutes"] = 0.0
+
+    avg_winner_hold = round(sum(winning_hold_times) / len(winning_hold_times), 1) if winning_hold_times else 0.0
+    avg_loser_hold = round(sum(losing_hold_times) / len(losing_hold_times), 1) if losing_hold_times else 0.0
+
+    # GAP 3: Time of day performance breakdown
+    time_of_day_stats = {}
+    for trade in trades:
+        try:
+            entry_dt = pd.to_datetime(trade["entry_time"])
+            hour = entry_dt.hour
+            time_of_day_stats.setdefault(hour, []).append(trade["pnl"])
+        except Exception:
+            pass
+
+    time_of_day_breakdown = {}
+    for hour, pnls in time_of_day_stats.items():
+        wins = [p for p in pnls if p > 0]
+        time_of_day_breakdown[hour] = {
+            "total_trades": len(pnls),
+            "win_rate_pct": round(len(wins) / len(pnls) * 100, 2) if pnls else 0.0,
+            "total_pnl": round(sum(pnls), 2),
+        }
+
     # ── Time-Series Sharpe Ratio (annualized) ──────────────────────────────
     daily_equities: dict = {}
     for pt in equity_curve:
@@ -583,10 +766,9 @@ async def run_backtest(
         sharpe = 0.0
 
     # ── Calmar Ratio = CAGR / Max Drawdown ────────────────────────────────
-    # For short backtests we approximate CAGR from return_pct
     calmar = round(return_pct / max_dd, 2) if max_dd > 0 else 0.0
 
-    # ── Per-Regime Breakdown (key research metric) ─────────────────────────
+    # ── Per-Regime Breakdown ─────────────────────────
     regimes_seen = {t.get("regime", "UNKNOWN") for t in trades}
     regime_breakdown: dict = {}
     for reg in regimes_seen:
@@ -621,8 +803,164 @@ async def run_backtest(
             # ── Capital ──────────────────────────────────────────────────
             "initial_capital":    initial_capital,
             "final_capital":      round(cash, 2),
+            # ── GAP 1-3 additions ─────────────────────────────────────────
+            "max_consecutive_losses": max_consecutive_losses,
+            "avg_winner_hold_minutes": avg_winner_hold,
+            "avg_loser_hold_minutes": avg_loser_hold,
+            "time_of_day_breakdown": time_of_day_breakdown,
+            "correlation_filter_note": "Portfolio-level correlation filter is RECOMMENDED for multiple live symbols to avoid concentration risk.",
         },
-        "regime_breakdown": regime_breakdown,   # per-regime win rates for research paper
+        "regime_breakdown": regime_breakdown,
         "trades":           trades,
         "equity_curve":     equity_curve,
     }
+
+
+async def run_walk_forward_backtest(
+    symbol: str,
+    period: str = "6mo",
+    interval: str = "5m",
+    train_pct: float = 0.70,
+    n_folds: int = 4,
+    initial_capital: float = 100000.0,
+    stop_loss_pct: float = 1.5,
+    take_profit_pct: float = 3.0,
+    size_pct: float = 10.0,
+    slippage_pct: float = 0.05,
+    execution_delay_candles: int = 0,
+    trailing_stop_enabled: bool = True,
+    trailing_stop_trigger_pct: float = 2.0,
+    trailing_stop_sl_pct: float = 1.5,
+) -> dict:
+    """
+    Run walk-forward validation backtest by splitting historical data into rolling folds.
+    """
+    candles = load_historical_candles(symbol, period=period, interval=interval)
+    if not candles or len(candles) < 100:
+        return {
+            "status": "error",
+            "message": f"Insufficient historical candles for walk-forward validation (minimum 100 needed, got {len(candles) if candles else 0})",
+        }
+
+    L = len(candles)
+    test_chunk_size = int((L * (1.0 - train_pct)) / n_folds)
+    if test_chunk_size < 10:
+        return {
+            "status": "error",
+            "message": f"Walk-forward validation test chunk size too small ({test_chunk_size} candles). Increase data range or decrease n_folds.",
+        }
+
+    folds = []
+    all_test_trades = []
+    
+    # Capital starts at initial_capital and resets per fold to isolate metrics
+    for i in range(n_folds):
+        train_end = int(L * train_pct) + i * test_chunk_size
+        test_start = train_end
+        test_end = min(test_start + test_chunk_size, L)
+        
+        logger.info(f"Walk-forward Fold {i+1}/{n_folds} | Test window indices: [{test_start}, {test_end})")
+        
+        res = await run_backtest(
+            symbol=symbol,
+            period=period,
+            interval=interval,
+            initial_capital=initial_capital,
+            stop_loss_pct=stop_loss_pct,
+            take_profit_pct=take_profit_pct,
+            size_pct=size_pct,
+            slippage_pct=slippage_pct,
+            execution_delay_candles=execution_delay_candles,
+            trailing_stop_enabled=trailing_stop_enabled,
+            trailing_stop_trigger_pct=trailing_stop_trigger_pct,
+            trailing_stop_sl_pct=trailing_stop_sl_pct,
+            start_idx=test_start,
+            end_idx=test_end,
+        )
+        
+        fold_trades = res.get("trades", [])
+        all_test_trades.extend(fold_trades)
+        
+        folds.append({
+            "fold_index": i + 1,
+            "test_start_time": candles[test_start]["timestamp"],
+            "test_end_time": candles[min(test_end, L - 1)]["timestamp"],
+            "metrics": res.get("metrics", {}),
+            "regime_breakdown": res.get("regime_breakdown", {}),
+        })
+
+    # Compute aggregate out-of-sample metrics
+    total_trades = len(all_test_trades)
+    winning_trades = [t for t in all_test_trades if t["pnl"] > 0]
+    losing_trades = [t for t in all_test_trades if t["pnl"] < 0]
+    
+    win_rate = (len(winning_trades) / total_trades * 100.0) if total_trades > 0 else 0.0
+    total_pnl = sum(t["pnl"] for t in all_test_trades)
+    return_pct = (total_pnl / initial_capital) * 100.0
+    
+    gross_profits = sum([t["pnl"] for t in winning_trades])
+    gross_losses = sum([abs(t["pnl"]) for t in losing_trades])
+    profit_factor = round(gross_profits / gross_losses, 2) if gross_losses > 0 else (round(gross_profits, 2) if gross_profits > 0 else 1.0)
+    
+    max_consecutive_losses = 0
+    current_streak = 0
+    for trade in all_test_trades:
+        if trade["pnl"] < 0:
+            current_streak += 1
+            max_consecutive_losses = max(max_consecutive_losses, current_streak)
+        else:
+            current_streak = 0
+            
+    winning_hold_times = []
+    losing_hold_times = []
+    for trade in all_test_trades:
+        if "hold_minutes" in trade:
+            if trade["pnl"] > 0:
+                winning_hold_times.append(trade["hold_minutes"])
+            elif trade["pnl"] < 0:
+                losing_hold_times.append(trade["hold_minutes"])
+                
+    avg_winner_hold = round(sum(winning_hold_times) / len(winning_hold_times), 1) if winning_hold_times else 0.0
+    avg_loser_hold = round(sum(losing_hold_times) / len(losing_hold_times), 1) if losing_hold_times else 0.0
+    
+    # Time-of-day breakdown for aggregate
+    time_of_day_stats = {}
+    for trade in all_test_trades:
+        try:
+            entry_dt = pd.to_datetime(trade["entry_time"])
+            hour = entry_dt.hour
+            time_of_day_stats.setdefault(hour, []).append(trade["pnl"])
+        except Exception:
+            pass
+
+    time_of_day_breakdown = {}
+    for hour, pnls in time_of_day_stats.items():
+        wins = [p for p in pnls if p > 0]
+        time_of_day_breakdown[hour] = {
+            "total_trades": len(pnls),
+            "win_rate_pct": round(len(wins) / len(pnls) * 100, 2) if pnls else 0.0,
+            "total_pnl": round(sum(pnls), 2),
+        }
+
+    aggregate_metrics = {
+        "total_trades": total_trades,
+        "win_rate": round(win_rate, 2),
+        "total_pnl": round(total_pnl, 2),
+        "return_pct": round(return_pct, 2),
+        "profit_factor": profit_factor,
+        "max_consecutive_losses": max_consecutive_losses,
+        "avg_winner_hold_minutes": avg_winner_hold,
+        "avg_loser_hold_minutes": avg_loser_hold,
+        "time_of_day_breakdown": time_of_day_breakdown,
+        "correlation_filter_note": "Portfolio-level correlation filter is RECOMMENDED for multiple live symbols to avoid concentration risk.",
+    }
+
+    return {
+        "symbol": symbol,
+        "period": period,
+        "interval": interval,
+        "folds": folds,
+        "aggregate_metrics": aggregate_metrics,
+        "all_trades": all_test_trades,
+    }
+

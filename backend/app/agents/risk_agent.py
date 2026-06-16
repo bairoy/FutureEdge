@@ -276,7 +276,17 @@ async def risk_agent_node(state: AgentState) -> dict:
         # in professional trading to reduce volatility.
 
         user_id = state.get("user_id", "anonymous")
-        kelly_fraction = await _calculate_kelly(symbol, user_id)
+        price = ctx.current_price
+
+        # Extract ATR for cold start sizing
+        signal_vote = state.get("signal_vote")
+        atr = None
+        if signal_vote and signal_vote.metadata:
+            atr = signal_vote.metadata.get("atr")
+        if not atr or atr <= 0:
+            atr = price * 0.002  # fallback
+
+        kelly_fraction = await _calculate_kelly(symbol, user_id, price, atr)
         metadata["kelly_fraction"]      = kelly_fraction
         metadata["suggested_size_pct"]  = round(kelly_fraction * 100, 2)
 
@@ -332,17 +342,17 @@ async def risk_agent_node(state: AgentState) -> dict:
 # KELLY CRITERION CALCULATION  (from real Postgres history)
 # ============================================================
 
-async def _calculate_kelly(symbol: str, user_id: str) -> float:
+async def _calculate_kelly(symbol: str, user_id: str, price: float, atr: float) -> float:
     """
     Calculate the optimal position size fraction using the
     Kelly criterion, based on real trade history from Postgres.
 
-    Returns a fraction between 0.0 and 0.25.
+    Returns a fraction between 0.02 and 0.25.
     0.02 = 2% of capital per trade (conservative minimum).
     0.25 = 25% of capital per trade (maximum cap, never exceeded).
 
     If fewer than 10 closed trades exist for this symbol,
-    we return a safe conservative default of 0.02 (2%).
+    we return an ATR-based cold start size (1% risk rule).
     """
 
     try:
@@ -350,7 +360,24 @@ async def _calculate_kelly(symbol: str, user_id: str) -> float:
             trades = await TradeRepo.get_recent_closed_trades(
                 session, symbol, user_id=user_id, limit=50
             )
-            stats = TradeRepo.calculate_win_stats(trades)
+
+        # Cold-start: size by ATR so that the 1.5 * ATR stop loss equals 1% of total equity
+        if len(trades) < 10:
+            if atr > 0:
+                # size_rupees = equity * 0.01
+                # shares = size_rupees / (1.5 * ATR)
+                # position_size_pct (kelly_fraction) = (shares * price) / equity = (0.01 * price) / (1.5 * ATR)
+                result = (0.01 * price) / (1.5 * atr)
+                result = max(0.02, min(result, 0.25))
+                logger.info(
+                    f"Kelly cold-start (n={len(trades)} < 10) | "
+                    f"ATR-based size (1% risk): {result:.4f} | ATR={atr:.2f} | price={price:.2f}"
+                )
+                return round(result, 4)
+            else:
+                return 0.02
+
+        stats = TradeRepo.calculate_win_stats(trades)
 
         win_rate = stats["win_rate"]
         avg_win  = stats["avg_win"]

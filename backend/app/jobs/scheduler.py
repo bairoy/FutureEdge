@@ -35,6 +35,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from loguru import logger
 
+from app.core.config import settings
+
 IST = ZoneInfo("Asia/Kolkata")
 
 
@@ -125,7 +127,11 @@ async def _calibration_daily():
 
 
 async def _daily_pnl_report():
-    """Compile daily P&L summary and log it."""
+    """Compile daily P&L summary and send it to Telegram."""
+    if not settings.DAILY_REPORT_ENABLED:
+        logger.info("Scheduler: daily P&L report is disabled in settings")
+        return
+
     from datetime import date
     today = date.today()
     if today.weekday() > 4:
@@ -136,24 +142,54 @@ async def _daily_pnl_report():
         from app.db.postgres import AsyncSessionLocal
         from sqlalchemy import select, func
         from app.db.models.trade import Trade
+        from app.services.telegram_service import send_telegram_message
 
         async with AsyncSessionLocal() as session:
             # Get today's closed trades
             result = await session.execute(
                 select(Trade).where(
                     Trade.status == "CLOSED",
-                    func.date(Trade.updated_at) == today,
+                    func.date(Trade.closed_at) == today,
                 )
             )
             trades = list(result.scalars().all())
 
         if not trades:
-            logger.info("Scheduler: no closed trades today — skipping P&L report")
+            logger.info("Scheduler: no closed trades today — sending status alert")
+            msg = (
+                f"<b>📊 Daily P&L Report ({today.strftime('%Y-%m-%d')})</b>\n"
+                f"-----------------------------------------\n"
+                f"No trades were closed today."
+            )
+            await send_telegram_message(msg)
             return
 
         wins   = [t for t in trades if (t.realized_pnl or 0) > 0]
         losses = [t for t in trades if (t.realized_pnl or 0) <= 0]
         total_pnl = sum(t.realized_pnl or 0 for t in trades)
+
+        # Formulate HTML report for Telegram
+        trade_lines = []
+        for t in trades:
+            pnl_val = t.realized_pnl or 0.0
+            pnl_str = f"₹{pnl_val:.2f}"
+            pnl_prefix = "🟢" if pnl_val > 0 else "🔴"
+            trade_lines.append(
+                f"{pnl_prefix} <b>{t.symbol}</b> ({t.direction}): {pnl_str}"
+            )
+
+        trade_list_str = "\n".join(trade_lines)
+
+        text = (
+            f"<b>📊 Daily P&L Report ({today.strftime('%Y-%m-%d')})</b>\n"
+            f"-----------------------------------------\n"
+            f"<b>Total Closed Trades:</b> {len(trades)}\n"
+            f"<b>🟢 Wins:</b> {len(wins)}  |  <b>🔴 Losses:</b> {len(losses)}\n"
+            f"<b>💰 Net P&L:</b> <b>₹{total_pnl:.2f}</b>\n"
+            f"-----------------------------------------\n"
+            f"<b>Trade Details:</b>\n"
+            f"{trade_list_str}"
+        )
 
         logger.info(
             f"📊 DAILY P&L REPORT ({today.strftime('%Y-%m-%d')}):\n"
@@ -161,6 +197,9 @@ async def _daily_pnl_report():
             f"  - Wins: {len(wins)} / Losses: {len(losses)}\n"
             f"  - Net P&L: ₹{total_pnl:.2f}"
         )
+
+        await send_telegram_message(text)
+        logger.info("✅ Daily P&L report sent to Telegram")
     except Exception as e:
         logger.error(f"Scheduler: daily P&L report failed: {e}")
 
@@ -218,10 +257,15 @@ def build_scheduler() -> AsyncIOScheduler:
         misfire_grace_time=1800,
     )
 
-    # 4:30 PM IST Mon-Fri — daily P&L report
+    # Daily P&L report from settings
     scheduler.add_job(
         _daily_pnl_report,
-        CronTrigger(day_of_week="mon-fri", hour=16, minute=30, timezone=IST),
+        CronTrigger(
+            day_of_week="mon-fri",
+            hour=settings.DAILY_REPORT_HOUR_IST,
+            minute=settings.DAILY_REPORT_MINUTE_IST,
+            timezone=IST
+        ),
         id="daily_pnl_report",
         name="Daily P&L Report",
         replace_existing=True,

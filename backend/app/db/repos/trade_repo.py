@@ -100,7 +100,7 @@ class TradeRepo:
             human_approved = proposal.human_approved,
             human_notes    = proposal.human_notes,
 
-            # Store all agent votes as JSON — full audit trail
+            # Store all agent votes as JSON — full audit trail + metadata (regime)
             agent_consensus = [
                 {
                     "agent":      vote.agent,
@@ -109,7 +109,8 @@ class TradeRepo:
                     "reasoning":  vote.reasoning,
                 }
                 for vote in proposal.agent_consensus
-            ],
+            ] + [{"meta": True, "regime": proposal.regime if hasattr(proposal, "regime") and proposal.regime else "UNKNOWN"}],
+
 
             broker            = broker,
             broker_order_id   = broker_order_id,

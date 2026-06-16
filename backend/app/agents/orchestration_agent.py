@@ -111,8 +111,10 @@ async def orchestrator_node(state: AgentState) -> dict:
         # on each agent's historical prediction accuracy.
         # Falls back to DEFAULT_AGENT_WEIGHTS if Redis is empty.
 
+        current_regime = ctx.regime if hasattr(ctx, "regime") and ctx.regime else "UNKNOWN"
         from app.jobs.weight_updater import get_agent_weights
-        agent_weights = await get_agent_weights()
+        agent_weights = await get_agent_weights(regime=current_regime)
+
 
         # --------------------------------------------------------
         # COLLECT VOTES
@@ -135,6 +137,7 @@ async def orchestrator_node(state: AgentState) -> dict:
             proposal = TradeProposal(
                 symbol=symbol, direction="NONE",
                 size=0, entry_price=price, risk_score=1.0,
+                regime=current_regime,
             )
 
             return {
@@ -166,7 +169,9 @@ async def orchestrator_node(state: AgentState) -> dict:
                 risk_score     = 1.0,
                 agent_consensus= votes,
                 human_approved = False,
+                regime         = current_regime,
             )
+
 
             await _publish_results(symbol, proposal, votes, run_id)
 
@@ -220,8 +225,9 @@ async def orchestrator_node(state: AgentState) -> dict:
         # --------------------------------------------------------
 
         # Fetch adaptive decision threshold from Redis (updated by CalibrationAgent nightly)
-        # Defaults to 0.55 if not configured or on failure
-        threshold = 0.55
+        # Defaults to 0.40 — lowered from 0.55 because the signal scoring ceiling is ~0.5
+        # after MTF/volatility dampening. 0.55 was causing near-zero trade generation.
+        threshold = 0.40
         try:
             raw_threshold = await redis_client.get("futureedge:decision_threshold")
             if raw_threshold:
@@ -263,7 +269,7 @@ async def orchestrator_node(state: AgentState) -> dict:
         ))
 
         # --------------------------------------------------------
-        # POSITION SIZING  (using Kelly from risk agent)
+        # POSITION SIZING  (Kelly × ATR adjustment)
         # --------------------------------------------------------
 
         # Extract Kelly fraction computed by risk_agent
@@ -274,21 +280,81 @@ async def orchestrator_node(state: AgentState) -> dict:
             kelly_fraction = risk_vote.metadata.get("kelly_fraction", 0.02)
 
         if decision in ("BUY", "SELL"):
-            # Position size in Rupees
-            position_rupees = portfolio.total_equity * kelly_fraction
+            # ISSUE 11: Scale position size inversely with ATR volatility.
+            # High ATR% (volatile/small-cap) → smaller position.
+            # Low ATR% (liquid large-cap) → full Kelly position.
+            signal_vote_meta = state.get("signal_vote")
+            atr_val = None
+            if signal_vote_meta and signal_vote_meta.metadata:
+                atr_val = signal_vote_meta.metadata.get("atr")
+
+            atr_pct = (atr_val / price) if (atr_val and price > 0) else 0.01
+            # Reference: 1% ATR = no adjustment. Halve size for each doubling of ATR%
+            atr_adjustment = min(1.0, 0.01 / max(atr_pct, 0.001))
+
+            position_rupees = portfolio.total_equity * kelly_fraction * atr_adjustment
+
+            if atr_adjustment < 1.0:
+                logger.info(
+                    f"Orchestrator | ATR-adjusted sizing: kelly={kelly_fraction:.3f} "
+                    f"atr%={atr_pct*100:.2f}% adj={atr_adjustment:.2f} "
+                    f"position=₹{position_rupees:.0f}"
+                )
         else:
             position_rupees = 0.0
 
         # --------------------------------------------------------
-        # HITL EVALUATION
+        # HITL EVALUATION  (ISSUE 2 — smart risk-based gating)
         # --------------------------------------------------------
+        # OLD: every trade required human approval (kills intraday — signals expire
+        #       in minutes but human review takes 5–10 minutes).
+        # NEW: auto-approve small, high-confidence, low-risk trades.
+        #      Only escalate to HITL when one or more risk conditions are met.
 
+        from app.core.config import settings
         hitl_required = False
         hitl_reasons  = []
 
         if direction != "NONE":
-            hitl_required = True
-            hitl_reasons.append(f"Human-in-the-Loop verification required for {direction} proposal.")
+            if settings.HITL_AUTO_APPROVE_ENABLED:
+                # Evaluate each risk condition independently
+                large_position = position_rupees > (portfolio.total_equity * settings.HITL_POSITION_SIZE_THRESHOLD_PCT / 100.0)
+                high_risk      = risk_score > settings.HITL_RISK_SCORE_THRESHOLD
+                low_confidence = confidence < settings.HITL_CONFIDENCE_THRESHOLD
+                macro_vote     = state.get("macro_vote")
+                vix_elevated   = (
+                    macro_vote is not None and
+                    macro_vote.metadata is not None and
+                    macro_vote.metadata.get("india_vix", 0) > settings.HITL_VIX_THRESHOLD
+                )
+
+                if large_position:
+                    hitl_required = True
+                    hitl_reasons.append(
+                        f"Large position ₹{position_rupees:.0f} > "
+                        f"{settings.HITL_POSITION_SIZE_THRESHOLD_PCT}% of equity"
+                    )
+                if high_risk:
+                    hitl_required = True
+                    hitl_reasons.append(f"High risk score: {risk_score:.2f} > {settings.HITL_RISK_SCORE_THRESHOLD}")
+                if low_confidence:
+                    hitl_required = True
+                    hitl_reasons.append(f"Low confidence: {confidence:.2f} < {settings.HITL_CONFIDENCE_THRESHOLD}")
+                if vix_elevated:
+                    hitl_required = True
+                    hitl_reasons.append(
+                        f"Elevated VIX: {macro_vote.metadata.get('india_vix', 0):.1f} > {settings.HITL_VIX_THRESHOLD}"
+                    )
+
+                if not hitl_required:
+                    logger.info(
+                        f"✅ HITL auto-approved | {direction} {symbol} | "
+                        f"risk={risk_score:.2f} | conf={confidence:.2f} | size=₹{position_rupees:.0f}"
+                    )
+            else:
+                # Legacy mode: HITL on every trade
+                hitl_required = True
+                hitl_reasons.append(f"HITL required for {direction} proposal (legacy mode)")
 
         # --------------------------------------------------------
         # EPISODIC MEMORY: RETRIEVE SIMILAR PAST TRADES (Phase 2 — new)
@@ -369,6 +435,7 @@ async def orchestrator_node(state: AgentState) -> dict:
             agent_consensus= votes,
             human_approved = None,
             llm_rationale  = llm_rationale,
+            regime         = current_regime,
         )
 
         # --------------------------------------------------------
@@ -437,6 +504,7 @@ async def orchestrator_node(state: AgentState) -> dict:
         fallback = TradeProposal(
             symbol="UNKNOWN", direction="NONE",
             size=0, entry_price=0, risk_score=1.0,
+            regime="UNKNOWN",
         )
 
         return {
