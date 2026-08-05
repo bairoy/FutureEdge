@@ -60,6 +60,14 @@ class Settings(BaseSettings):
     FRONTEND_URL: str = "http://localhost:3000"
     ENCRYPTION_KEY: str = ""
 
+    # Comma-separated IPs of reverse proxies allowed to set X-Forwarded-For.
+    # Empty (the default) means "no proxy" — rate limiting keys on the direct
+    # socket peer and X-Forwarded-For is ignored entirely, so a client cannot
+    # spoof its way around a limit by sending the header itself. Set this to
+    # your nginx/Caddy/Traefik IP when deploying behind one, and pass the same
+    # value to uvicorn's --forwarded-allow-ips.
+    TRUSTED_PROXY_IPS: str = ""
+
     # --------------------------------------------------------
     # NOTIFICATIONS (Twilio/WhatsApp — disabled, everything on dashboard)
     # --------------------------------------------------------

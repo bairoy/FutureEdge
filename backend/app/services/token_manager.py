@@ -136,6 +136,70 @@ def decrypt_token(encrypted: str) -> str:
         raise ValueError(f"Cannot decrypt token: {e}") from e
 
 
+def _looks_like_ciphertext(value: str) -> bool:
+    """
+    Cheap format check: could `value` plausibly be an encrypt_token() blob?
+
+    This exists to keep the legacy-plaintext path quiet. Read sites call
+    decrypt_stored_token() on every feed poll, so routing a known-plaintext
+    token through decrypt_token() logs an ERROR several times a minute for a
+    condition we expect and handle. Screening on format first means a real
+    decrypt failure — corruption, or the wrong ENCRYPTION_KEY — is the only
+    thing that reaches the error log, and therefore actually means something.
+
+    A blob is strict base64 of nonce(12) + ciphertext(>=1) + tag(16), so
+    anything decoding to fewer than 29 bytes cannot be one. A raw Kite token
+    (~32 alphanumeric chars) decodes to ~24 bytes and is rejected here.
+    """
+    if value.startswith("UNENCRYPTED:"):
+        return True
+
+    try:
+        return len(base64.b64decode(value, validate=True)) >= 12 + 1 + 16
+    except Exception:
+        return False
+
+
+def decrypt_stored_token(stored: str | None) -> str | None:
+    """
+    Read back a Zerodha access token from Redis or broker_token.json.
+
+    Use this at every token *read* site — `brokers/zerodha.py`, `data/feed.py`
+    — so the storage format stays a single decision made in one place.
+
+    Anything that is not in our encrypted format is returned as-is and treated
+    as a legacy plaintext token. That keeps a session stored before encryption
+    was wired in working until it expires at the next 6 AM IST rollover; after
+    that every stored token is ciphertext and this branch stops firing. It is a
+    read-side compatibility shim only — never write plaintext.
+
+    Returns None for an empty/missing token so callers can fall through to
+    their next source.
+    """
+    if not stored:
+        return None
+
+    if not _looks_like_ciphertext(stored):
+        logger.debug(
+            "Stored Zerodha token is not in encrypted format — treating it as a "
+            "legacy plaintext token. It will be re-stored encrypted on next login."
+        )
+        return stored
+
+    try:
+        return decrypt_token(stored)
+    except Exception:
+        # Reaching here means it LOOKED like ciphertext but would not decrypt:
+        # a wrong/rotated ENCRYPTION_KEY or a corrupted value. Worth shouting
+        # about, because the operator's next login is the only way out.
+        logger.error(
+            "Stored Zerodha token looks encrypted but failed to decrypt — "
+            "check ENCRYPTION_KEY has not changed. Re-authenticate with Zerodha "
+            "to store a fresh token."
+        )
+        return stored
+
+
 def is_encryption_configured() -> bool:
     """Return True if a real encryption key is configured."""
     key_hex = settings.ENCRYPTION_KEY

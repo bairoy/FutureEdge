@@ -1,4 +1,5 @@
 import os
+from urllib.parse import quote, parse_qs
 from fastapi import APIRouter, Request, Depends, HTTPException
 from fastapi.responses import HTMLResponse
 from loguru import logger
@@ -9,6 +10,8 @@ from app.core.config import settings
 from app.db.redis import redis_client, KEY_ZERODHA_ACCESS_TOKEN
 from app.auth.dependencies import get_db, require_viewer, require_risk_manager
 from app.db.models.user import User
+from app.services.oauth_state import issue_state, consume_state
+from app.services.token_manager import encrypt_token
 
 router = APIRouter()
 
@@ -59,11 +62,26 @@ def update_env_file(key: str, value: str):
 
 
 @router.get("/auth/zerodha/login-url")
-async def get_login_url():
+async def get_login_url(
+    current_user: User = Depends(require_risk_manager),
+):
     """
     Returns the official Zerodha login/consent page URL.
+
+    Mints a single-use CSRF `state` bound to the calling user and threads it
+    through the login URL so `zerodha_callback` can prove the callback it
+    receives belongs to a login *we* started. See `services/oauth_state.py`
+    for why the callback relies on this instead of a JWT dependency.
+
+    Kite round-trips custom query params via `redirect_params`, so the state
+    comes back to us appended to the registered redirect URL.
     """
-    login_url = f"https://kite.trade/connect/login?v=3&api_key={settings.ZERODHA_API_KEY}"
+    state = await issue_state(user_id=str(current_user.id))
+
+    login_url = (
+        f"https://kite.trade/connect/login?v=3&api_key={settings.ZERODHA_API_KEY}"
+        f"&redirect_params={quote(f'state={state}', safe='')}"
+    )
     return {
         "login_url": login_url,
         "is_configured": bool(settings.ZERODHA_API_KEY and settings.ZERODHA_API_SECRET)
@@ -71,7 +89,9 @@ async def get_login_url():
 
 
 @router.get("/auth/zerodha/status")
-async def get_zerodha_status():
+async def get_zerodha_status(
+    current_user: User = Depends(require_risk_manager),
+):
     """
     Returns status of the active broker and whether we are connected.
     """
@@ -135,37 +155,88 @@ async def select_broker(
     }
 
 
+def _error_page(title: str, message: str, status_code: int) -> HTMLResponse:
+    """Render the shared dark-themed failure card used by the callback route."""
+    html = f"""
+        <html>
+            <head>
+                <title>{title}</title>
+                <style>
+                    body {{ background-color: #0b0f19; color: #ef4444; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
+                    .card {{ background-color: #111827; border: 1px solid #1f2937; border-radius: 1rem; padding: 2.5rem; text-align: center; max-width: 400px; }}
+                    h1 {{ margin-bottom: 1rem; }}
+                    p {{ color: #9ca3af; margin-bottom: 1.5rem; }}
+                    .btn {{ background-color: #ef4444; color: white; text-decoration: none; padding: 0.75rem 1.5rem; border-radius: 0.5rem; font-weight: bold; }}
+                </style>
+            </head>
+            <body>
+                <div class="card">
+                    <h1>{title}</h1>
+                    <p>{message}</p>
+                    <a href="{settings.FRONTEND_URL}/dashboard" class="btn">Back to Dashboard</a>
+                </div>
+            </body>
+        </html>
+    """
+    return HTMLResponse(content=html, status_code=status_code)
+
+
+def _extract_state(request: Request) -> str | None:
+    """
+    Pull the CSRF state off the callback URL.
+
+    Kite echoes custom params supplied via `redirect_params`, and depending on
+    the app's redirect configuration they arrive either flattened onto the
+    query string (`?state=...`) or still packed inside `redirect_params`.
+    Accept both rather than depending on one Kite behaviour.
+    """
+    state = request.query_params.get("state")
+    if state:
+        return state
+
+    packed = request.query_params.get("redirect_params")
+    if packed:
+        return parse_qs(packed).get("state", [None])[0]
+
+    return None
+
+
 @router.get("/auth/zerodha/callback", response_class=HTMLResponse)
 async def zerodha_callback(request: Request):
     """
     OAuth-style callback redirect route.
     Zerodha redirects here with ?request_token=XXXX.
     Exchanges request_token for access_token, saves it, and redirects back to frontend.
+
+    NOTE ON AUTH: this route deliberately has no `Depends(require_*)` — it is
+    reached by a browser redirect from Zerodha, which carries no Authorization
+    header. The single-use `state` minted by `login-url` (an admin-only route)
+    is what authenticates it. Verify state BEFORE `generate_session()`, so an
+    unsolicited callback never spends our API secret.
     """
+    state = _extract_state(request)
+    issuing_user_id = await consume_state(state)
+    if issuing_user_id is None:
+        logger.warning(
+            "Rejected Zerodha callback: missing/invalid/expired OAuth state "
+            f"(state_present={bool(state)})"
+        )
+        return _error_page(
+            "Authentication Failed",
+            "This login link is invalid, already used, or expired. "
+            "Start the connection again from the dashboard.",
+            403,
+        )
+
+    logger.info(f"Zerodha callback state verified | issued_by_user={issuing_user_id}")
+
     request_token = request.query_params.get("request_token")
     if not request_token:
-        error_html = """
-        <html>
-            <head>
-                <title>Authentication Error</title>
-                <style>
-                    body { background-color: #0b0f19; color: #ef4444; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-                    .card { background-color: #111827; border: 1px solid #1f2937; border-radius: 1rem; padding: 2.5rem; text-align: center; max-width: 400px; }
-                    h1 { margin-bottom: 1rem; }
-                    p { color: #9ca3af; margin-bottom: 1.5rem; }
-                    .btn { background-color: #ef4444; color: white; text-decoration: none; padding: 0.75rem 1.5rem; border-radius: 0.5rem; font-weight: bold; }
-                </style>
-            </head>
-            <body>
-                <div class="card">
-                    <h1>Authentication Failed</h1>
-                    <p>No request token was provided in the callback query parameters.</p>
-                    <a href="http://localhost:3000/dashboard" class="btn">Back to Dashboard</a>
-                </div>
-            </body>
-        </html>
-        """
-        return HTMLResponse(content=error_html.replace("http://localhost:3000", settings.FRONTEND_URL), status_code=400)
+        return _error_page(
+            "Authentication Failed",
+            "No request token was provided in the callback query parameters.",
+            400,
+        )
 
     try:
         from kiteconnect import KiteConnect
@@ -175,15 +246,21 @@ async def zerodha_callback(request: Request):
         data = kite.generate_session(request_token, api_secret=settings.ZERODHA_API_SECRET)
         access_token = data["access_token"]
 
+        # The token never leaves this function in plaintext: both storage
+        # sinks below get the AES-256-GCM blob, and brokers/zerodha.py
+        # decrypts on read. Read access to Redis or the JSON file is no
+        # longer equivalent to full broker access.
+        encrypted_token = encrypt_token(access_token)
+
         # 2. Save access token to Redis (for fast, non-restart updates)
-        await redis_client.set(KEY_ZERODHA_ACCESS_TOKEN, access_token)
+        await redis_client.set(KEY_ZERODHA_ACCESS_TOKEN, encrypted_token)
 
         # 3. Save to local JSON config (for persistence without triggering uvicorn reload loops)
         import json
         try:
             with open("broker_token.json", "w") as f:
-                json.dump({"ZERODHA_ACCESS_TOKEN": access_token}, f)
-            logger.info("Saved Zerodha token to broker_token.json")
+                json.dump({"ZERODHA_ACCESS_TOKEN": encrypted_token}, f)
+            logger.info("Saved encrypted Zerodha token to broker_token.json")
         except Exception as je:
             logger.warning(f"Failed to save Zerodha token to broker_token.json: {je}")
 
@@ -233,32 +310,17 @@ async def zerodha_callback(request: Request):
         return HTMLResponse(content=success_html.replace("http://localhost:3000", settings.FRONTEND_URL))
 
     except Exception as e:
+        # The exception text stays server-side. This handler wraps the
+        # session exchange and the token writes, so `e` can carry request/
+        # response fragments — not something to render into a page that
+        # sits in browser history.
         logger.exception(f"Failed to generate Zerodha access token: {e}")
-        fail_html = f"""
-        <html>
-            <head>
-                <title>Authentication Failed</title>
-                <style>
-                    body {{ background-color: #0b0f19; color: #ef4444; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
-                    .card {{ background-color: #111827; border: 1px solid #1f2937; border-radius: 1rem; padding: 2.5rem; text-align: center; max-width: 400px; }}
-                    h1 {{ margin-bottom: 1rem; }}
-                    p {{ color: #9ca3af; margin-bottom: 1.5rem; line-height: 1.5; }}
-                    .btn {{ background-color: #ef4444; color: white; text-decoration: none; padding: 0.75rem 1.5rem; border-radius: 0.5rem; font-weight: bold; }}
-                    .error {{ color: #f87171; font-family: monospace; font-size: 0.85rem; background: #1e1b4b; padding: 0.5rem; border-radius: 0.25rem; word-break: break-all; }}
-                </style>
-            </head>
-            <body>
-                <div class="card">
-                    <h1>Authentication Failed</h1>
-                    <p>An error occurred while exchanging the request token.</p>
-                    <p class="error">{str(e)}</p>
-                    <br/>
-                    <a href="{settings.FRONTEND_URL}/dashboard" class="btn">Back to Dashboard</a>
-                </div>
-            </body>
-        </html>
-        """
-        return HTMLResponse(content=fail_html, status_code=500)
+        return _error_page(
+            "Authentication Failed",
+            "An error occurred while exchanging the request token. "
+            "Check the backend logs for details.",
+            500,
+        )
 
 
 class BrokerPositionExitRequest(BaseModel):
