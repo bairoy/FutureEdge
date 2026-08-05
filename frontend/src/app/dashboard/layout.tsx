@@ -22,12 +22,12 @@
 
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import Link from "next/link";
 import {
   LayoutDashboard, TrendingUp, Users, Activity,
-  LogOut, BarChart2, ExternalLink, RefreshCw, LineChart
+  LogOut, BarChart2, ExternalLink, LineChart
 } from "lucide-react";
 
 import api, { tokenStore } from "@/lib/api";
@@ -35,6 +35,7 @@ import { useAuthStore, useTradingStore } from "@/store";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { useKillSwitch } from "@/hooks/useKillSwitch";
 import { KillSwitchButton } from "@/components/trading/KillSwitchButton";
+import { SystemStatusBar } from "@/components/trading/SystemStatusBar";
 import { HITLModal } from "@/components/trading/HITLModal";
 import { showToast } from "@/components/ui/Toast";
 import type { UserProfile } from "@/types";
@@ -66,63 +67,29 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
   const { user, setUser, setLoading, isLoading } = useAuthStore();
   const hitlPending = useTradingStore((s) => s.hitlPending);
-  const paperTrade = useTradingStore((s) => s.paperTrade);
   const setPaperTrade = useTradingStore((s) => s.setPaperTrade);
 
-  const [zerodhaStatus, setZerodhaStatus] = useState<{ is_zerodha: boolean; connected: boolean } | null>(null);
-  const [checkingZerodha, setCheckingZerodha] = useState(false);
-
-  async function checkZerodhaStatus() {
-    try {
-      const { data } = await api.get("/auth/zerodha/status");
-      setZerodhaStatus(data);
-    } catch (err) {
-      console.error("[Zerodha] Status check failed:", err);
-    }
-  }
-
-  async function handleConnectZerodha() {
-    setCheckingZerodha(true);
-    try {
-      const { data } = await api.get("/auth/zerodha/login-url");
-      if (data.login_url) {
-        window.location.href = data.login_url;
-      } else {
-        showToast("Zerodha login URL not configured on backend", "error");
-      }
-    } catch (err) {
-      showToast("Failed to fetch Zerodha login URL", "error");
-    } finally {
-      setCheckingZerodha(false);
-    }
-  }
-
-  // Effect to parse success callback and poll status
+  // Announce a completed Zerodha OAuth round trip.
+  //
+  // This used to ALSO push the broker mode to the backend on every mount,
+  // reading localStorage("fe-paper-trade") and POSTing /auth/broker/select.
+  // That silently enabled the LIVE broker whenever a stale `false` was left
+  // in localStorage — a page refresh could arm real-money trading with no
+  // confirmation, and it rewrote ACTIVE_BROKER in .env as a side effect.
+  // The backend is now the single source of truth for broker mode;
+  // SystemStatusBar reports it and only changes it on explicit user action.
   useEffect(() => {
-    if (isLoading) return;
+    if (isLoading || typeof window === "undefined") return;
 
-    if (typeof window !== "undefined") {
-      const params = new URLSearchParams(window.location.search);
-      if (params.get("zerodha") === "success") {
-        showToast("Zerodha connected successfully!", "success");
-        // Clear query parameters from URL bar
-        const newUrl = window.location.pathname;
-        window.history.replaceState({}, "", newUrl);
-      }
-
-      // Load paper trade setting and sync with backend
-      const savedPaper = localStorage.getItem("fe-paper-trade");
-      const currentPaperVal = savedPaper !== "false";
-      setPaperTrade(currentPaperVal);
-
-      api.post("/auth/broker/select", { broker: currentPaperVal ? "mock" : "zerodha" })
-        .then(() => checkZerodhaStatus())
-        .catch((err) => console.error("Failed to sync broker selection on mount:", err));
-    } else {
-      checkZerodhaStatus();
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("zerodha") === "success") {
+      showToast("Zerodha connected — live feed enabled", "success");
+      window.history.replaceState({}, "", window.location.pathname);
     }
-    const interval = setInterval(checkZerodhaStatus, 30_000);
-    return () => clearInterval(interval);
+
+    // Keep the local store in step with the persisted preference for any
+    // component still reading it, without pushing it to the server.
+    setPaperTrade(localStorage.getItem("fe-paper-trade") !== "false");
   }, [isLoading, setPaperTrade]);
 
   // Start WebSocket + sync kill switch state
@@ -147,19 +114,39 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
     if (!restorePromise) {
       restorePromise = (async () => {
-        try {
-          // 1. Get a fresh access token using the refresh cookie
-          const { data: tokens } = await api.post("/auth/refresh", { refresh_token: rt });
-          tokenStore.setTokens(tokens.access_token, tokens.refresh_token);
+        const MAX_RETRIES = 2;
+        const DELAYS = [500, 1500]; // ms between retries
 
-          // 2. Load the actual user object (syncs any role changes etc)
-          const { data: profile } = await api.get<UserProfile>("/auth/me");
-          return profile;
-        } catch (err) {
-          console.error("[Auth] Session restore failed:", err);
-          tokenStore.clearTokens();
-          return null;
+        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+          try {
+            // 1. Get a fresh access token using the refresh cookie
+            const { data: tokens } = await api.post("/auth/refresh", { refresh_token: rt });
+            tokenStore.setTokens(tokens.access_token, tokens.refresh_token);
+
+            // 2. Load the actual user object (syncs any role changes etc)
+            const { data: profile } = await api.get<UserProfile>("/auth/me");
+            return profile;
+          } catch (err: any) {
+            // Retry on 5xx/network errors (e.g. ECONNRESET during backend hot-reload)
+            // but NOT on 401/403 (invalid token → must re-login)
+            const status = err?.response?.status;
+            const isRetryable = !status || status >= 500;
+
+            if (isRetryable && attempt < MAX_RETRIES) {
+              console.warn(
+                `[Auth] Session restore attempt ${attempt + 1} failed (${status ?? "network"}), ` +
+                `retrying in ${DELAYS[attempt]}ms…`
+              );
+              await new Promise((r) => setTimeout(r, DELAYS[attempt]));
+              continue;
+            }
+
+            console.error("[Auth] Session restore failed:", err);
+            tokenStore.clearTokens();
+            return null;
+          }
         }
+        return null;
       })();
     }
 
@@ -280,65 +267,9 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
             {pathname.split("/").filter(Boolean).pop()?.replace("-", " ") ?? "Dashboard"}
           </span>
           <div className="flex items-center gap-3">
-            {/* Paper Trading Toggle */}
-            <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-gray-800 bg-gray-950/40 select-none">
-              <span className="text-xs font-semibold text-gray-300">Enable Paper Trading</span>
-              <button
-                type="button"
-                onClick={async () => {
-                  const newVal = !paperTrade;
-                  setPaperTrade(newVal);
-                  if (typeof window !== "undefined") {
-                    localStorage.setItem("fe-paper-trade", String(newVal));
-                  }
-                  try {
-                    await api.post("/auth/broker/select", { broker: newVal ? "mock" : "zerodha" });
-                    showToast(newVal ? "Paper Trading Enabled" : "Live Trading Enabled (Zerodha)", "success");
-                    checkZerodhaStatus();
-                  } catch (err) {
-                    showToast("Failed to change broker mode", "error");
-                  }
-                }}
-                className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                  paperTrade ? "bg-amber-500" : "bg-gray-700"
-                }`}
-                title={paperTrade ? "Paper Trading is Enabled (Simulated)" : "Paper Trading is Disabled (Real Broker)"}
-              >
-                <span
-                  className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-205 ease-in-out ${
-                    paperTrade ? "translate-x-4" : "translate-x-0"
-                  }`}
-                />
-              </button>
-            </div>
-
-            {zerodhaStatus?.is_zerodha && (
-              zerodhaStatus.connected ? (
-                <button
-                  onClick={handleConnectZerodha}
-                  disabled={checkingZerodha}
-                  title="Zerodha session is active. Click to re-authenticate."
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-green-500/30 bg-green-500/10 text-green-400 text-xs font-semibold hover:bg-green-500/20 transition-all shadow-[0_0_10px_rgba(34,197,94,0.1)] cursor-pointer"
-                >
-                  <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse shrink-0" />
-                  Zerodha Connected
-                </button>
-              ) : (
-                <button
-                  onClick={handleConnectZerodha}
-                  disabled={checkingZerodha}
-                  title="Authentication Required. Click to connect to Zerodha."
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 text-amber-400 text-xs font-semibold hover:bg-amber-500/20 transition-all shadow-[0_0_10px_rgba(245,158,11,0.15)] animate-pulse cursor-pointer"
-                >
-                  {checkingZerodha ? (
-                    <RefreshCw className="w-3 h-3 animate-spin shrink-0" />
-                  ) : (
-                    <span className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0" />
-                  )}
-                  Connect Zerodha
-                </button>
-              )
-            )}
+            {/* Feed and broker are reported and controlled separately —
+                see components/trading/SystemStatusBar.tsx for why. */}
+            <SystemStatusBar canSwitchBroker={hasRole(user.role, "risk_manager")} />
             {hasRole(user.role, "risk_manager") && <KillSwitchButton />}
           </div>
         </header>

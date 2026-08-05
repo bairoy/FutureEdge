@@ -145,25 +145,44 @@ export interface AgentResultMessage {
   };
 }
 
+/**
+ * Two different payloads arrive on the "hitl_pending" channel, discriminated
+ * by `status`:
+ *   - a proposal awaiting approval  (orchestration_agent._publish_results)
+ *   - a resolution notice           (human_agent, published on workflow resume)
+ * Modelling only the first is what broke the build — the resolution branch in
+ * useWebSocket reads fields the old single-shape type didn't have.
+ */
+export interface HITLProposalPayload {
+  status?: undefined;
+  symbol: string;
+  reasons: string[];
+  proposal: {
+    run_id: string;
+    symbol: string;
+    direction: string;
+    size: number;
+    entry_price: number;
+    risk_score: number;
+    stop_loss: number | null;
+    take_profit: number | null;
+    llm_rationale: string | null;
+    hitl_required: boolean;
+    hitl_reasons: string[];
+    votes: AgentVote[];
+  };
+}
+
+export interface HITLResolvedPayload {
+  status: "RESOLVED";
+  run_id: string;
+  decision: string;
+  hitl_status: "APPROVED" | "REJECTED";
+}
+
 export interface HITLPendingMessage {
   type: "hitl_pending";
-  data: {
-    symbol: string;
-    reasons: string[];
-    llm_rationale: string | null;
-    memories: EpisodicMemory[];
-    proposal: {
-      run_id?: string;
-      direction: string;
-      size: number;
-      entry_price: number;
-      risk_score: number;
-      stop_loss?: number;
-      take_profit?: number;
-      votes: AgentVote[];
-      hitl_required?: boolean;
-    };
-  };
+  data: HITLProposalPayload | HITLResolvedPayload;
 }
 
 export interface TradeMessage {
@@ -200,3 +219,39 @@ export type WebSocketMessage =
   | TradeMessage
   | KillSwitchMessage
   | ClearTicksMessage;
+
+/**
+ * GET /api/v1/system/status
+ *
+ * Feed and broker are deliberately separate objects: where prices come from
+ * and where orders go are independent choices. The usual setup is a live
+ * Zerodha feed with the mock broker — real prices, simulated money.
+ */
+export interface SystemStatus {
+  market_open: boolean;
+  feed: {
+    mode: "zerodha" | "mock";
+    /** What is ACTUALLY serving prices right now, which may not equal `mode`. */
+    source: "zerodha_ticker" | "yfinance";
+    label: string;
+    /** Human-readable reason, including WHY a feed is degraded. */
+    detail: string;
+    is_live: boolean;
+    is_delayed: boolean;
+    streaming: boolean;
+    tick_age_seconds: number | null;
+  };
+  broker: {
+    mode: "zerodha" | "mock";
+    label: string;
+    detail: string;
+    /** True means orders hit a REAL Zerodha account. */
+    is_live: boolean;
+    is_paper: boolean;
+    connected: boolean;
+  };
+  zerodha: {
+    configured: boolean;
+    connected: boolean;
+  };
+}
