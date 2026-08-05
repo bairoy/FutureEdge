@@ -158,8 +158,9 @@ class PositionReconciler:
                     for d in discrepancies
                 ])
                 reason = f"POSITION RECONCILIATION DISCREPANCY: {desc}"
+                # No duration: a position mismatch between us and the broker is
+                # unresolved until a human resolves it, not 4 hours later.
                 await activate_kill_switch(
-                    duration_seconds=14400,  # 4 hours
                     reason=reason,
                 )
                 logger.critical(

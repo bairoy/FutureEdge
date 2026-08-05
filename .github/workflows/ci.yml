@@ -81,12 +81,15 @@ jobs:
           # Stop on critical errors (E = pycodestyle errors, F = pyflakes)
           ruff check app/ --select E,F --ignore E501,E402
 
+      # Runs from the repo root, NOT backend/: the suite lives in ./tests and
+      # each test file puts ./backend on sys.path itself. With
+      # `working-directory: backend` this step died on "file or directory not
+      # found: tests/" and no backend test has ever actually run in CI.
       - name: Run tests with coverage
-        working-directory: backend
         run: |
           pytest tests/ \
             --asyncio-mode=auto \
-            --cov=app \
+            --cov=backend/app \
             --cov-report=term-missing \
             --cov-report=xml \
             --cov-fail-under=40 \
@@ -98,8 +101,39 @@ jobs:
         uses: codecov/codecov-action@v4
         if: always()
         with:
-          file: backend/coverage.xml
+          file: coverage.xml   # written at the repo root, where pytest now runs
           fail_ci_if_error: false
+
+  frontend:
+    name: Frontend Build
+    runs-on: ubuntu-latest
+
+    # Runs against a clean checkout on purpose: a gitignored-but-required source
+    # file (frontend/src/lib/api.ts) broke this build for months and nobody saw
+    # it, because CI never compiled the frontend at all.
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Type-check
+        working-directory: frontend
+        run: npm run type-check
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
 
   backtest-regression:
     name: Backtest Regression (main branch only)

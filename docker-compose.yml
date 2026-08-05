@@ -6,6 +6,16 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     container_name: futureedge_backend
+    # Override Dockerfile CMD to add --timeout-graceful-shutdown 3.
+    # This prevents Uvicorn from hanging indefinitely at "Waiting for background
+    # tasks to complete" during hot-reload, which caused 500 errors on login.
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --proxy-headers
+      --reload
+      --timeout-graceful-shutdown 3
     ports:
       - "8000:8000"
     volumes:
@@ -46,16 +56,23 @@ services:
     image: postgres:16
     container_name: futureedge_postgres
     restart: always
+    # Read from .env — the same file the backend loads via env_file, so the
+    # database and the app can never drift onto different credentials.
+    #
+    # NOTE: Postgres only applies these on FIRST init of an empty data
+    # directory. Changing POSTGRES_PASSWORD for an existing postgres_data
+    # volume does nothing to the stored password — you must either ALTER USER
+    # inside the running container, or drop the volume and re-init.
     environment:
-      POSTGRES_USER: futureedge
-      POSTGRES_PASSWORD: futureedge
-      POSTGRES_DB: futureedge
+      POSTGRES_USER:     ${POSTGRES_USER:-futureedge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB:       ${POSTGRES_DB:-futureedge}
     ports:
       - "127.0.0.1:5439:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U futureedge"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-futureedge}"]
       interval: 5s
       timeout: 5s
       retries: 5

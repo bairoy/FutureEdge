@@ -105,6 +105,18 @@ async def lifespan(app):
         logger.info("Checkpoint tables ready")
 
         # --------------------------------------------------------
+        # STEP 1b: RESTORE KILL-SWITCH STATE
+        # --------------------------------------------------------
+        # Runs before ANY trading machinery starts. Redis is a cache; if it was
+        # restarted while trading was halted the flag is gone, and without this
+        # the system would come back up happily placing orders. Postgres holds
+        # the durable state — replay it now, and fail closed if it can't be read.
+
+        from app.services.kill_switch_service import reconcile_kill_switch_from_db
+
+        await reconcile_kill_switch_from_db()
+
+        # --------------------------------------------------------
         # STEP 2: COMPILE GRAPH
         # --------------------------------------------------------
 
@@ -240,17 +252,37 @@ async def lifespan(app):
         yield
 
         # --------------------------------------------------------
-        # SHUTDOWN
+        # SHUTDOWN — each step guarded so one failure doesn't abort the rest
         # --------------------------------------------------------
 
         logger.info("Shutting down FutureEdge...")
 
-        await position_reconciler.stop()
-        await trailing_stop_updater.stop()
-        await exit_monitor.stop()
-        scheduler.shutdown(wait=False)
-        tick_publisher.stop()
-        await broker.disconnect()
+        for label, coro_or_fn in [
+            ("position_reconciler", lambda: position_reconciler.stop()),
+            ("trailing_stop_updater", lambda: trailing_stop_updater.stop()),
+            ("exit_monitor", lambda: exit_monitor.stop()),
+        ]:
+            try:
+                result = coro_or_fn()
+                if hasattr(result, "__await__"):
+                    await result
+            except Exception as exc:
+                logger.warning(f"Shutdown step '{label}' raised: {exc} — continuing.")
+
+        try:
+            scheduler.shutdown(wait=False)
+        except Exception as exc:
+            logger.warning(f"APScheduler shutdown raised: {exc} — continuing.")
+
+        try:
+            tick_publisher.stop()
+        except Exception as exc:
+            logger.warning(f"TickPublisher stop raised: {exc} — continuing.")
+
+        try:
+            await broker.disconnect()
+        except Exception as exc:
+            logger.warning(f"Broker disconnect raised: {exc} — continuing.")
 
         logger.info("Shutdown complete")
 

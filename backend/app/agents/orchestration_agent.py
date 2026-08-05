@@ -550,6 +550,11 @@ async def _publish_results(
             "size":         proposal.size,
             "entry_price":  proposal.entry_price,
             "risk_score":   proposal.risk_score,
+            # SL/TP are set just above (ATR-based) — they must ride along in the
+            # payload or the HITL approval modal renders "Stop Loss: N/A" and the
+            # human approves a trade without seeing where it exits.
+            "stop_loss":    proposal.stop_loss,
+            "take_profit":  proposal.take_profit,
             "llm_rationale": proposal.llm_rationale,
             "hitl_required": hitl_required,
             "hitl_reasons": hitl_reasons or [],

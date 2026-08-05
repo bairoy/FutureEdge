@@ -56,6 +56,7 @@ from app.db.models.refresh_token import RefreshToken  # refresh_tokens table
 from app.db.models.workflow_run  import WorkflowRun   # workflow_runs table
 from app.db.models.trade         import Trade         # trades table
 from app.db.models.kill_switch_event import KillSwitchEvent # kill_switch_events table
+from app.db.models.kill_switch_state import KillSwitchState # kill_switch_state table (durable halt flag)
 
 
 async def create_tables() -> None:
@@ -67,12 +68,16 @@ async def create_tables() -> None:
         # SQLAlchemy function — we wrap it for async compatibility
         await conn.run_sync(Base.metadata.create_all)
 
+    # Listed explicitly rather than read off the metadata, so add new tables
+    # here too — a table missing from this list still gets created, it just
+    # goes unmentioned, which reads like it was skipped.
     logger.info("All tables created successfully:")
     logger.info("  ✓ users")
     logger.info("  ✓ refresh_tokens")
     logger.info("  ✓ workflow_runs")
     logger.info("  ✓ trades")
     logger.info("  ✓ kill_switch_events")
+    logger.info("  ✓ kill_switch_state")
     logger.info("")
     logger.info("Next step: create your first admin user:")
     logger.info("  docker compose exec backend python -m app.scripts.create_admin")

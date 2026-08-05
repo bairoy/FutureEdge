@@ -42,8 +42,13 @@ develop-eggs/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Anchored to the Python project root on purpose. Unanchored `lib/` also matched
+# frontend/src/lib/, so frontend/src/lib/api.ts was silently never committed and
+# every fresh checkout failed to build on the missing "@/lib/api" import.
+/lib/
+/lib64/
+backend/lib/
+backend/lib64/
 parts/
 sdist/
 var/
