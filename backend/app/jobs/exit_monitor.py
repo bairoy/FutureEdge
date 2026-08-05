@@ -309,6 +309,19 @@ class ExitMonitor:
 
             except Exception as e:
                 logger.error(f"Broker exit order failed for trade {trade.id}: {e}")
+                from app.brokers.kite_errors import handle_kite_error, KiteAction
+
+                action = await handle_kite_error(
+                    e, context=f"exit_monitor:{trade.symbol}:trade={trade.id}"
+                )
+                if action is not KiteAction.RETRY:
+                    # The exit could not be placed and retrying will not help.
+                    # Returning leaves the trade OPEN rather than closing it in
+                    # the DB at a price we never actually got — recording a
+                    # phantom exit would hide a position that is still live at
+                    # the broker. handle_kite_error has already alerted (and
+                    # halted, if the broker itself is unusable).
+                    return
                 actual_exit = exit_price
         else:
             actual_exit = exit_price
@@ -439,8 +452,9 @@ class ExitMonitor:
             if daily_loss_pct >= settings.MAX_DAILY_LOSS_PCT:
                 from app.services.kill_switch_service import activate_kill_switch
 
+                # No duration: blowing the daily loss cap must not un-halt
+                # itself. A human reviews the day before trading resumes.
                 await activate_kill_switch(
-                    duration_seconds=14400,  # 4 hours
                     reason=(
                         f"DAILY LOSS CAP BREACHED: "
                         f"₹{self._daily_pnl:.2f} = {daily_loss_pct:.1f}% of equity "

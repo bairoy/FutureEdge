@@ -22,6 +22,22 @@ from app.agents.execution_agent import execution_node
 from app.jobs.exit_monitor import ExitMonitor
 
 
+@pytest.fixture(autouse=True)
+def _kill_switch_off():
+    """
+    These tests exercise execution routing, not the kill switch.
+
+    The halt check fails CLOSED, so with no Redis reachable in a unit test run
+    it reports HALTED and every execution gets blocked. Say explicitly that
+    trading is not halted, so the assertions below test what they mean to.
+    """
+    with patch(
+        "app.services.kill_switch_service.is_trading_halted",
+        new=AsyncMock(return_value=False),
+    ):
+        yield
+
+
 def _make_execution_state(
     direction: str = "LONG",
     size: float = 10000.0,
