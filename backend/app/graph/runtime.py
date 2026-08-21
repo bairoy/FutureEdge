@@ -205,6 +205,21 @@ async def lifespan(app):
         except Exception as q_err:
             logger.error(f"Failed to initialise Qdrant collection: {q_err}")
 
+        # Investing mode's document corpus (annual reports, concall transcripts).
+        # A SEPARATE collection from the one above: that holds 12-dimensional
+        # market vectors, this holds text embeddings of a different size, and
+        # Qdrant fixes vector size per collection.
+        #
+        # Failure is logged and tolerated for the same reason as above — the
+        # trading path must still start without it. Investing-mode retrieval
+        # will report itself unavailable rather than the app refusing to boot.
+        try:
+            from app.memory.document_store import init_document_collection
+            await loop.run_in_executor(None, init_document_collection)
+            logger.info("Qdrant document collection check/creation complete")
+        except Exception as d_err:
+            logger.error(f"Failed to initialise Qdrant document collection: {d_err}")
+
         # --------------------------------------------------------
         # STEP 7: START EXIT MONITORING ENGINE (Phase 2 — new)
         # --------------------------------------------------------

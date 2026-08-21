@@ -19,6 +19,7 @@ The risk agent's Kelly criterion uses per-user trade history.
 
 SAFETY LAYERS (in order):
 --------------------------
+0. Analysis mode guard → refuses INVESTING mode outright (it places no orders)
 1. Kill switch check   → kill_switch_service.is_trading_halted() (fails closed)
 2. No-trade check      → direction is NONE or size is 0
 3. HITL approval check → must be approved if hitl_required
@@ -50,9 +51,39 @@ async def execution_node(state: AgentState) -> dict:
       - run_id        : the unique workflow identifier
     """
 
+    run_id:  str = state.get("run_id", "unknown")
+    user_id: str = state.get("user_id", "anonymous")
+
+    # ====================================================
+    # LAYER -1: ANALYSIS MODE GUARD
+    # ====================================================
+    # Investing mode is advisory: it produces research and never places an
+    # order. The graph enforces that structurally — the investing branch ends
+    # at thesis_agent and has no edge to this node — so reaching here in
+    # INVESTING mode means the graph was rewired, not that a trade was
+    # approved.
+    #
+    # Checked BEFORE state["consensus"] is read, because the investing branch
+    # never populates it. Checked before the kill switch too: this is not a
+    # risk decision that could be waived, it is a mode that has no orders.
+    #
+    # This guard is why "advisory only" is a property of the system rather
+    # than of the current graph topology. If CNC execution is ever added, the
+    # hard rule in CLAUDE.md still stands and this is where it is enforced.
+
+    if (state.get("analysis_mode") or "TRADING").upper() == "INVESTING":
+        logger.error(
+            f"BLOCKED: execution reached in INVESTING mode | run_id={run_id} | "
+            f"user_id={user_id} — investing mode places no orders"
+        )
+        return {
+            "executed_trade":  None,
+            "execution_error": "INVESTING_MODE_NO_EXECUTION",
+            "completed_nodes": ["execution"],
+            "logs":            ["Execution refused — Investing mode is advisory and places no orders."],
+        }
+
     proposal: TradeProposal = state["consensus"]
-    run_id:   str           = state["run_id"]
-    user_id:  str           = state.get("user_id", "anonymous")
 
     try:
         logs_accumulated = []

@@ -1,15 +1,30 @@
 """
 app/db/models/fundamental_scorecard.py
 =========================================
-FundamentalScorecard table — one row per symbol per generation, so you can
-track whether a company's fundamentals are improving or degrading over time
-(the trend matters more than any single snapshot).
+FundamentalScorecard — one row per Investing-mode analysis run, so the trend in
+a company's fundamentals is visible over time. The trend matters more than any
+single snapshot: the quarterly re-review job diffs against these rows to detect
+a thesis degrading.
 
-Drop this file in as app/db/models/fundamental_scorecard.py, then:
-    1. Import it in app/db/models/__init__.py alongside the other models
-       (so Alembic/create_tables picks it up)
-    2. Run: docker compose run --rm backend python -m app.scripts.create_tables
-       (or generate a proper Alembic migration if you're past initial setup)
+WHAT THIS STORES, AND WHAT IT DELIBERATELY DOES NOT:
+------------------------------------------------------
+Stored: the QUALITY verdict and the VALUATION BAND, each with the date of the
+data behind them. Both change about once a quarter and cost a full pipeline run
+to produce.
+
+NOT stored: the stance (BUY / HOLD / WATCH / ...). It depends on the live price
+and on whether the position is held, so it is computed on read by
+app/services/stance.py. Persisting it would mean re-running the whole pipeline
+every time the price moved, and would leave a stale verb in the database
+between runs.
+
+Also not stored: any position size. Investing mode is advisory — it places no
+orders, and how much to buy is the reader's decision.
+
+    docker compose run --rm backend python -m app.scripts.create_tables
+
+Note create_all() does NOT alter an existing table, so a column added here
+after the table exists needs a manual migration or a drop and recreate.
 """
 
 import uuid
@@ -27,26 +42,33 @@ class FundamentalScorecard(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
 
     symbol: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
-    data_as_of: Mapped[str] = mapped_column(String(20), nullable=False)  # e.g. "Mar 2026"
+    run_id: Mapped[str] = mapped_column(String(36), nullable=True)
+    data_as_of: Mapped[str] = mapped_column(String(40), nullable=True)   # e.g. "Mar 2026"
 
-    verdict: Mapped[str] = mapped_column(String(20), nullable=False)          # INVESTMENT_GRADE / NEUTRAL / AVOID
-    confidence: Mapped[str] = mapped_column(String(10), nullable=False)      # HIGH / MEDIUM / LOW
-    suggested_allocation_pct: Mapped[float] = mapped_column(Float, nullable=False)
+    # INVESTMENT_GRADE | WATCHLIST | NOT_INVESTABLE | NOT_RATED
+    quality_grade: Mapped[str] = mapped_column(String(20), nullable=False)
 
-    # Full structured scorecard (ratios, flags, DuPont breakdown) — kept as
-    # JSON rather than a wide column-per-ratio table, since the ratio set
-    # here is still likely to evolve as you tune the agent.
-    profitability: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
-    leverage: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
-    growth: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
-    valuation: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # Set only when quality_grade is NOT_RATED, e.g. "SECTOR_UNSUPPORTED",
+    # "INSUFFICIENT_DATA". A refusal has to say why, or it is indistinguishable
+    # from a failure.
+    not_rated_reason: Mapped[str] = mapped_column(String(40), nullable=True)
 
-    dupont: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # Kept separate on purpose: "the data is complete and the case is marginal"
+    # is a different state from "the case looks strong but inputs are missing".
+    completeness: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    conviction: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+
+    # The three stages, as produced. JSON rather than a column per metric,
+    # because the metric set is still evolving and the shapes are nested.
+    business_report: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    financial_report: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    valuation_report: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
 
     red_flags: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
-    green_flags: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    missing_data: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
 
-    rationale: Mapped[str] = mapped_column(Text, nullable=True)
+    # Non-prescriptive prose. The verb lives in the computed stance, not here.
+    narrative: Mapped[str] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
