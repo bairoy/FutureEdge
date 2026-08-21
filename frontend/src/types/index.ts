@@ -255,3 +255,141 @@ export interface SystemStatus {
     connected: boolean;
   };
 }
+
+/* ─── INVESTING MODE ──────────────────────────────────────────
+ *
+ * Shapes returned by /api/v1/investing. Advisory only — nothing on this
+ * surface places an order, and there is no field here that could.
+ *
+ * The split between `quality` (persisted, changes ~quarterly) and `stance`
+ * (computed on read, changes every tick) mirrors the backend exactly. See
+ * app/services/stance.py for why the stance is never stored.
+ */
+
+/** INVESTMENT_GRADE and WATCHLIST pass; NOT_RATED is a refusal to judge, not a bad grade. */
+export type QualityGrade =
+  | "INVESTMENT_GRADE"
+  | "WATCHLIST"
+  | "NOT_INVESTABLE"
+  | "NOT_RATED";
+
+/** Note the absence of SELL: expensive stops buying, it never forces an exit. */
+export type StanceAction =
+  | "BUY" | "ADD" | "HOLD" | "WATCH" | "EXIT" | "AVOID" | "NOT_RATED";
+
+export type PriceVsBand =
+  | "BELOW_MOS" | "UNDERVALUED" | "FAIRLY_VALUED" | "OVERVALUED";
+
+export type CheckStatus = "PASS" | "FAIL" | "FLAG" | "NOT_COMPUTABLE";
+
+export interface RedFlag {
+  question: number;
+  flag: string;
+  citations?: string[];
+}
+
+export interface BusinessAnswer {
+  n: number;
+  question: string;
+  kind: string;
+  status: string;          // ANSWERED | NOT_FOUND | NEEDS_EXTERNAL
+  answer: string;
+  citations: string[];
+  is_opinion: boolean;
+  /** Which tier answered it. Filings are audited; the open web is not, and the
+   *  reader has to be able to tell them apart at a glance. */
+  source?: "DOCUMENTS" | "WEB" | "SHAREHOLDING" | "NONE";
+  /** Populated only when source is WEB. */
+  sources?: { title: string; url: string; domain: string }[];
+}
+
+export interface FinancialCheck {
+  n: number;               // 101+ are calculation cautions, not scored checks
+  name: string;
+  status: CheckStatus;
+  value: number | string | null;
+  detail: string;
+  source: string;
+}
+
+/** One thing a stage could not compute. Rendered, never swallowed —
+ *  a scorecard missing four checks must not look like one that passed ten. */
+export interface MissingDatum {
+  stage: "BUSINESS" | "FINANCIAL" | "VALUATION";
+  field: string;
+  reason: string;
+  period?: string | null;
+}
+
+export interface ValuationReport {
+  intrinsic: number | null;
+  upper_band: number | null;
+  lower_band: number | null;
+  mos_buy_price: number | null;
+  reverse_dcf_implied_fcf: number | null;
+  complete: boolean;
+  assumptions: {
+    base_fcf_cr?: number;
+    stage1_growth_pct?: number;
+    stage2_growth_pct?: number;
+    terminal_growth_pct?: number;
+    discount_rate_pct?: number;
+    beta?: number;
+    beta_note?: string;
+    risk_free_rate_pct?: number;
+    risk_free_reviewed?: string;
+    equity_risk_premium_pct?: number;
+    net_debt_cr?: number;
+    shares_outstanding?: number;
+    current_price?: number | null;
+    price_vs_band?: PriceVsBand;
+    terminal_share_of_value?: number;
+    reverse_dcf_note?: string;
+    warnings?: string[];
+  };
+  sensitivity: {
+    /** { "dr_11.5": { "tg_3.0": 391.2, … } } — rows are discount rates. */
+    intrinsic_by_discount_and_terminal_growth?: Record<string, Record<string, number>>;
+    base_discount_rate_pct?: number;
+  };
+}
+
+/** GET /api/v1/investing/{symbol}/thesis */
+export interface Thesis {
+  symbol: string;
+  as_of: string;
+  data_as_of: string | null;
+  quality: {
+    grade: QualityGrade;
+    not_rated_reason: string | null;
+    completeness: number;    // 0-1
+    conviction: number;      // 0-1, deliberately distinct from completeness
+    red_flags: RedFlag[];
+  };
+  valuation: ValuationReport;
+  stance: {
+    action: StanceAction;
+    price_vs_band: PriceVsBand | null;
+    trigger_price: number | null;
+    /** The exact matrix cell that fired. Never render the verb without it. */
+    rule_applied: string;
+    horizon: string;
+    computed_at: string;
+    current_price: number | null;
+  };
+  owned: { quantity: number; avg_buy_price: number; buy_date: string } | null;
+  business: { answers: BusinessAnswer[]; red_flags: RedFlag[]; gate: string; complete: boolean };
+  financial: { checks: FinancialCheck[]; completeness: number; complete: boolean };
+  missing_data: MissingDatum[];
+  narrative: string;
+  /** Always true. Stated on every response so the client cannot forget. */
+  advisory_only: boolean;
+}
+
+export interface InvestingHolding {
+  symbol: string;
+  quantity: number;
+  avg_buy_price: number;
+  buy_date: string;
+  notes: string | null;
+}

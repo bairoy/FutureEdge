@@ -27,7 +27,7 @@ import { useRouter, usePathname } from "next/navigation";
 import Link from "next/link";
 import {
   LayoutDashboard, TrendingUp, Users, Activity,
-  LogOut, BarChart2, ExternalLink, LineChart
+  LogOut, BarChart2, ExternalLink, LineChart, Landmark
 } from "lucide-react";
 
 import api, { tokenStore } from "@/lib/api";
@@ -44,6 +44,10 @@ import type { UserProfile } from "@/types";
 const NAV = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard, minRole: "viewer" },
   { href: "/dashboard/trades", label: "Trades", icon: TrendingUp, minRole: "viewer" },
+  // Investing is advisory and places no orders, so it is readable by anyone
+  // who can see the dashboard. Running an analysis is gated at trader inside
+  // the page, matching the backend.
+  { href: "/dashboard/investing", label: "Investing", icon: Landmark, minRole: "viewer" },
   { href: "/dashboard/backtest", label: "Backtest", icon: LineChart, minRole: "trader" },
   { href: "/dashboard/users", label: "Users", icon: Users, minRole: "admin" },
 ];
