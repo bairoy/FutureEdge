@@ -308,6 +308,12 @@ class Settings(BaseSettings):
     # cannot quietly turn one run into an unbounded number of paid searches.
     STAGE1_WEB_SEARCH_MAX_QUESTIONS: int = 18
 
+    # Quarterly re-review of holdings + watchlist. Off by default in no
+    # environment — but a switch exists because the sweep costs a full pipeline
+    # run per symbol, and someone running a fork without an OpenAI key wants it
+    # quiet rather than failing four times a year.
+    INVESTING_REVIEW_ENABLED: bool = True
+
     # --------------------------------------------------------
     # APSCHEDULER SETTINGS
     # --------------------------------------------------------

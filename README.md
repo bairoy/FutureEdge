@@ -25,6 +25,7 @@ The two modes share state definitions and infrastructure but no execution path. 
 * **Stage 2 — financial due diligence**: the 10-point checklist (margins, growth divergence, dilution, leverage, inventory/debtor days, CFO, ROE, segment sprawl, subsidiaries), each check carrying its own source.
 * **Stage 3 — intrinsic value**: a full 10-step DCF — CAPM discount rate from a live beta, two-stage growth, Gordon *and* exit-multiple terminal values, net-debt adjustment, a ±10% band, a margin-of-safety price, a reverse DCF, and a sensitivity grid.
 * **Nothing is silently dropped** — any figure a stage could not compute is recorded as a `MissingDatum` with a reason, and the thesis reports its own completeness. A scorecard missing four checks never looks like one that passed ten.
+* **Quarterly re-review**: every 1 March / June / September / December the system re-runs the full pipeline on your holdings and watchlist, diffs each verdict against the previous quarter, and alerts on Telegram when a business has deteriorated. This is what tells you when to *sell* something you bought by hand — the half a one-off analysis cannot answer.
 * **Stance is computed on read, never stored** — it depends on the live price and on whether you hold the position, so persisting it would make it stale the moment the market moved. Every stance records the exact rule that produced it.
 
 ---

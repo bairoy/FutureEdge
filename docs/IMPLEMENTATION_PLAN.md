@@ -721,7 +721,36 @@ Two disjoint branches. No shared tail — Investing has no execution to reuse.
 
 ### 4E — Monitoring and separation
 
-- [ ] **Quarterly re-review job** (reuse the `apscheduler` pattern in `jobs/scheduler.py`): re-run the pipeline per symbol in `investing_holdings` + `INVESTING_WATCHLIST_SYMBOLS`, and alert via Telegram when a `QualityVerdict.grade` **degrades** or a new Tier-1 red flag appears. This is the highest-value part of the feature — you need to know when to sell something you bought by hand — and it is why the holdings register exists.
+- [x] **Quarterly re-review job** — `app/jobs/investing_review.py`, registered on the scheduler as
+  `quarterly_investing_review`. Re-runs the pipeline for every symbol in `investing_holdings` ∪
+  `INVESTING_WATCHLIST_SYMBOLS`, stores each new scorecard, diffs it against the previous one, and
+  alerts on Telegram.
+
+  **The distinction the job exists to get right:** a grade can fall because the business deteriorated
+  *or* because the data stopped arriving — and insufficient data forces NOT_RATED, so both land in
+  the same column. Reporting them identically would one day tell you a compounder had degraded when
+  in fact a parser broke, and the natural response to "your holding degraded" is to sell it. So
+  `NOT_RATED` is deliberately **absent from `_GRADE_RANK`**: it cannot be a degradation, and is
+  reported separately, worded as a system problem ("this is missing data, not evidence the business
+  got worse"). Six tests pin that from different directions.
+
+  **Other decisions:** holdings are listed before watchlist symbols (a stale watchlist costs an
+  opportunity, a stale holding costs money); the sweep is sequential because each symbol is a full
+  scrape + retrieval + paid search + DCF and the scraper already serialises itself; one symbol
+  failing never aborts the rest; a dead Telegram channel cannot lose a completed review; and
+  **silence is the healthy result** — a quarterly job that always reports "all fine" teaches you to
+  skim it, and then the one that matters gets skimmed too.
+
+  **Schedule — 06:00 IST on 1 Mar / Jun / Sep / Dec.** Indian filings land roughly Q3 by mid-Feb, Q4
+  and the annual report by end-May, Q1 by mid-Aug, Q2 by mid-Nov, so these dates sit just *after*
+  each results season rather than inside one. `misfire_grace_time` is a full day, not minutes: a
+  quarterly review missed outright is a quarter blind, and yesterday's is still useful.
+
+  It computes no stance — the verb depends on the live price and would be stale within the hour,
+  which is why stance is derived on read in the API instead.
+  **Done when:** it registers, diffs real stored scorecards, and never calls a data failure a
+  downgrade. ✅ verified live: registered as the 6th job, next fire 1 Sep 2026; diffed the two real
+  ASIANPAINT scorecards correctly. 19 new tests.
 
 - [ ] **Track the calls.** Store the `Stance` at each quarterly review and score it later. The repo already does win-rate and calibration for trading; research desks do the same for ratings, and it is the only way to discover whether the DCF assumptions run systematically optimistic.
 

@@ -21,6 +21,8 @@ SCHEDULED JOBS:
 | instruments_refresh      | 8:00 AM IST M-F   | Refresh instrument master       |
 | weight_updater_daily     | 4:00 PM IST M-F   | Recalculate agent weights       |
 | daily_pnl_report         | 4:30 PM IST M-F   | Compile daily P&L log           |
+| quarterly_investing_review | 6 AM IST, 1st of  | Re-run fundamentals on holdings |
+|                          | Mar/Jun/Sep/Dec   | + watchlist, alert on decay     |
 
 USAGE (called from runtime.py lifespan):
     from app.jobs.scheduler import scheduler
@@ -43,6 +45,26 @@ IST = ZoneInfo("Asia/Kolkata")
 # ============================================================
 # JOB FUNCTIONS
 # ============================================================
+
+async def _quarterly_investing_review():
+    """
+    Re-run the fundamental pipeline on every holding and watchlist symbol, and
+    alert when a business has deteriorated since last quarter.
+
+    Advisory only, like everything in investing mode: it sends a message and
+    places no orders.
+    """
+    logger.info("⏰ Scheduler: quarterly investing re-review starting...")
+    try:
+        from app.jobs.investing_review import run_review
+        summary = await run_review()
+        logger.info(
+            f"✅ Scheduler: quarterly review done — {len(summary.reviewed)} symbol(s), "
+            f"{len(summary.alerting)} needing attention"
+        )
+    except Exception as e:
+        logger.error(f"Scheduler: quarterly investing review failed: {e}")
+
 
 async def _instruments_refresh():
     """Refresh Zerodha instrument master CSV into Redis cache."""
@@ -271,6 +293,30 @@ def build_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
         misfire_grace_time=1800,
     )
+
+    # Quarterly investing re-review — the job that tells you when to sell
+    # something you bought by hand.
+    #
+    # WHY THE 1st OF MAR/JUN/SEP/DEC: Indian companies report quarterly, and
+    # the filings land roughly Q3 by mid-February, Q4 and the annual report by
+    # end-May, Q1 by mid-August, Q2 by mid-November. These dates put each
+    # review just AFTER a results season rather than in the middle of one, so
+    # it reads fresh statements instead of re-reading last quarter's.
+    #
+    # 6 AM IST because the sweep is slow — a full pipeline per symbol — and it
+    # has no business competing with the pre-market warmup at 9.
+    if settings.INVESTING_REVIEW_ENABLED:
+        scheduler.add_job(
+            _quarterly_investing_review,
+            CronTrigger(month="3,6,9,12", day=1, hour=6, minute=0, timezone=IST),
+            id="quarterly_investing_review",
+            name="Quarterly Investing Re-Review",
+            replace_existing=True,
+            # A quarterly review missed entirely is a quarter blind, so it is
+            # worth running late. The other jobs use minutes; this one uses a
+            # day, because "yesterday's quarterly review" is still useful.
+            misfire_grace_time=86400,
+        )
 
     logger.info(f"⏰ Scheduler configured with {len(scheduler.get_jobs())} jobs")
     return scheduler
