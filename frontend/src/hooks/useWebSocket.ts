@@ -23,7 +23,7 @@
 
 import { useEffect, useRef } from "react";
 import { tokenStore } from "@/lib/api";
-import { useTradingStore, useAuthStore, type TickPoint, type HITLPending } from "@/store";
+import { useTradingStore, useAuthStore, type HITLPending } from "@/store";
 import type { WebSocketMessage } from "@/types";
 
 const WS_BASE = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000";
@@ -34,7 +34,7 @@ export function useWebSocket() {
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const alive = useRef(true);
 
-  const { currentSymbol, addTick, clearTicks, setAgentResult, setHITLPending, setKillSwitch } = useTradingStore();
+  const { currentSymbol, applyTrade, clearTicks, setAgentResult, setHITLPending, setKillSwitch } = useTradingStore();
   const user = useAuthStore((s) => s.user);
   const isLoading = useAuthStore((s) => s.isLoading);
 
@@ -100,14 +100,15 @@ export function useWebSocket() {
 
       case "tick": {
         const d = msg.data;
-        // lightweight-charts needs Unix seconds, not milliseconds
-        const tick: TickPoint = {
-          time: Math.floor(new Date(d.timestamp).getTime() / 1000),
-          open: d.open, high: d.high,
-          low: d.low, close: d.close,
-          volume: d.volume,
-        };
-        addTick(tick);
+        // Only `ltp` is per-trade. The open/high/low/close on this payload are
+        // Kite's DAY-level OHLC (and `close` is the previous day's close), so
+        // they must not be used as candle values — the store folds the LTP
+        // into the current minute's candle instead.
+        applyTrade(
+          d.ltp,
+          Math.floor(new Date(d.timestamp).getTime() / 1000), // seconds, not ms
+          d.volume,
+        );
         break;
       }
 
@@ -119,10 +120,12 @@ export function useWebSocket() {
 
       case "hitl_pending": {
         const d = msg.data;
+
+        // Resolution notice — close the modal and stamp the outcome on the run
         if (!d || d.status === "RESOLVED") {
           setHITLPending(null);
           const store = useTradingStore.getState();
-          if (store.runResult && store.runResult.thread_id === d?.run_id) {
+          if (d && store.runResult && store.runResult.thread_id === d.run_id) {
             store.setRunResult({
               ...store.runResult,
               hitl_status: d.hitl_status,
@@ -130,20 +133,25 @@ export function useWebSocket() {
           }
           break;
         }
+
+        // Proposal awaiting approval. Everything but symbol/reasons lives on
+        // `proposal` — reading llm_rationale off the top level (as this used to)
+        // always yielded undefined, so the modal showed no rationale.
+        const p = d.proposal;
         const pending: HITLPending = {
-          threadId: (d as any).proposal?.run_id ?? "",
+          threadId: p.run_id,
           symbol: d.symbol,
-          direction: d.proposal?.direction ?? "NONE",
-          size: d.proposal?.size ?? 0,
-          entryPrice: d.proposal?.entry_price ?? 0,
-          riskScore: d.proposal?.risk_score ?? 0,
-          stopLoss: d.proposal?.stop_loss,
-          takeProfit: d.proposal?.take_profit,
-          llmRationale: d.llm_rationale,
+          direction: p.direction,
+          size: p.size,
+          entryPrice: p.entry_price,
+          riskScore: p.risk_score,
+          stopLoss: p.stop_loss ?? undefined,
+          takeProfit: p.take_profit ?? undefined,
+          llmRationale: p.llm_rationale,
           reasons: d.reasons,
-          memories: d.memories ?? [],
-          votes: d.proposal?.votes ?? [],
-          hitlRequired: (d as any).proposal?.hitl_required,
+          memories: [], // this channel doesn't carry episodic memories
+          votes: p.votes,
+          hitlRequired: p.hitl_required,
         };
         setHITLPending(pending);
         break;

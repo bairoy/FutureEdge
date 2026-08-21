@@ -7,16 +7,11 @@ Only risk_manager and admin can halt or resume trading.
 Viewers and traders can only CHECK the status.
 """
 
-import json
-from datetime import datetime
-
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from loguru import logger
 
 from app.auth.dependencies import require_viewer, require_risk_manager
 from app.db.models.user import User
-from app.db.redis import redis_client, KEY_TRADING_HALT, CHANNEL_KILL_SWITCH
 
 
 router = APIRouter(prefix="/api/v1/kill-switch", tags=["Kill Switch"])
@@ -37,8 +32,9 @@ async def halt_trading(
     """
     from app.services.kill_switch_service import activate_kill_switch
 
+    # No duration: an operator halt lasts until an operator lifts it. This used
+    # to pass 14400s, so trading silently resumed 4 hours later on its own.
     await activate_kill_switch(
-        duration_seconds=14400,  # 4 hours default
         reason=request.reason,
         user_id=current_user.id,
         user_email=current_user.email,
@@ -68,10 +64,15 @@ async def kill_switch_status(
 ):
     """Any authenticated user can check if trading is halted."""
 
-    value     = await redis_client.get(KEY_TRADING_HALT)
-    is_halted = value == "1"
+    # Via the service, not a raw Redis read — an unreachable Redis must report
+    # HALTED here too, otherwise the dashboard shows a green "ACTIVE" light
+    # while the system is actually blocking every order.
+    from app.services.kill_switch_service import get_kill_switch_status
+
+    state = await get_kill_switch_status()
 
     return {
-        "halted": is_halted,
-        "status": "HALTED" if is_halted else "ACTIVE",
+        "halted": state["halted"],
+        "status": "HALTED" if state["halted"] else "ACTIVE",
+        "reason": state["reason"],
     }

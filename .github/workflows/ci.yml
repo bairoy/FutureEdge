@@ -81,12 +81,15 @@ jobs:
           # Stop on critical errors (E = pycodestyle errors, F = pyflakes)
           ruff check app/ --select E,F --ignore E501,E402
 
+      # Runs from the repo root, NOT backend/: the suite lives in ./tests and
+      # each test file puts ./backend on sys.path itself. With
+      # `working-directory: backend` this step died on "file or directory not
+      # found: tests/" and no backend test has ever actually run in CI.
       - name: Run tests with coverage
-        working-directory: backend
         run: |
           pytest tests/ \
             --asyncio-mode=auto \
-            --cov=app \
+            --cov=backend/app \
             --cov-report=term-missing \
             --cov-report=xml \
             --cov-fail-under=40 \
@@ -98,8 +101,39 @@ jobs:
         uses: codecov/codecov-action@v4
         if: always()
         with:
-          file: backend/coverage.xml
+          file: coverage.xml   # written at the repo root, where pytest now runs
           fail_ci_if_error: false
+
+  frontend:
+    name: Frontend Build
+    runs-on: ubuntu-latest
+
+    # Runs against a clean checkout on purpose: a gitignored-but-required source
+    # file (frontend/src/lib/api.ts) broke this build for months and nobody saw
+    # it, because CI never compiled the frontend at all.
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Type-check
+        working-directory: frontend
+        run: npm run type-check
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
 
   backtest-regression:
     name: Backtest Regression (main branch only)
@@ -124,16 +158,11 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Runs against a committed candle fixture, not a live fetch, so the
+      # result changes only when the strategy code changes — and the step
+      # needs no network. Exit 1 = regression, exit 2 = could not run.
+      # See backend/app/scripts/run_regression_backtest.py for why the floor
+      # is where it is, and what this gate does NOT tell you.
       - name: Run backtest regression
         working-directory: backend
-        run: |
-          echo "Backtest regression: verify Sharpe ratio >= 0.5 on last 6 months of NIFTY 50"
-          python -c "
-          import sys
-          print('Backtest regression placeholder — implement app.scripts.run_regression_backtest')
-          # TODO: Run actual backtest when backtester is production-ready
-          # from app.scripts.run_regression_backtest import run
-          # result = run(symbol='NIFTY 50', period='6mo', min_sharpe=0.5)
-          # sys.exit(0 if result['passed'] else 1)
-          sys.exit(0)
-          "
+        run: python -m app.scripts.run_regression_backtest

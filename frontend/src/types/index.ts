@@ -145,25 +145,44 @@ export interface AgentResultMessage {
   };
 }
 
+/**
+ * Two different payloads arrive on the "hitl_pending" channel, discriminated
+ * by `status`:
+ *   - a proposal awaiting approval  (orchestration_agent._publish_results)
+ *   - a resolution notice           (human_agent, published on workflow resume)
+ * Modelling only the first is what broke the build — the resolution branch in
+ * useWebSocket reads fields the old single-shape type didn't have.
+ */
+export interface HITLProposalPayload {
+  status?: undefined;
+  symbol: string;
+  reasons: string[];
+  proposal: {
+    run_id: string;
+    symbol: string;
+    direction: string;
+    size: number;
+    entry_price: number;
+    risk_score: number;
+    stop_loss: number | null;
+    take_profit: number | null;
+    llm_rationale: string | null;
+    hitl_required: boolean;
+    hitl_reasons: string[];
+    votes: AgentVote[];
+  };
+}
+
+export interface HITLResolvedPayload {
+  status: "RESOLVED";
+  run_id: string;
+  decision: string;
+  hitl_status: "APPROVED" | "REJECTED";
+}
+
 export interface HITLPendingMessage {
   type: "hitl_pending";
-  data: {
-    symbol: string;
-    reasons: string[];
-    llm_rationale: string | null;
-    memories: EpisodicMemory[];
-    proposal: {
-      run_id?: string;
-      direction: string;
-      size: number;
-      entry_price: number;
-      risk_score: number;
-      stop_loss?: number;
-      take_profit?: number;
-      votes: AgentVote[];
-      hitl_required?: boolean;
-    };
-  };
+  data: HITLProposalPayload | HITLResolvedPayload;
 }
 
 export interface TradeMessage {
@@ -200,3 +219,177 @@ export type WebSocketMessage =
   | TradeMessage
   | KillSwitchMessage
   | ClearTicksMessage;
+
+/**
+ * GET /api/v1/system/status
+ *
+ * Feed and broker are deliberately separate objects: where prices come from
+ * and where orders go are independent choices. The usual setup is a live
+ * Zerodha feed with the mock broker — real prices, simulated money.
+ */
+export interface SystemStatus {
+  market_open: boolean;
+  feed: {
+    mode: "zerodha" | "mock";
+    /** What is ACTUALLY serving prices right now, which may not equal `mode`. */
+    source: "zerodha_ticker" | "yfinance";
+    label: string;
+    /** Human-readable reason, including WHY a feed is degraded. */
+    detail: string;
+    is_live: boolean;
+    is_delayed: boolean;
+    streaming: boolean;
+    tick_age_seconds: number | null;
+  };
+  broker: {
+    mode: "zerodha" | "mock";
+    label: string;
+    detail: string;
+    /** True means orders hit a REAL Zerodha account. */
+    is_live: boolean;
+    is_paper: boolean;
+    connected: boolean;
+  };
+  zerodha: {
+    configured: boolean;
+    connected: boolean;
+  };
+}
+
+/* ─── INVESTING MODE ──────────────────────────────────────────
+ *
+ * Shapes returned by /api/v1/investing. Advisory only — nothing on this
+ * surface places an order, and there is no field here that could.
+ *
+ * The split between `quality` (persisted, changes ~quarterly) and `stance`
+ * (computed on read, changes every tick) mirrors the backend exactly. See
+ * app/services/stance.py for why the stance is never stored.
+ */
+
+/** INVESTMENT_GRADE and WATCHLIST pass; NOT_RATED is a refusal to judge, not a bad grade. */
+export type QualityGrade =
+  | "INVESTMENT_GRADE"
+  | "WATCHLIST"
+  | "NOT_INVESTABLE"
+  | "NOT_RATED";
+
+/** Note the absence of SELL: expensive stops buying, it never forces an exit. */
+export type StanceAction =
+  | "BUY" | "ADD" | "HOLD" | "WATCH" | "EXIT" | "AVOID" | "NOT_RATED";
+
+export type PriceVsBand =
+  | "BELOW_MOS" | "UNDERVALUED" | "FAIRLY_VALUED" | "OVERVALUED";
+
+export type CheckStatus = "PASS" | "FAIL" | "FLAG" | "NOT_COMPUTABLE";
+
+export interface RedFlag {
+  question: number;
+  flag: string;
+  citations?: string[];
+}
+
+export interface BusinessAnswer {
+  n: number;
+  question: string;
+  kind: string;
+  status: string;          // ANSWERED | NOT_FOUND | NEEDS_EXTERNAL
+  answer: string;
+  citations: string[];
+  is_opinion: boolean;
+  /** Which tier answered it. Filings are audited; the open web is not, and the
+   *  reader has to be able to tell them apart at a glance. */
+  source?: "DOCUMENTS" | "WEB" | "SHAREHOLDING" | "NONE";
+  /** Populated only when source is WEB. */
+  sources?: { title: string; url: string; domain: string }[];
+}
+
+export interface FinancialCheck {
+  n: number;               // 101+ are calculation cautions, not scored checks
+  name: string;
+  status: CheckStatus;
+  value: number | string | null;
+  detail: string;
+  source: string;
+}
+
+/** One thing a stage could not compute. Rendered, never swallowed —
+ *  a scorecard missing four checks must not look like one that passed ten. */
+export interface MissingDatum {
+  stage: "BUSINESS" | "FINANCIAL" | "VALUATION";
+  field: string;
+  reason: string;
+  period?: string | null;
+}
+
+export interface ValuationReport {
+  intrinsic: number | null;
+  upper_band: number | null;
+  lower_band: number | null;
+  mos_buy_price: number | null;
+  reverse_dcf_implied_fcf: number | null;
+  complete: boolean;
+  assumptions: {
+    base_fcf_cr?: number;
+    stage1_growth_pct?: number;
+    stage2_growth_pct?: number;
+    terminal_growth_pct?: number;
+    discount_rate_pct?: number;
+    beta?: number;
+    beta_note?: string;
+    risk_free_rate_pct?: number;
+    risk_free_reviewed?: string;
+    equity_risk_premium_pct?: number;
+    net_debt_cr?: number;
+    shares_outstanding?: number;
+    current_price?: number | null;
+    price_vs_band?: PriceVsBand;
+    terminal_share_of_value?: number;
+    reverse_dcf_note?: string;
+    warnings?: string[];
+  };
+  sensitivity: {
+    /** { "dr_11.5": { "tg_3.0": 391.2, … } } — rows are discount rates. */
+    intrinsic_by_discount_and_terminal_growth?: Record<string, Record<string, number>>;
+    base_discount_rate_pct?: number;
+  };
+}
+
+/** GET /api/v1/investing/{symbol}/thesis */
+export interface Thesis {
+  symbol: string;
+  as_of: string;
+  data_as_of: string | null;
+  quality: {
+    grade: QualityGrade;
+    not_rated_reason: string | null;
+    completeness: number;    // 0-1
+    conviction: number;      // 0-1, deliberately distinct from completeness
+    red_flags: RedFlag[];
+  };
+  valuation: ValuationReport;
+  stance: {
+    action: StanceAction;
+    price_vs_band: PriceVsBand | null;
+    trigger_price: number | null;
+    /** The exact matrix cell that fired. Never render the verb without it. */
+    rule_applied: string;
+    horizon: string;
+    computed_at: string;
+    current_price: number | null;
+  };
+  owned: { quantity: number; avg_buy_price: number; buy_date: string } | null;
+  business: { answers: BusinessAnswer[]; red_flags: RedFlag[]; gate: string; complete: boolean };
+  financial: { checks: FinancialCheck[]; completeness: number; complete: boolean };
+  missing_data: MissingDatum[];
+  narrative: string;
+  /** Always true. Stated on every response so the client cannot forget. */
+  advisory_only: boolean;
+}
+
+export interface InvestingHolding {
+  symbol: string;
+  quantity: number;
+  avg_buy_price: number;
+  buy_date: string;
+  notes: string | null;
+}

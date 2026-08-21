@@ -20,7 +20,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from langgraph.types import Command
 
@@ -308,10 +308,51 @@ async def resume_workflow(
             detail="Only a risk_manager or admin can approve or reject risky trades."
         )
 
-    if workflow_run.status != "HITL_PENDING":
+    # ========================================================
+    # ATOMIC CLAIM — exactly one request may resume a given run
+    # ========================================================
+    # This used to be a plain `if workflow_run.status != "HITL_PENDING"` check
+    # followed, much later, by a write of status="COMPLETED". The trade is
+    # executed by graph.ainvoke() *between* those two points, so two concurrent
+    # resumes (a double-clicked Approve, a retried request, two risk managers)
+    # both read HITL_PENDING, both passed the check, and both placed the order.
+    #
+    # Instead, claim the row with a conditional UPDATE and let the database
+    # decide the winner: only the request whose UPDATE actually matched a row
+    # proceeds. Deliberately NOT `SELECT ... FOR UPDATE` — that would hold a row
+    # lock across the whole graph run, including the broker network call, and
+    # merely queue the second request rather than rejecting it.
+    from datetime import datetime, timezone
+
+    claim = await db.execute(
+        update(WorkflowRun)
+        .where(
+            WorkflowRun.run_id == request.thread_id,
+            WorkflowRun.status == "HITL_PENDING",   # ← the compare-and-set
+        )
+        .values(
+            status           = "HITL_RESOLVING",
+            hitl_reviewed_by = current_user.id,
+            hitl_decided_at  = datetime.now(timezone.utc),
+        )
+    )
+    await db.commit()
+
+    if claim.rowcount == 0:
+        # Someone else claimed it first, or it was never pending. Re-read to
+        # report the real current status rather than the one we read earlier.
+        await db.refresh(workflow_run)
+        logger.warning(
+            f"HITL resume rejected — run already resolved | "
+            f"run_id={request.thread_id} | status={workflow_run.status} | "
+            f"reviewer={current_user.email}"
+        )
         raise HTTPException(
             status_code=400,
-            detail=f"Workflow is not pending HITL review. Current status: {workflow_run.status}",
+            detail=(
+                f"Workflow is not pending HITL review. "
+                f"Current status: {workflow_run.status}"
+            ),
         )
 
     config = {"configurable": {"thread_id": request.thread_id}}
@@ -334,13 +375,20 @@ async def resume_workflow(
         )
     except Exception as e:
         logger.exception(f"Resume failed: {e}")
+        # Mark FAILED, do NOT revert to HITL_PENDING. The exception may have
+        # been raised after the broker order was already placed, and making the
+        # run resumable again would risk executing it twice — the exact bug the
+        # claim above exists to prevent. A stranded run needs a human to check
+        # the broker; a duplicated order costs real money.
+        workflow_run.status        = "FAILED"
+        workflow_run.error_message = str(e)[:500]
+        workflow_run.completed_at  = datetime.now(timezone.utc)
+        await db.commit()
         raise HTTPException(status_code=500, detail=f"Resume failed: {str(e)}")
 
-    # Update workflow run record
-    from datetime import datetime, timezone
+    # Finalise the claimed run. hitl_reviewed_by / hitl_decided_at were already
+    # stamped by the claim, so the reviewer is recorded even if this crashes.
     workflow_run.status           = "COMPLETED"
-    workflow_run.hitl_reviewed_by = current_user.id
-    workflow_run.hitl_decided_at  = datetime.now(timezone.utc)
     workflow_run.completed_at     = datetime.now(timezone.utc)
     workflow_run.completed_nodes  = state.get("completed_nodes", [])
     workflow_run.error_message    = state.get("execution_error")

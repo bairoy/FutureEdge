@@ -121,7 +121,7 @@ async def get_market_history(symbol: str):
     
     # Format for lightweight-charts (Unix seconds)
     formatted = []
-    for c in candles[-50:]:
+    for c in candles[-500:]:
         try:
             ts = int(datetime.fromisoformat(c["timestamp"]).timestamp())
             formatted.append({

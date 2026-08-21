@@ -168,16 +168,24 @@ async def run_backtest(
     trailing_stop_sl_pct: float = 1.5,
     start_idx: int = None,
     end_idx: int = None,
+    candles: list[dict] | None = None,
 ) -> dict:
     """
     Run a historical simulation on OHLCV candles.
 
     Bypasses OpenAI LLM reasoning calls to keep execution fast and free,
     using the exact indicator logic of SignalAgent and risk parameters.
+
+    `candles` lets a caller supply its own OHLCV series instead of fetching
+    `period`/`interval` from yfinance. The CI regression gate uses it to pin an
+    explicit, fixed date range: gating on a rolling "last 6 months" would move
+    the result every day and fail the build because the market moved, not
+    because the strategy regressed.
     """
 
-    # 1. Fetch candles
-    candles = load_historical_candles(symbol, period=period, interval=interval)
+    # 1. Fetch candles (unless the caller supplied them)
+    if candles is None:
+        candles = load_historical_candles(symbol, period=period, interval=interval)
     if not candles or len(candles) < 35:
         logger.warning(f"Insufficient historical candles for backtesting {symbol}")
         return {

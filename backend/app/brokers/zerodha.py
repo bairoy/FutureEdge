@@ -41,6 +41,7 @@ from loguru import logger
 
 from app.brokers.base import BrokerBase, OrderResult
 from app.core.config import settings
+from app.services.token_manager import decrypt_stored_token
 
 
 class ZerodhaBroker(BrokerBase):
@@ -80,7 +81,7 @@ class ZerodhaBroker(BrokerBase):
 
             # Try to load token from Redis first
             try:
-                token = await redis_client.get(KEY_ZERODHA_ACCESS_TOKEN)
+                token = decrypt_stored_token(await redis_client.get(KEY_ZERODHA_ACCESS_TOKEN))
             except Exception as re:
                 logger.warning(f"Could not fetch Zerodha token from Redis: {re}")
                 token = None
@@ -92,16 +93,29 @@ class ZerodhaBroker(BrokerBase):
                     try:
                         with open("broker_token.json", "r") as f:
                             token_data = json.load(f)
-                            token = token_data.get("ZERODHA_ACCESS_TOKEN")
+                            token = decrypt_stored_token(token_data.get("ZERODHA_ACCESS_TOKEN"))
                         logger.info("Loaded Zerodha access token from broker_token.json")
                     except Exception as fe:
                         logger.warning(f"Could not load token from broker_token.json: {fe}")
 
             if not token:
+                # Env-supplied token is hand-pasted by the operator, so it is
+                # plaintext by definition — nothing to decrypt.
                 token = settings.ZERODHA_ACCESS_TOKEN
 
             if not token:
-                raise ValueError("No Zerodha access token available in Redis, JSON config, or env settings")
+                # Not an error condition — this is simply "the operator has not
+                # logged in yet today". Kite tokens expire at 6 AM IST, so this
+                # is the NORMAL state every morning, and connect() is called on
+                # every portfolio fetch and status poll. Returning quietly here
+                # keeps it out of the classifier below, which would otherwise
+                # fire an operator alert on each of those polls.
+                logger.warning(
+                    "ZerodhaBroker not connected — no access token available. "
+                    "Connect Zerodha from the dashboard to authenticate."
+                )
+                self._connected = False
+                return False
 
             self._kite = KiteConnect(api_key=settings.ZERODHA_API_KEY)
             self._kite.set_access_token(token)
@@ -122,6 +136,12 @@ class ZerodhaBroker(BrokerBase):
         except Exception as e:
             logger.error(f"❌ ZerodhaBroker connection failed: {e}")
             self._connected = False
+            # An expired/invalid access token surfaces here as TokenException.
+            # Left as a plain log (as it was), the scheduler would keep calling
+            # connect() every cycle, failing silently, while the operator saw
+            # nothing and open positions went unmanaged.
+            from app.brokers.kite_errors import handle_kite_error
+            await handle_kite_error(e, context="ZerodhaBroker.connect")
             return False
 
     async def disconnect(self) -> None:
@@ -281,11 +301,15 @@ class ZerodhaBroker(BrokerBase):
             average_price = 0.0
             latest_status = "OPEN"
 
+            # Defined once here, not inside the loop: the post-cancel
+            # verification below also needs it, and depending on a name bound
+            # in a loop body is easy to break by accident.
+            def _get_history():
+                return self._kite.order_history(order_id)
+
             for _ in range(10):  # 10 attempts * 200ms = 2.0s
                 await asyncio.sleep(0.2)
                 try:
-                    def _get_history():
-                        return self._kite.order_history(order_id)
                     history = await loop.run_in_executor(None, _get_history)
                     if history:
                         latest = history[-1]
@@ -321,18 +345,92 @@ class ZerodhaBroker(BrokerBase):
                 except Exception as cancel_err:
                     logger.error(f"Failed to cancel unfilled order {order_id}: {cancel_err}")
 
+                # ----------------------------------------------------------
+                # RE-READ THE BROKER AFTER CANCELLING — DO NOT ASSUME IT WORKED
+                # ----------------------------------------------------------
+                # The order can fill in the window between our last poll and
+                # the cancel landing at Zerodha. Previously this returned
+                # success=False unconditionally, so execution_agent wrote no
+                # trade row while a REAL position sat open at the broker —
+                # silent, and the opposite of the phantom-trade bug: there the
+                # DB invented a position, here it would miss a genuine one.
+                # Only the broker knows the truth, so ask it.
+                #
+                # Partial fills matter just as much: Kite can fill part of the
+                # quantity and cancel the remainder, leaving real exposure on a
+                # status of CANCELLED.
+                final_status   = latest_status
+                filled_qty     = 0.0
+                final_avg_price = 0.0
+                try:
+                    history = await loop.run_in_executor(None, _get_history)
+                    if history:
+                        final = history[-1]
+                        final_status    = final.get("status", latest_status)
+                        filled_qty      = float(final.get("filled_quantity", 0) or 0)
+                        final_avg_price = float(final.get("average_price", 0.0) or 0.0)
+                except Exception as verify_err:
+                    # Cannot confirm either way. Treat it as filled-unknown
+                    # rather than flat: an unrecorded live position is far more
+                    # dangerous than a trade row we later reconcile away.
+                    logger.error(
+                        f"Could not verify final state of order {order_id} after cancel: "
+                        f"{verify_err} — position may be open at the broker"
+                    )
+                    return OrderResult(
+                        success       = False,
+                        order_id      = str(order_id),
+                        fill_price    = 0.0,
+                        quantity      = 0.0,
+                        status        = "UNKNOWN",
+                        error_message = (
+                            f"Order {order_id} state UNVERIFIED after cancel attempt — "
+                            f"check the broker manually before trading this symbol again"
+                        ),
+                        raw_response  = {"order_id": order_id, "symbol": symbol},
+                    )
+
+                if final_status == "COMPLETE" or filled_qty > 0:
+                    # It filled (fully or partially) despite the cancel. We hold
+                    # a real position — report it so it gets recorded and the
+                    # exit monitor can manage it.
+                    logger.warning(
+                        f"⚠️ ZerodhaBroker | ORDER FILLED DURING CANCEL | "
+                        f"order_id={order_id} | filled={filled_qty}/{quantity} @ {final_avg_price} — "
+                        f"recording as an open position"
+                    )
+                    return OrderResult(
+                        success      = True,
+                        order_id     = str(order_id),
+                        fill_price   = final_avg_price if final_avg_price > 0 else await self.get_ltp(symbol),
+                        quantity     = filled_qty if filled_qty > 0 else quantity,
+                        status       = "COMPLETE",
+                        raw_response = {
+                            "order_id": order_id,
+                            "symbol": symbol,
+                            "filled_during_cancel": True,
+                            "requested_quantity": quantity,
+                        },
+                    )
+
                 return OrderResult(
                     success       = False,
                     order_id      = str(order_id),
                     fill_price    = 0.0,
                     quantity      = 0.0,
-                    status        = "CANCELLED" if latest_status != "REJECTED" else "REJECTED",
-                    error_message = f"Order unfilled after 2s timeout (status: {latest_status})",
+                    status        = "CANCELLED" if final_status != "REJECTED" else "REJECTED",
+                    error_message = f"Order unfilled after 2s timeout (status: {final_status})",
                     raw_response  = {"order_id": order_id, "symbol": symbol},
                 )
 
         except Exception as e:
             logger.error(f"❌ ZerodhaBroker.place_order failed: {e}")
+            # The 2026-08-05 "No IPs configured" rejection landed here and was
+            # logged like any transient error, so exit_monitor retried it every
+            # few seconds for an hour. Classify it: an unusable broker halts
+            # trading and alerts once instead of failing quietly forever.
+            from app.brokers.kite_errors import handle_kite_error
+            await handle_kite_error(e, context=f"ZerodhaBroker.place_order:{symbol}")
             return OrderResult(
                 success       = False,
                 order_id      = "",

@@ -60,6 +60,14 @@ class Settings(BaseSettings):
     FRONTEND_URL: str = "http://localhost:3000"
     ENCRYPTION_KEY: str = ""
 
+    # Comma-separated IPs of reverse proxies allowed to set X-Forwarded-For.
+    # Empty (the default) means "no proxy" — rate limiting keys on the direct
+    # socket peer and X-Forwarded-For is ignored entirely, so a client cannot
+    # spoof its way around a limit by sending the header itself. Set this to
+    # your nginx/Caddy/Traefik IP when deploying behind one, and pass the same
+    # value to uvicorn's --forwarded-allow-ips.
+    TRUSTED_PROXY_IPS: str = ""
+
     # --------------------------------------------------------
     # NOTIFICATIONS (Twilio/WhatsApp — disabled, everything on dashboard)
     # --------------------------------------------------------
@@ -185,6 +193,126 @@ class Settings(BaseSettings):
 
     # Watchlist
     WATCHLIST_SYMBOLS: str = "NIFTY 50,BANKNIFTY"
+
+    # Investing-mode watchlist — kept SEPARATE from the trading watchlist, and
+    # required to be disjoint from it: you may hold a symbol in demat from a
+    # manual buy while the trading side shorts it intraday as MIS, which the
+    # broker can treat as a delivery sell.
+    #
+    # Banks and NBFCs are deliberately absent (HDFCBANK, ICICIBANK, BAJFINANCE
+    # were in the original list). Screener serves lenders a different P&L
+    # schema, and leverage/coverage ratios do not carry their usual meaning
+    # when borrowing IS the raw material — those symbols return NOT_RATED.
+    INVESTING_WATCHLIST_SYMBOLS: str = (
+        "RELIANCE,TCS,INFY,HINDUNILVR,ITC,LT,ASIANPAINT,MARUTI,SUNPHARMA"
+    )
+
+    # --------------------------------------------------------
+    # VALUATION (Investing mode, Stage 3 DCF)
+    # --------------------------------------------------------
+    # Discount rate is CAPM: risk-free + beta x equity risk premium.
+    #
+    # RISK_FREE_RATE_PCT is the 10-year Indian government bond yield. It is a
+    # reviewed constant rather than a scrape on purpose: the 10-year G-sec
+    # moves slowly, and a rate that is a month stale changes intrinsic value
+    # far less than the discount-rate choice itself already does (a 11% -> 13%
+    # move is worth about -23%). A scraper here would add a fragile dependency
+    # for no accuracy. Update it quarterly and move the review date with it.
+    RISK_FREE_RATE_PCT: float = 6.5
+    RISK_FREE_RATE_REVIEWED: str = "2026-08-19"
+
+    # The method puts India's equity risk premium at 4-4.5%.
+    EQUITY_RISK_PREMIUM_PCT: float = 4.5
+
+    # Two-stage FCF growth. Conservative by default — very few companies
+    # sustain FCF growth above ~20% for long, so anything higher is an
+    # aggressive scenario to be shown alongside the base case, not as it.
+    DCF_STAGE1_GROWTH_PCT: float = 15.0   # years 1-5
+    DCF_STAGE2_GROWTH_PCT: float = 10.0   # years 6-10
+    DCF_TERMINAL_GROWTH_PCT: float = 3.5  # 3-4% at most, never >= discount rate
+    DCF_EXIT_MULTIPLE: float = 20.0       # for the alternative terminal value
+
+    # --------------------------------------------------------
+    # DOCUMENT INGESTION (Investing mode, Stage 1)
+    # --------------------------------------------------------
+    # A SEPARATE Qdrant collection from QDRANT_COLLECTION. That one holds
+    # 12-dimensional hand-built market vectors (memory/embedder.py); these are
+    # text embeddings of a different dimension entirely. Same database, and
+    # they must not share a collection.
+    QDRANT_DOCUMENTS_COLLECTION: str = "company_documents"
+
+    # Embeddings use OpenAI by default (OPENAI_API_KEY). If LOCAL_MODEL_BASE_URL
+    # is set, that endpoint is used instead — the client is OpenAI-compatible
+    # either way, so switching provider is configuration, not code.
+    #
+    # Cost is not the constraint here: the full watchlist is roughly 5.5M tokens
+    # to embed once (a 187-page annual report is ~285k), which is cents at
+    # text-embedding-3-small rates. Re-ingesting a document already stored is a
+    # no-op — chunk ids are deterministic — so this does not recur.
+    #
+    # CHANGE THE DIMENSION WITH THE MODEL. Qdrant fixes vector size at
+    # collection creation, so a mismatch fails every upsert against an existing
+    # collection (drop and re-create it if you switch).
+    #   text-embedding-3-small -> 1536   (default; best cost/quality here)
+    #   text-embedding-3-large -> 3072
+    #   nomic-embed-text       -> 768    (local, via LOCAL_MODEL_BASE_URL)
+    EMBEDDING_MODEL_NAME: str = "text-embedding-3-small"
+    EMBEDDING_DIMENSION: int = 1536
+
+    # Chunk size is a retrieval tradeoff, not a storage one: too small and an
+    # answer gets split across chunks, too large and the citation stops
+    # pointing anywhere useful. Chunks never span pages, so a citation always
+    # names one page.
+    DOCUMENT_CHUNK_CHARS: int = 1200
+    DOCUMENT_CHUNK_OVERLAP: int = 150
+
+    # Stage 1 synthesis: an LLM drafts each answer from RETRIEVED passages only.
+    # Roughly 18 questions x ~2k input tokens per company, run quarterly — small,
+    # because retrieval means a 190-page PDF is never sent to a model.
+    # Turn synthesis off to get retrieval-only output: the passages and their
+    # citations, with no drafted answer. Everything downstream still works;
+    # you read three paragraphs instead of one sentence.
+    STAGE1_SYNTHESIS_ENABLED: bool = True
+    STAGE1_SYNTHESIS_MODEL: str = "gpt-4o-mini"
+    # Retrieved passages per question, after merging several query phrasings.
+    #
+    # MEASURED, not guessed — and raising it made things WORSE. Going from 5 to
+    # 8 (and keeping 2x that after the merge) dropped RELIANCE from 12/18 to
+    # 10/18: Q5 and Q7 went from answered back to not-found. Feeding more
+    # passages buys recall at the cost of precision, and a model handed mostly
+    # irrelevant fragments declines to answer rather than digging the good one
+    # out. Do not raise this without re-measuring the answered count.
+    STAGE1_TOP_K: int = 5
+
+    # Web search — the fallback when the company's own documents cannot answer.
+    #
+    # WHY A FALLBACK AND NOT A PARALLEL SOURCE: the annual report is audited and
+    # the open web is not, so filings answer first and search only fills what
+    # they leave empty. Each answer records which tier it came from.
+    #
+    # This is also what rescues a symbol whose report was never ingested. Those
+    # used to score 1/18 with every answer reading "no relevant passage found",
+    # which looks like the information does not exist rather than like nothing
+    # was ever downloaded.
+    #
+    # COST: roughly $10 per 1,000 searches plus tokens. The worst case is a
+    # company with no documents at all, which fires one search per unanswered
+    # question — under 20 cents for a full 18-question run, quarterly.
+    STAGE1_WEB_SEARCH_ENABLED: bool = True
+    STAGE1_WEB_SEARCH_MODEL: str = "gpt-4o-mini"
+    STAGE1_WEB_SEARCH_TIMEOUT_S: int = 120
+    # Stage 1 fans out over all 18 questions at once; this bounds how many of
+    # them may be searching simultaneously.
+    STAGE1_WEB_SEARCH_CONCURRENCY: int = 6
+    # Hard ceiling per analysis, so a company with an empty document store
+    # cannot quietly turn one run into an unbounded number of paid searches.
+    STAGE1_WEB_SEARCH_MAX_QUESTIONS: int = 18
+
+    # Quarterly re-review of holdings + watchlist. Off by default in no
+    # environment — but a switch exists because the sweep costs a full pipeline
+    # run per symbol, and someone running a fork without an OpenAI key wants it
+    # quiet rather than failing four times a year.
+    INVESTING_REVIEW_ENABLED: bool = True
 
     # --------------------------------------------------------
     # APSCHEDULER SETTINGS

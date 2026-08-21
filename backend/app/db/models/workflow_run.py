@@ -101,12 +101,17 @@ class WorkflowRun(Base):
     # STATUS
     # --------------------------------------------------------
 
-    # RUNNING | HITL_PENDING | COMPLETED | FAILED | REJECTED
+    # RUNNING | HITL_PENDING | HITL_RESOLVING | COMPLETED | FAILED | REJECTED
+    #
+    # HITL_RESOLVING is a short-lived claim state. `resume_workflow` flips
+    # HITL_PENDING → HITL_RESOLVING with a conditional UPDATE before running the
+    # graph, so exactly one concurrent request can execute a given trade. See
+    # the "atomic claim" section of workflow_router.py::resume_workflow.
     status: Mapped[str] = mapped_column(
         String(20),
         default="RUNNING",
         index=True,
-        comment="RUNNING | HITL_PENDING | COMPLETED | FAILED | REJECTED",
+        comment="RUNNING | HITL_PENDING | HITL_RESOLVING | COMPLETED | FAILED | REJECTED",
     )
 
     # --------------------------------------------------------

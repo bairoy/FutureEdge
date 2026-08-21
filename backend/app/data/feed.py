@@ -47,6 +47,7 @@ from loguru import logger
 from app.db.redis import redis_client, STREAM_TICKS, KEY_ZERODHA_ACCESS_TOKEN
 import redis as sync_redis
 from app.core.config import settings
+from app.services.token_manager import decrypt_stored_token
 
 
 # ============================================================
@@ -168,11 +169,11 @@ def _get_sync_kite_client() -> Optional[any]:
             from app.db.redis import KEY_ZERODHA_ACCESS_TOKEN
             val = r.get(KEY_ZERODHA_ACCESS_TOKEN)
             if val:
-                token = val.decode() if isinstance(val, bytes) else val
+                token = decrypt_stored_token(val.decode() if isinstance(val, bytes) else val)
             r.close()
         except:
             pass
-            
+
         # 2. Try JSON file
         if not token:
             import json
@@ -181,7 +182,7 @@ def _get_sync_kite_client() -> Optional[any]:
                 try:
                     with open("broker_token.json", "r") as f:
                         token_data = json.load(f)
-                        token = token_data.get("ZERODHA_ACCESS_TOKEN")
+                        token = decrypt_stored_token(token_data.get("ZERODHA_ACCESS_TOKEN"))
                 except:
                     pass
                     
@@ -427,7 +428,7 @@ class NSETickPublisher:
             token = None
 
         if token:
-            token = token.decode() if isinstance(token, bytes) else token
+            token = decrypt_stored_token(token.decode() if isinstance(token, bytes) else token)
         else:
             # Try JSON file fallback
             import os
@@ -436,7 +437,7 @@ class NSETickPublisher:
                 try:
                     with open("broker_token.json", "r") as f:
                         token_data = json.load(f)
-                        token = token_data.get("ZERODHA_ACCESS_TOKEN")
+                        token = decrypt_stored_token(token_data.get("ZERODHA_ACCESS_TOKEN"))
                     logger.info("Loaded Zerodha access token for KiteTicker from broker_token.json")
                 except Exception as fe:
                     logger.warning(f"Could not load token for KiteTicker from broker_token.json: {fe}")
@@ -488,6 +489,17 @@ class NSETickPublisher:
         except Exception as e:
             logger.error(f"NSETickPublisher start failed: {e}")
 
+    def stop(self) -> None:
+        """
+        Disconnect the KiteTicker websocket and release the sync Redis client.
+
+        This body used to sit unindented at the tail of start(), with its `def`
+        line missing — so start() connected the ticker and then immediately tore
+        it down (~3ms later), and no live tick ever reached Redis. Every price
+        silently fell back to 15-minute-delayed yfinance data. Callers that
+        expected a stop() (zerodha_router's post-login feed restart) also failed
+        with AttributeError, so a fresh login never revived the feed either.
+        """
         if self._ticker and self._running:
             self._ticker.stop()
             self._running = False
@@ -498,6 +510,17 @@ class NSETickPublisher:
                     pass
                 self._redis_sync = None
             logger.info("🔴 NSETickPublisher stopped")
+
+    def is_streaming(self) -> bool:
+        """
+        True when the KiteTicker websocket thread is up.
+
+        Public accessor so status endpoints do not reach into `_running`.
+        Note this reports the *socket*, not data freshness — outside market
+        hours the socket stays connected while no ticks arrive, so callers
+        that care about live data must also check tick age.
+        """
+        return bool(self._ticker and self._running)
 
     def subscribe_tokens(self, tokens: list[int]) -> None:
         """

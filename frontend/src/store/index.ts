@@ -22,14 +22,33 @@ import type { UserProfile, AgentVote, EpisodicMemory, KillSwitchStatus, Workflow
 // ─── TYPES ───────────────────────────────────────────────────
 
 // One candlestick point — format required by lightweight-charts
+/**
+ * One aggregated OHLC candle, NOT one raw tick.
+ *
+ * `time` is the start of the candle's minute bucket (Unix seconds, UTC).
+ * `close` is the last traded price seen inside that minute, so the newest
+ * candle's close is always the current LTP.
+ *
+ * `volume` carries Kite's cumulative day volume as of the latest tick in the
+ * bucket, not per-candle volume — nothing renders it today, and deriving a
+ * true per-minute delta would mean tracking the cumulative at each candle
+ * open. Revisit if a volume histogram is ever added.
+ */
 export interface TickPoint {
-  time: number; // Unix timestamp in seconds
+  time: number; // Unix timestamp in seconds — start of the minute bucket
   open: number;
   high: number;
   low: number;
   close: number;
   volume: number;
 }
+
+/** Candle width. NSE/Kite's default intraday granularity is one minute. */
+export const CANDLE_SECONDS = 60;
+
+/** Floor a Unix-seconds timestamp to the start of its candle. */
+export const candleBucket = (timeSec: number): number =>
+  Math.floor(timeSec / CANDLE_SECONDS) * CANDLE_SECONDS;
 
 // Data shown in the HITL approval modal
 export interface HITLPending {
@@ -98,7 +117,7 @@ interface TradingState {
   paperTrade: boolean;
   runResult: WorkflowRunResponse | null;
 
-  addTick: (tick: TickPoint) => void;
+  applyTrade: (ltp: number, timeSec: number, volume?: number) => void;
   setTicks: (ticks: TickPoint[]) => void;
   clearTicks: () => void;
   setAgentResult: (votes: AgentVote[], direction: string, risk: number, rationale: string | null) => void;
@@ -121,11 +140,63 @@ export const useTradingStore = create<TradingState>((set) => ({
   paperTrade: true, // Default to true
   runResult: null,
 
-  // Keep only last 500 ticks so memory stays bounded
-  addTick: (tick) =>
-    set((s) => ({ ticks: [...s.ticks.slice(-499), tick] })),
+  /**
+   * Fold one trade into the current minute's candle — the same way Kite
+   * builds its intraday chart.
+   *
+   * Previously each tick was pushed as its own bar, carrying Kite's *day-level*
+   * OHLC straight from the websocket payload. Every "candle" therefore spanned
+   * the whole day's range and closed at the PREVIOUS day's close, which is what
+   * produced the solid block of full-height bars on the right of the chart and
+   * a Last Price that never matched the live quote.
+   *
+   * Only the LTP carries per-trade information, so that is what we aggregate:
+   * first trade in a minute opens the candle, subsequent trades stretch the
+   * high/low and move the close.
+   */
+  applyTrade: (ltp, timeSec, volume) =>
+    set((s) => {
+      if (!Number.isFinite(ltp) || ltp <= 0) return s;
 
-  setTicks: (ticks) => set({ ticks: ticks.slice(-500) }),
+      const bucket = candleBucket(timeSec);
+      const last = s.ticks[s.ticks.length - 1];
+
+      // Late tick belonging to an already-closed candle. Dropping it keeps the
+      // series monotonic, which lightweight-charts requires.
+      if (last && bucket < last.time) return s;
+
+      if (last && bucket === last.time) {
+        const updated: TickPoint = {
+          ...last,
+          high:   Math.max(last.high, ltp),
+          low:    Math.min(last.low, ltp),
+          close:  ltp,
+          volume: volume ?? last.volume,
+        };
+        return { ticks: [...s.ticks.slice(0, -1), updated] };
+      }
+
+      // First trade of a new minute opens a fresh candle.
+      const opened: TickPoint = {
+        time:   bucket,
+        open:   ltp,
+        high:   ltp,
+        low:    ltp,
+        close:  ltp,
+        volume: volume ?? 0,
+      };
+      return { ticks: [...s.ticks.slice(-499), opened] };
+    }),
+
+  // Historical bars are already OHLC. Snap their timestamps to the same bucket
+  // grid so the first live tick continues the last history candle instead of
+  // opening a duplicate one a few seconds later.
+  setTicks: (ticks) =>
+    set({
+      ticks: ticks
+        .slice(-500)
+        .map((t) => ({ ...t, time: candleBucket(t.time) })),
+    }),
 
   clearTicks: () => set({ ticks: [] }),
 

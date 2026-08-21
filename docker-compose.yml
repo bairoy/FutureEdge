@@ -6,6 +6,26 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     container_name: futureedge_backend
+    # Every other service had a restart policy; this one did not. The backend
+    # runs exit_monitor, which enforces stop-losses on open intraday positions
+    # every 10s — so a crash here left real MIS positions completely unguarded
+    # until the broker's ~3:20 PM auto-square-off. It must come back by itself.
+    #
+    # "unless-stopped" rather than "always": a deliberate `docker compose stop`
+    # should stay stopped, instead of resurrecting on the next daemon start.
+    restart: unless-stopped
+    # DEV override of the image CMD: adds --reload for hot-reloading the
+    # bind-mounted source, and --timeout-graceful-shutdown 3, which stops
+    # Uvicorn hanging at "Waiting for background tasks to complete" on reload
+    # (that hang caused 500s on login). The production entrypoint is the
+    # Dockerfile CMD, which has no --reload — see backend/Dockerfile.
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --proxy-headers
+      --reload
+      --timeout-graceful-shutdown 3
     ports:
       - "8000:8000"
     volumes:
@@ -25,6 +45,16 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+    # Generous ceilings, not tuning targets. The point is that a runaway leak
+    # cannot take the whole host (and therefore Postgres/Redis) down with it.
+    # Set well above observed steady-state — an OOM-killed backend is the very
+    # failure the restart policy above exists to avoid, so do not trim these
+    # without measuring first. FINBERT_ENABLED=true would need more headroom.
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+          cpus: "2.0"
 
   frontend:
     build:
@@ -46,16 +76,23 @@ services:
     image: postgres:16
     container_name: futureedge_postgres
     restart: always
+    # Read from .env — the same file the backend loads via env_file, so the
+    # database and the app can never drift onto different credentials.
+    #
+    # NOTE: Postgres only applies these on FIRST init of an empty data
+    # directory. Changing POSTGRES_PASSWORD for an existing postgres_data
+    # volume does nothing to the stored password — you must either ALTER USER
+    # inside the running container, or drop the volume and re-init.
     environment:
-      POSTGRES_USER: futureedge
-      POSTGRES_PASSWORD: futureedge
-      POSTGRES_DB: futureedge
+      POSTGRES_USER:     ${POSTGRES_USER:-futureedge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB:       ${POSTGRES_DB:-futureedge}
     ports:
       - "127.0.0.1:5439:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U futureedge"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-futureedge}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -64,23 +101,48 @@ services:
     image: redis:7
     container_name: futureedge_redis
     restart: always
+    # Redis was running purely in memory with no volume, so every restart
+    # silently discarded adaptive agent weights and calibration state — the
+    # things that take hundreds of closed trades to learn.
+    #
+    # appendfsync everysec: at most one second of writes lost on a hard kill,
+    # without the throughput cost of fsync-per-write. Nothing here is a
+    # system of record — the kill switch is durable in Postgres (see
+    # kill_switch_state), which is why it survived a container restart during
+    # the 2026-08-05 incident.
+    command: redis-server --appendonly yes --appendfsync everysec
     ports:
       - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G
 
   qdrant:
-    image: qdrant/qdrant:latest
+    # Pinned. ":latest" meant a rebuild could silently move the vector store
+    # to a new major version — episodic trade memory lives here, and a storage
+    # format change is not something to discover during market hours.
+    # Matches what was running when this was pinned; bump deliberately.
+    image: qdrant/qdrant:v1.18.2
     container_name: futureedge_qdrant
     restart: always
     ports:
       - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
+    deploy:
+      resources:
+        limits:
+          memory: 2G
 
 volumes:
   postgres_data:
   qdrant_data:
+  redis_data:

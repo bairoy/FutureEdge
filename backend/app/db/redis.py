@@ -73,6 +73,10 @@ KEY_INDICATORS = "futureedge:indicators:{symbol}"   # format with symbol
 # Zerodha dynamic access token (expires daily at 6:00 AM IST)
 KEY_ZERODHA_ACCESS_TOKEN = "futureedge:zerodha:access_token"
 
+# Single-use CSRF state for the Zerodha OAuth round trip.
+# Format with the state value; the stored value is the issuing user's id.
+KEY_ZERODHA_OAUTH_STATE = "futureedge:zerodha:oauth_state:{state}"
+
 
 # ============================================================
 # REDIS STREAM NAMES

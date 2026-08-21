@@ -94,15 +94,20 @@ async def telegram_webhook(request: Request, db: AsyncSession = Depends(get_db))
                         lambda: kite.generate_session(request_token, api_secret=settings.ZERODHA_API_SECRET)
                     )
                     access_token = data["access_token"]
-                    
+
+                    # Same storage contract as zerodha_router: both sinks hold
+                    # ciphertext only, decrypted at read time by token_manager.
+                    from app.services.token_manager import encrypt_token
+                    encrypted_token = encrypt_token(access_token)
+
                     # 2. Save access token to Redis
-                    await redis_client.set(KEY_ZERODHA_ACCESS_TOKEN, access_token)
-                    
+                    await redis_client.set(KEY_ZERODHA_ACCESS_TOKEN, encrypted_token)
+
                     # 3. Save to local JSON config
                     try:
                         with open("broker_token.json", "w") as f:
-                            json.dump({"ZERODHA_ACCESS_TOKEN": access_token}, f)
-                        logger.info("Saved Zerodha token to broker_token.json via Telegram command")
+                            json.dump({"ZERODHA_ACCESS_TOKEN": encrypted_token}, f)
+                        logger.info("Saved encrypted Zerodha token to broker_token.json via Telegram command")
                     except Exception as je:
                         logger.warning(f"Failed to save Zerodha token to broker_token.json: {je}")
                     

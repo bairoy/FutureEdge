@@ -19,7 +19,8 @@ The risk agent's Kelly criterion uses per-user trade history.
 
 SAFETY LAYERS (in order):
 --------------------------
-1. Kill switch check   → Redis TRADING_HALT key
+0. Analysis mode guard → refuses INVESTING mode outright (it places no orders)
+1. Kill switch check   → kill_switch_service.is_trading_halted() (fails closed)
 2. No-trade check      → direction is NONE or size is 0
 3. HITL approval check → must be approved if hitl_required
 4. Share conversion    → Rupees / price = integer shares
@@ -32,7 +33,7 @@ import json
 
 from loguru import logger
 
-from app.db.redis import redis_client, KEY_TRADING_HALT, CHANNEL_TRADE_EXECUTED
+from app.db.redis import redis_client, CHANNEL_TRADE_EXECUTED
 from app.db.postgres import AsyncSessionLocal
 from app.db.repos.trade_repo import TradeRepo
 from app.brokers.base import get_broker
@@ -50,9 +51,39 @@ async def execution_node(state: AgentState) -> dict:
       - run_id        : the unique workflow identifier
     """
 
+    run_id:  str = state.get("run_id", "unknown")
+    user_id: str = state.get("user_id", "anonymous")
+
+    # ====================================================
+    # LAYER -1: ANALYSIS MODE GUARD
+    # ====================================================
+    # Investing mode is advisory: it produces research and never places an
+    # order. The graph enforces that structurally — the investing branch ends
+    # at thesis_agent and has no edge to this node — so reaching here in
+    # INVESTING mode means the graph was rewired, not that a trade was
+    # approved.
+    #
+    # Checked BEFORE state["consensus"] is read, because the investing branch
+    # never populates it. Checked before the kill switch too: this is not a
+    # risk decision that could be waived, it is a mode that has no orders.
+    #
+    # This guard is why "advisory only" is a property of the system rather
+    # than of the current graph topology. If CNC execution is ever added, the
+    # hard rule in CLAUDE.md still stands and this is where it is enforced.
+
+    if (state.get("analysis_mode") or "TRADING").upper() == "INVESTING":
+        logger.error(
+            f"BLOCKED: execution reached in INVESTING mode | run_id={run_id} | "
+            f"user_id={user_id} — investing mode places no orders"
+        )
+        return {
+            "executed_trade":  None,
+            "execution_error": "INVESTING_MODE_NO_EXECUTION",
+            "completed_nodes": ["execution"],
+            "logs":            ["Execution refused — Investing mode is advisory and places no orders."],
+        }
+
     proposal: TradeProposal = state["consensus"]
-    run_id:   str           = state["run_id"]
-    user_id:  str           = state.get("user_id", "anonymous")
 
     try:
         logs_accumulated = []
@@ -77,13 +108,17 @@ async def execution_node(state: AgentState) -> dict:
         # ====================================================
         # LAYER 1: KILL SWITCH
         # ====================================================
-        # Redis key TRADING_HALT="1" means halt all trading.
         # Set by risk managers via POST /api/v1/kill-switch/halt.
         # Checked here BEFORE doing anything else.
+        #
+        # Goes through is_trading_halted() rather than reading the Redis key
+        # directly: the service treats an unreachable Redis as HALTED. Reading
+        # the key here used to let a Redis outage raise past this check, or a
+        # None reply read as "not halted" — both fail open on the order path.
 
-        halt = await redis_client.get(KEY_TRADING_HALT)
+        from app.services.kill_switch_service import is_trading_halted
 
-        if halt == "1":
+        if await is_trading_halted():
             logger.critical(
                 f"KILL SWITCH ACTIVE | run_id={run_id} | user_id={user_id}"
             )
@@ -243,6 +278,10 @@ async def execution_node(state: AgentState) -> dict:
                 )
             except Exception as e:
                 logger.error(f"Consensus exit broker order failed: {e}")
+                from app.brokers.kite_errors import handle_kite_error
+                await handle_kite_error(
+                    e, context=f"execution:consensus_exit:{proposal.symbol}"
+                )
                 order_result = None
                 
             if not order_result or not order_result.success:
@@ -366,6 +405,10 @@ async def execution_node(state: AgentState) -> dict:
                     )
                 except Exception as e:
                     logger.error(f"Scale-in broker order failed: {e}")
+                    from app.brokers.kite_errors import handle_kite_error
+                    await handle_kite_error(
+                        e, context=f"execution:scale_in:{proposal.symbol}"
+                    )
                     order_result = None
 
                 if not order_result or not order_result.success:
@@ -505,6 +548,10 @@ async def execution_node(state: AgentState) -> dict:
                     )
                 except Exception as e:
                     logger.error(f"Reversal exit broker order failed: {e}")
+                    from app.brokers.kite_errors import handle_kite_error
+                    await handle_kite_error(
+                        e, context=f"execution:reversal_exit:{proposal.symbol}"
+                    )
                     order_result = None
                     
                 if not order_result or not order_result.success:
@@ -667,6 +714,15 @@ async def execution_node(state: AgentState) -> dict:
                     broker            = broker_name,
                     broker_order_id   = order_result.order_id if order_result.success else None,
                     actual_fill_price = order_result.fill_price if order_result.success else None,
+                    # A rejected order must NOT be recorded as an open position.
+                    # save_trade() defaults status to "OPEN", and this argument
+                    # was previously omitted — so an order the broker refused
+                    # (expired token, no static IP allowlist, insufficient
+                    # margin) still wrote status=OPEN with a NULL
+                    # broker_order_id. The system then believed it held a
+                    # position that does not exist at the broker, and
+                    # exit_monitor spun trying to square it off forever.
+                    status            = None if order_result.success else "FAILED",
                 )
 
         except Exception as db_err:

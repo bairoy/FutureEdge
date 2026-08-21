@@ -19,6 +19,12 @@ TABLES CREATED:
     workflow_runs   — every agent cycle tied to a user
     trades          — every executed or rejected trade
 
+INVESTING MODE TABLES:
+-----------------------
+    fundamental_scorecards     — quality verdict per symbol, one row per run
+    fundamental_manual_inputs  — figures typed in from annual reports
+    investing_holdings         — long-term positions the user bought by hand
+
 LANGGRAPH TABLES:
 -----------------
 LangGraph creates its own checkpoint tables automatically
@@ -49,13 +55,23 @@ from app.db.base     import Base
 # SQLAlchemy discovers tables by tracking which classes
 # inherit from Base. If you don't import a model here,
 # its table will NOT be created.
+#
+# These imports look unused and are not — importing IS the registration.
+# noqa: F401 on each, so `ruff check --select F` (which CI gates on) doesn't
+# read the whole block as dead code.
 # ============================================================
 
-from app.db.models.user          import User          # users table
-from app.db.models.refresh_token import RefreshToken  # refresh_tokens table
-from app.db.models.workflow_run  import WorkflowRun   # workflow_runs table
-from app.db.models.trade         import Trade         # trades table
-from app.db.models.kill_switch_event import KillSwitchEvent # kill_switch_events table
+from app.db.models.user               import User                   # noqa: F401  users
+from app.db.models.refresh_token      import RefreshToken           # noqa: F401  refresh_tokens
+from app.db.models.workflow_run       import WorkflowRun            # noqa: F401  workflow_runs
+from app.db.models.trade              import Trade                  # noqa: F401  trades
+from app.db.models.kill_switch_event  import KillSwitchEvent        # noqa: F401  kill_switch_events
+from app.db.models.kill_switch_state  import KillSwitchState        # noqa: F401  kill_switch_state (durable halt flag)
+
+# Investing mode — advisory only, so nothing here writes to `trades`.
+from app.db.models.fundamental_scorecard    import FundamentalScorecard   # noqa: F401  fundamental_scorecards
+from app.db.models.fundamental_manual_input import FundamentalManualInput # noqa: F401  fundamental_manual_inputs
+from app.db.models.investing_holding        import InvestingHolding       # noqa: F401  investing_holdings
 
 
 async def create_tables() -> None:
@@ -67,12 +83,19 @@ async def create_tables() -> None:
         # SQLAlchemy function — we wrap it for async compatibility
         await conn.run_sync(Base.metadata.create_all)
 
+    # Listed explicitly rather than read off the metadata, so add new tables
+    # here too — a table missing from this list still gets created, it just
+    # goes unmentioned, which reads like it was skipped.
     logger.info("All tables created successfully:")
     logger.info("  ✓ users")
     logger.info("  ✓ refresh_tokens")
     logger.info("  ✓ workflow_runs")
     logger.info("  ✓ trades")
     logger.info("  ✓ kill_switch_events")
+    logger.info("  ✓ kill_switch_state")
+    logger.info("  ✓ fundamental_scorecards")
+    logger.info("  ✓ fundamental_manual_inputs")
+    logger.info("  ✓ investing_holdings")
     logger.info("")
     logger.info("Next step: create your first admin user:")
     logger.info("  docker compose exec backend python -m app.scripts.create_admin")
